@@ -64,7 +64,9 @@
 | Reviewer | 独立レビュー → PASS / REPAIR / REPLAN | なし |
 | Diagnostician | 繰り返し失敗の原因分析 → RETRY / SPLIT / REPLAN / BLOCKED | なし |
 
-全ロールで `git commit/push/merge/rebase/reset`、sudo、credential操作等は PreToolUse Hook が拒否する(`harness/security/`)。
+全ロールで `git commit/push/merge/rebase/reset`、sudo、credential操作等は PreToolUse Hook が拒否する(`harness/security/`)。加えてDeveloper以外のロールは書き込み系シェルコマンド(リダイレクト、`sed -i`、`git apply`、`python -c` 等)も拒否される。
+
+なお、このシェルコマンド検査は defense-in-depth であり完全なサンドボックスではない(テストを実行できるシェルは最終的に任意コードを実行できる)。読み取り専用ロールの完全な強制が必要な場合は、コンテナ等のOSレベル隔離の中でHarnessを実行すること。
 
 ## セットアップ
 

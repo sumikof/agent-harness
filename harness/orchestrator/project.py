@@ -84,6 +84,15 @@ class ProjectOrchestrator:
                 f"{self.config.repository_path} is not a git repository. "
                 "Place or clone the target repository there first."
             )
+        if self.git.head_commit() is None:
+            # Checkpoint/recovery semantics need a HEAD to reset to. Commit
+            # whatever the repository starts with as the baseline; ignored
+            # files stay untouched on disk.
+            self.git.add_all()
+            baseline = self.git.commit("harness: baseline commit", allow_empty=True)
+            self.events.emit("BASELINE_COMMITTED", project_id=row["id"],
+                             payload={"commit": baseline})
+            logger.info("created baseline commit %s in commitless repository", baseline[:8])
         return row
 
     def project_context(self) -> ProjectContext:

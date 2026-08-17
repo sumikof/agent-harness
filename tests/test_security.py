@@ -145,6 +145,14 @@ class TestWriteHints:
             "git -C . apply -",
             "git restore src/x.py",
             "git checkout-index -a",
+            "git read-tree -mu HEAD~1",
+            # inline interpreter code / nested shells can write anything
+            "python -c 'open(\"src/main.py\",\"w\").write(\"x\")'",
+            "python3 -B -c 'import os'",
+            "perl -e 'unlink @ARGV'",
+            "node -e 'require(\"fs\").writeFileSync(\"x\",\"y\")'",
+            "bash -c 'echo x'",
+            "sh -lc 'anything'",
         ]:
             assert find_write_hint(cmd) is not None, cmd
 
@@ -162,6 +170,11 @@ class TestWriteHints:
             "grep -- '->' src/x.py",
             "cmd >& /dev/null",
             "cmd >&2",
+            # interpreters running project code / tests stay allowed
+            "python -m pytest -q",
+            "python -m pytest -c pytest.ini",
+            "node --version",
+            "bash run_tests.sh",
         ]:
             assert find_write_hint(cmd) is None, cmd
 

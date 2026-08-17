@@ -30,8 +30,9 @@ class CheckpointManager:
         self.repo.reset_hard(commit_hash)
 
     def discard_working_tree(self) -> None:
+        # ensure_project() guarantees a baseline commit before any agent
+        # runs, so HEAD normally exists. With no commits there is nothing
+        # safe to reset to — pre-existing (possibly ignored) user data must
+        # never be destroyed — so this is a no-op then.
         if self.repo.head_commit() is not None:
             self.repo.reset_hard("HEAD")
-        else:
-            # No commits yet: the "last good state" is an empty tree.
-            self.repo.discard_all_unborn()

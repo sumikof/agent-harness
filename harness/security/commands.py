@@ -3,6 +3,13 @@
 The harness owns the git lifecycle and the host environment; agents get a
 restricted Bash. Deny rules are checked against every command an agent
 tries to run, before execution (PreToolUse hook).
+
+These checks are defense-in-depth, not a sandbox: a shell that can run
+project tests can ultimately execute arbitrary code (test suites, build
+scripts, plugins). Hard enforcement of read-only roles requires OS-level
+isolation (containers, mount namespaces, seccomp), which is a deployment
+concern outside the harness process. The heuristics here exist to stop
+accidental and casual violations cheaply and loudly.
 """
 
 from __future__ import annotations
@@ -119,8 +126,19 @@ _WRITE_HINTS: list[tuple[re.Pattern, str]] = [
     # here-docs included). Lifecycle commands are banned globally; these are
     # legitimate for the Developer only.
     (
-        re.compile(r"\bgit\b[^|;&]*?\b(apply|restore|checkout-index)\b"),
+        re.compile(r"\bgit\b[^|;&]*?\b(apply|restore|checkout-index|read-tree)\b"),
         "git working-tree write",
+    ),
+    # Inline interpreter code and nested shells can write files without any
+    # of the markers above; deny them for restricted roles. (Heuristics are
+    # defense-in-depth, not a sandbox — see the module docstring.)
+    (
+        re.compile(r"\b(python[0-9.]*|perl|ruby|node|php|deno)(\s+-\S+)*\s+(-c|-e|--eval)\b"),
+        "inline interpreter code can write files",
+    ),
+    (
+        re.compile(r"\b(sh|bash|zsh|dash|ksh)\b\s+-[a-zA-Z]*c\b"),
+        "nested shell command string",
     ),
 ]
 

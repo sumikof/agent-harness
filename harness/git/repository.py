@@ -79,25 +79,23 @@ class GitRepository:
     def add_all(self) -> None:
         self._run("add", "-A")
 
-    def commit(self, message: str) -> str:
-        self._run(
+    def commit(self, message: str, allow_empty: bool = False) -> str:
+        args = [
             "-c", "user.name=agent-harness",
             "-c", "user.email=agent-harness@localhost",
             "commit", "-m", message,
-        )
+        ]
+        if allow_empty:
+            args.append("--allow-empty")
+        self._run(*args)
         return self.head_commit() or ""
 
     def reset_hard(self, ref: str = "HEAD") -> None:
+        # `clean -fd` deliberately leaves ignored files alone: build caches
+        # and pre-existing user data (via .gitignore / info/exclude) are not
+        # the harness's to destroy.
         self._run("reset", "--hard", ref)
         self._run("clean", "-fd")
-
-    def discard_all_unborn(self) -> None:
-        """Empty the tree of a repository that has no commits yet
-        (reset --hard has no HEAD to reset to). Includes ignored files (-x):
-        with no commits there is no build state worth preserving, and a
-        deleted .gitignore would otherwise leave them behind as dirt."""
-        self._run("rm", "-r", "--cached", "--ignore-unmatch", "-f", ".", check=False)
-        self._run("clean", "-fdx", check=False)
 
     def log_oneline(self, limit: int = 20) -> str:
         return self._run("log", "--oneline", f"-{limit}", check=False).stdout

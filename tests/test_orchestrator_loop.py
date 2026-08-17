@@ -95,6 +95,35 @@ def install_fake(monkeypatch, fake: FakeRunner) -> None:
     monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider: fake)
 
 
+def test_ensure_project_creates_baseline_commit(tmp_path):
+    """A commitless repo gets a baseline commit at project start, so every
+    later reset/recovery has a HEAD; ignored user data is untouched (Codex P1)."""
+    workspace = tmp_path / "workspace"
+    repo = GitRepository(workspace / "repository")
+    repo.init()
+    (repo.path / "existing.txt").write_text("pre-existing\n")
+    (repo.path / ".git" / "info" / "exclude").write_text("private/\n")
+    (repo.path / "private").mkdir()
+    (repo.path / "private" / "data.txt").write_text("user data\n")
+
+    cfg = HarnessConfig(
+        project=ProjectConfig(name="baseline-test", goal="g"),
+        workspace_dir=str(workspace),
+        verification=VerificationConfig(language="none", commands=["true"]),
+    )
+    cfg.config_path = REPO_ROOT / "config.yaml"
+    orchestrator = ProjectOrchestrator(cfg)
+    orchestrator.ensure_project()
+
+    assert repo.head_commit() is not None       # baseline exists
+    assert not repo.is_dirty()                  # existing.txt was committed
+    assert (repo.path / "private" / "data.txt").exists()  # ignored data kept
+    # and a discard after agent work now really resets
+    (repo.path / "existing.txt").write_text("agent half-done\n")
+    orchestrator.checkpoint.discard_working_tree()
+    assert (repo.path / "existing.txt").read_text() == "pre-existing\n"
+
+
 async def test_happy_path_completes_project(config, monkeypatch):
     orchestrator = ProjectOrchestrator(config)
     fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])

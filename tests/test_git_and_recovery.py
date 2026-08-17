@@ -79,24 +79,35 @@ def test_recovery_after_crash(tmp_path, repo):
     db.close()
 
 
-def test_discard_working_tree_in_unborn_repo(tmp_path):
-    """A repo with no commits must still be resettable to an empty tree (Codex P2)."""
+def test_discard_working_tree_unborn_repo_is_safe_noop(tmp_path):
+    """With no commits there is nothing safe to reset to: pre-existing user
+    data (ignored or not) must never be destroyed (Codex P1)."""
     git = GitRepository(tmp_path / "unborn")
     git.init()
-    (git.path / "staged.txt").write_text("staged\n")
-    # a staged .gitignore hiding an ignored output must not leave dirt behind
-    (git.path / ".gitignore").write_text("build/\n")
-    git.add_all()
-    (git.path / "untracked.txt").write_text("untracked\n")
-    (git.path / "build").mkdir()
-    (git.path / "build" / "result").write_text("out\n")
+    (git.path / "data.txt").write_text("precious\n")
+    (git.path / ".git" / "info" / "exclude").write_text("private/\n")
+    (git.path / "private").mkdir()
+    (git.path / "private" / "secret.txt").write_text("keep me\n")
 
     CheckpointManager(git).discard_working_tree()
 
-    assert not git.is_dirty()
-    assert not (git.path / "staged.txt").exists()
-    assert not (git.path / "untracked.txt").exists()
-    assert not (git.path / "build").exists()
+    assert (git.path / "data.txt").read_text() == "precious\n"
+    assert (git.path / "private" / "secret.txt").read_text() == "keep me\n"
+
+
+def test_reset_hard_preserves_ignored_files(repo):
+    """Ignored files (build caches, user data) survive a checkpoint reset."""
+    (repo.path / ".gitignore").write_text("cache/\n")
+    repo.add_all()
+    repo.commit("add gitignore")
+    (repo.path / "cache").mkdir()
+    (repo.path / "cache" / "state.bin").write_text("cached\n")
+    (repo.path / "hello.txt").write_text("dirty\n")
+
+    CheckpointManager(repo).discard_working_tree()
+
+    assert not repo.is_dirty()
+    assert (repo.path / "cache" / "state.bin").exists()  # ignored data kept
 
 
 def test_recovery_refuses_unexplained_dirty_tree(tmp_path, repo):
