@@ -94,6 +94,62 @@ class VerificationStep(BaseModel):
     duration_seconds: float
     log_file: str = ""
     tail: str = ""
+    output_sha256: str = ""
+    output_bytes: int = 0
 
 
 VerificationResult.model_rebuild()
+
+
+# -- provenance envelope ----------------------------------------------------
+
+
+class ArtifactProducer(BaseModel):
+    role: str
+    agent_run_id: Optional[int] = None
+
+
+class ArtifactEnvelope(BaseModel):
+    """Common metadata wrapper for agent-produced artifacts.
+
+    The domain document lives unchanged under `payload`; the envelope adds
+    provenance (who produced it, from which inputs, at which commit) so any
+    artifact can be traced back to its producing AgentRun and context.
+    """
+
+    schema_version: int = 1
+    artifact_type: str
+    project_id: Optional[int] = None
+    task_id: Optional[int] = None
+    attempt_no: Optional[int] = None
+    producer: Optional[ArtifactProducer] = None
+    base_commit: Optional[str] = None
+    input_manifest_hash: Optional[str] = None
+    created_at: str = ""
+    payload: dict = Field(default_factory=dict)
+    evidence: list[dict] = Field(default_factory=list)
+
+
+# -- large output retention -------------------------------------------------
+
+
+class SpilledOutput(BaseModel):
+    """Bounded preview of an oversized output whose full text was spilled
+    to an artifact file. Nothing is lost: the artifact holds every byte."""
+
+    artifact_path: str
+    sha256: str
+    total_bytes: int
+    truncated: bool
+    head: str = ""
+    tail: str = ""
+
+    def render(self) -> str:
+        if not self.truncated:
+            return self.head
+        return (
+            f"{self.head}\n"
+            f"... (output truncated: {self.total_bytes} bytes total, "
+            f"full copy at {self.artifact_path}, sha256 {self.sha256[:16]}...)\n"
+            f"{self.tail}"
+        )

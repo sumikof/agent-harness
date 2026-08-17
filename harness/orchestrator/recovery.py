@@ -1,9 +1,19 @@
 """Startup recovery.
 
-The harness process is expected to die mid-run. On startup we reconcile
-SQLite state with the Git working tree: any RUNNING attempt is treated as
-interrupted, its dirty diff is archived as an artifact, the tree is reset
-to the last good commit, and the task is re-queued for a fresh attempt.
+The harness process is expected to die mid-run. On startup, state is
+reconciled in a fixed order:
+
+    1. SQLite integrity check
+    2. Event ledger integrity check (contiguous per-stream seq)
+    3. Unfinished operation detection (intent without result)
+    4. Git reconciliation (did a journaled commit actually happen?)
+    5. Workspace dirty-state recovery (archive diff, reset to HEAD)
+    6. Project / task state reconciliation (requeue in-flight work)
+
+A journaled GIT_COMMIT intent whose commit already exists in the
+repository is never re-executed: the DB is reconciled to the real git
+state instead. Only after operations are settled may the working tree be
+reset — never unconditionally.
 
 A dirty tree WITHOUT a recorded RUNNING attempt is not the harness's work
 to destroy: recovery refuses to start instead of resetting it.
@@ -11,11 +21,18 @@ to destroy: recovery refuses to start instead of resetting it.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 
 from ..artifacts.manager import ArtifactManager
-from ..database.event_repository import EventRepository
+from ..database.event_repository import EventRepository, EventType
+from ..database.operation_repository import (
+    OperationRepository,
+    OperationStatus,
+    OperationType,
+)
+from ..database.run_repository import RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.repository import GitRepository
@@ -39,6 +56,11 @@ class UnexplainedDirtyWorktree(Exception):
     """The repository has uncommitted changes the harness did not create."""
 
 
+class RecoveryIntegrityError(Exception):
+    """The persistent state plane itself cannot be trusted (corrupt SQLite
+    file or a gapped event stream). Never silently repaired."""
+
+
 class RecoveryManager:
     def __init__(
         self,
@@ -47,18 +69,40 @@ class RecoveryManager:
         artifacts: ArtifactManager,
         git: GitRepository,
         checkpoint: CheckpointManager,
+        operations: OperationRepository | None = None,
+        runs: RunRepository | None = None,
     ):
         self.tasks = tasks
         self.events = events
         self.artifacts = artifacts
         self.git = git
         self.checkpoint = checkpoint
+        self.operations = operations
+        self.runs = runs
 
     def recover(self, project_row: sqlite3.Row) -> bool:
         """Reconcile state after a possible crash. Returns True if recovery acted."""
         project_id = project_row["id"]
         acted = False
 
+        # 1-2. Integrity of the state plane itself. Corruption is fatal and
+        # loud — recovery must not guess on top of untrusted state.
+        integrity = self.tasks.db.integrity_check()
+        if integrity != "ok":
+            raise RecoveryIntegrityError(f"SQLite integrity check failed: {integrity}")
+        gaps = self.events.find_stream_gaps()
+        if gaps:
+            raise RecoveryIntegrityError(
+                f"event ledger has non-contiguous streams: {gaps}. The history "
+                "cannot be trusted; inspect the workspace before rerunning."
+            )
+
+        # 3-4. Unfinished operations: settle every journaled side effect
+        # against reality BEFORE touching the working tree.
+        if self.operations is not None:
+            acted |= self._settle_unfinished_operations(project_id)
+
+        # 5. Workspace dirty-state recovery.
         running = self.tasks.running_attempts(project_id)
         dirty = self.git.is_repo() and self.git.is_dirty()
 
@@ -70,7 +114,7 @@ class RecoveryManager:
             for attempt in running:
                 self.tasks.finish_attempt(attempt["id"], AttemptState.INTERRUPTED)
                 self.events.emit(
-                    "ATTEMPT_INTERRUPTED",
+                    EventType.ATTEMPT_INTERRUPTED,
                     project_id=project_id,
                     task_id=attempt["task_id"],
                     attempt_id=attempt["id"],
@@ -87,11 +131,17 @@ class RecoveryManager:
                 "attempt is recorded. Commit, stash, or clean it manually, then rerun."
             )
 
+        # 6. Project / task state reconciliation.
+        if self.runs is not None:
+            interrupted_runs = self.runs.interrupt_running(project_id)
+            if interrupted_runs:
+                logger.warning("recovery: closed %d interrupted agent run(s)", len(interrupted_runs))
+                acted = True
         for task in self.tasks.list_for_project(project_id):
             if task["status"] in IN_FLIGHT_STATES:
                 self.tasks.set_status(task["id"], TaskState.READY, force=True)
                 self.events.emit(
-                    "TASK_REQUEUED",
+                    EventType.TASK_REQUEUED,
                     project_id=project_id,
                     task_id=task["id"],
                     payload={"from_status": task["status"]},
@@ -99,9 +149,84 @@ class RecoveryManager:
                 acted = True
 
         if acted:
-            self.events.emit("RECOVERY_COMPLETED", project_id=project_id,
+            self.events.emit(EventType.RECOVERY_COMPLETED, project_id=project_id,
                              payload={"head": self.git.head_commit() if self.git.is_repo() else None})
         return acted
+
+    # ------------------------------------------------------------------
+
+    def _settle_unfinished_operations(self, project_id: int) -> bool:
+        acted = False
+        for op in self.operations.unfinished(OperationType.GIT_COMMIT):
+            self._reconcile_git_commit(project_id, op)
+            acted = True
+        for op_type in (OperationType.AGENT_DISPATCH, OperationType.VERIFICATION_COMMAND):
+            for op in self.operations.unfinished(op_type):
+                # The side effect (an agent session / a verification process)
+                # died with the harness; its worktree effects are handled by
+                # the dirty-state step, so the operation is closed as
+                # interrupted rather than guessed at.
+                self.operations.record_result(
+                    op["operation_id"],
+                    OperationStatus.INTERRUPTED,
+                    {"reason": "harness crashed while operation was in flight"},
+                )
+                acted = True
+        return acted
+
+    def _reconcile_git_commit(self, project_id: int, op: sqlite3.Row) -> None:
+        """A GIT_COMMIT intent has no result: did the commit happen?
+
+        If a commit carrying the operation's trailer exists, the side effect
+        is real — the DB is caught up to it and the commit is NEVER re-run.
+        If not, the intent simply never executed and is closed as FAILED;
+        normal retry logic will produce a fresh attempt.
+        """
+        operation_id = op["operation_id"]
+        payload = json.loads(op["payload"] or "{}")
+        task_id = payload.get("task_id") or op["task_id"]
+        attempt_id = payload.get("attempt_id") or op["attempt_id"]
+        commit_hash = self.checkpoint.find_committed_operation(operation_id)
+
+        if commit_hash is None:
+            self.operations.record_result(
+                operation_id, OperationStatus.FAILED,
+                {"reason": "intent journaled but commit never executed"},
+            )
+            logger.warning("recovery: git commit intent %s never executed", operation_id)
+            return
+
+        logger.warning(
+            "recovery: git commit intent %s already executed as %s; reconciling DB",
+            operation_id, commit_hash,
+        )
+        if task_id is not None:
+            attempt = self.tasks.get_attempt(attempt_id) if attempt_id else None
+            if attempt is not None and attempt["status"] == AttemptState.RUNNING.value:
+                self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
+            self.tasks.set_commit(task_id, commit_hash)
+            task = self.tasks.get(task_id)
+            if task is not None and task["status"] != TaskState.COMPLETED.value:
+                self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+                self.events.emit(
+                    EventType.TASK_COMPLETED,
+                    project_id=project_id,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    operation_id=operation_id,
+                    payload={"commit": commit_hash, "reconciled": True},
+                )
+        self.operations.record_result(
+            operation_id, OperationStatus.RECONCILED, {"commit": commit_hash}
+        )
+        self.events.emit(
+            EventType.GIT_COMMIT_RECONCILED,
+            project_id=project_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            payload={"commit": commit_hash},
+        )
 
     def _archive_dirty_diff(self, project_id: int) -> None:
         if not (self.git.is_repo() and self.git.is_dirty()):

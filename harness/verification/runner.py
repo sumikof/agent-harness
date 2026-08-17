@@ -7,6 +7,7 @@ checks process exit codes itself. Success == every exit code 0.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import time
 from pathlib import Path
@@ -66,6 +67,8 @@ class VerificationRunner:
             exit_code = -1
             output = f"TIMEOUT after {self.config.timeout_seconds}s\n{exc.stdout or ''}\n{exc.stderr or ''}"
         duration = time.monotonic() - started
+        # Full output is always retained on disk; only a bounded tail (plus
+        # hash + size for integrity/locating) travels into agent context.
         log_file.write_text(f"$ {command}\nexit: {exit_code}\n\n{output}", encoding="utf-8")
         return VerificationStep(
             command=command,
@@ -73,4 +76,6 @@ class VerificationRunner:
             duration_seconds=round(duration, 2),
             log_file=str(log_file),
             tail=output[-TAIL_CHARS:],
+            output_sha256=hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            output_bytes=len(output.encode("utf-8")),
         )

@@ -87,6 +87,46 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
     """,
+    # 2: durable event ledger (streams + contiguous seq), operation
+    #    intent/result journal, and agent-run provenance columns.
+    #    All new columns are nullable so a v1 workspace keeps working.
+    """
+    ALTER TABLE events ADD COLUMN agent_run_id INTEGER REFERENCES agent_runs(id);
+    ALTER TABLE events ADD COLUMN stream_type TEXT;
+    ALTER TABLE events ADD COLUMN stream_id INTEGER;
+    ALTER TABLE events ADD COLUMN seq INTEGER;
+    ALTER TABLE events ADD COLUMN operation_id TEXT;
+    ALTER TABLE events ADD COLUMN correlation_id TEXT;
+    ALTER TABLE events ADD COLUMN causation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_events_stream_seq
+        ON events(stream_type, stream_id, seq) WHERE seq IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_id TEXT NOT NULL UNIQUE,
+        operation_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        project_id INTEGER REFERENCES projects(id),
+        task_id INTEGER REFERENCES tasks(id),
+        attempt_id INTEGER REFERENCES task_attempts(id),
+        agent_run_id INTEGER REFERENCES agent_runs(id),
+        payload TEXT NOT NULL DEFAULT '{}',
+        result TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_operations_pending
+        ON operations(status, operation_type);
+
+    ALTER TABLE agent_runs ADD COLUMN provider TEXT;
+    ALTER TABLE agent_runs ADD COLUMN model TEXT;
+    ALTER TABLE agent_runs ADD COLUMN profile_hash TEXT;
+    ALTER TABLE agent_runs ADD COLUMN profile_version TEXT;
+    ALTER TABLE agent_runs ADD COLUMN context_manifest_path TEXT;
+    ALTER TABLE agent_runs ADD COLUMN context_manifest_hash TEXT;
+    ALTER TABLE agent_runs ADD COLUMN resolved_spec TEXT;
+    ALTER TABLE agent_runs ADD COLUMN dispatch_operation_id TEXT;
+    """,
 ]
 
 

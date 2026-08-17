@@ -6,13 +6,26 @@ live on the filesystem under workspace/artifacts/.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Optional, Type, TypeVar
 
 from pydantic import BaseModel
 
+from .schemas import ArtifactEnvelope, ArtifactProducer, SpilledOutput
+
 T = TypeVar("T", bound=BaseModel)
+
+# Above this many characters an output is spilled to a file and only a
+# bounded preview travels in agent context. Callers may override per site.
+DEFAULT_SPILL_THRESHOLD = 30000
+SPILL_HEAD_CHARS = 8000
+SPILL_TAIL_CHARS = 8000
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class ArtifactManager:
@@ -21,6 +34,8 @@ class ArtifactManager:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "tasks").mkdir(exist_ok=True)
         (self.root / "diagnostics").mkdir(exist_ok=True)
+        (self.root / "manifests").mkdir(exist_ok=True)
+        (self.root / "spill").mkdir(exist_ok=True)
 
     # -- path helpers ------------------------------------------------------
 
@@ -57,7 +72,72 @@ class ArtifactManager:
         data = self.load_json(path)
         if data is None:
             return None
+        data = self.unwrap_envelope(data)
         return model_type.model_validate(data)
+
+    # -- provenance envelope ------------------------------------------------
+
+    def save_enveloped(
+        self,
+        path: Path,
+        model: BaseModel,
+        *,
+        artifact_type: Optional[str] = None,
+        project_id: Optional[int] = None,
+        task_id: Optional[int] = None,
+        attempt_no: Optional[int] = None,
+        producer_role: Optional[str] = None,
+        producer_run_id: Optional[int] = None,
+        base_commit: Optional[str] = None,
+        input_manifest_hash: Optional[str] = None,
+        created_at: str = "",
+    ) -> Path:
+        envelope = ArtifactEnvelope(
+            artifact_type=artifact_type or type(model).__name__,
+            project_id=project_id,
+            task_id=task_id,
+            attempt_no=attempt_no,
+            producer=ArtifactProducer(role=producer_role, agent_run_id=producer_run_id)
+            if producer_role
+            else None,
+            base_commit=base_commit,
+            input_manifest_hash=input_manifest_hash,
+            created_at=created_at,
+            payload=model.model_dump(mode="json"),
+        )
+        return self.save_json(path, envelope.model_dump(mode="json"))
+
+    @staticmethod
+    def unwrap_envelope(data: dict | list) -> dict | list:
+        """Accept both enveloped and legacy raw artifact documents."""
+        if isinstance(data, dict) and "artifact_type" in data and "payload" in data:
+            return data["payload"]
+        return data
+
+    # -- large output retention ---------------------------------------------
+
+    def spill_text_output(
+        self,
+        name: str,
+        text: str,
+        *,
+        threshold: int = DEFAULT_SPILL_THRESHOLD,
+        head_chars: int = SPILL_HEAD_CHARS,
+        tail_chars: int = SPILL_TAIL_CHARS,
+    ) -> SpilledOutput:
+        """Persist `text` fully under artifacts/spill/ and return a bounded
+        preview safe to place in agent context. The full output is never lost."""
+        path = self.root / "spill" / name
+        self.save_text(path, text)
+        truncated = len(text) > threshold
+        return SpilledOutput(
+            artifact_path=str(path),
+            sha256=sha256_text(text),
+            total_bytes=len(text.encode("utf-8")),
+            truncated=truncated,
+            head=text if not truncated else text[:head_chars],
+            tail="" if not truncated else text[-tail_chars:],
+        )
 
     def save_text(self, path: Path, text: str) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)

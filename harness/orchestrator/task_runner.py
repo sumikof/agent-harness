@@ -19,12 +19,17 @@ from ..context.attempt_context import AttemptContext
 from ..context.project_context import ProjectContext
 from ..context.task_context import TaskContext
 from ..database.event_repository import EventRepository
-from ..database.run_repository import RunRepository
+from ..database.operation_repository import (
+    OperationRepository,
+    OperationStatus,
+    OperationType,
+)
+from ..database.run_repository import VERIFY_FAIL, VERIFY_PASS, RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.repository import GitRepository
 from ..verification.runner import VerificationRunner
-from .agent_invoker import AgentInvoker, AgentRunFailed
+from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded
 from .state_machine import (
     AttemptState,
@@ -61,6 +66,7 @@ class TaskRunner:
         git: GitRepository,
         checkpoint: CheckpointManager,
         verifier: VerificationRunner,
+        operations: OperationRepository | None = None,
     ):
         self.config = config
         self.invoker = invoker
@@ -71,6 +77,7 @@ class TaskRunner:
         self.git = git
         self.checkpoint = checkpoint
         self.verifier = verifier
+        self.operations = operations
 
     async def run_task(
         self, project_id: int, task_row: sqlite3.Row, project_ctx: ProjectContext
@@ -128,6 +135,16 @@ class TaskRunner:
                                      payload={"reason": str(exc)})
                     return TaskOutcome.BLOCKED
                 raise  # project-scope budget: the Project Loop pauses the project
+            except AgentConfigurationError as exc:
+                # A provider/profile misconfiguration fails identically on
+                # every retry: block loudly instead of burning attempts.
+                logger.error("configuration error on %s: %s", task_key, exc)
+                self._archive_and_discard(task_key, "config-error")
+                self._finish_running_attempts(task_id, AttemptState.FAILED)
+                self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
+                self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
+                                 payload={"reason": f"configuration error: {exc.detail}"})
+                return TaskOutcome.BLOCKED
             except AgentRunFailed as exc:
                 logger.error("agent run failed on %s: %s", task_key, exc)
                 # The attempt opened above is closed as FAILED, so this
@@ -138,7 +155,7 @@ class TaskRunner:
                 # in its context, and the tree is reset before diagnosis.
                 feedback = AttemptContext(
                     previous_attempt_summary=f"Previous attempt aborted: {exc.detail}",
-                    current_diff=self._safe_diff(),
+                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-aborted.diff"),
                 )
                 kind, payload = ("AGENT_FAILURE", None)
 
@@ -160,14 +177,14 @@ class TaskRunner:
                 self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
                 feedback = AttemptContext(
                     verification_failure=payload.model_dump(),
-                    current_diff=self._safe_diff(),
+                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-verify-fail.diff"),
                 )
             elif kind == "REPAIR":
                 self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
                 self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
                 feedback = AttemptContext(
                     review_feedback=payload.model_dump(),
-                    current_diff=self._safe_diff(),
+                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-repair.diff"),
                 )
             # AGENT_FAILURE: feedback already set above
 
@@ -227,12 +244,33 @@ class TaskRunner:
         )
         task_ctx.test_report = report.model_dump()
 
-        # Deterministic verification: exit codes, not agent claims
+        # Deterministic verification: exit codes, not agent claims. The
+        # command execution is journaled as an operation so a crash mid-run
+        # is visible as an unfinished VERIFICATION_COMMAND intent.
         self.tasks.set_status(task_id, TaskState.VERIFYING)
         self.events.emit("TEST_STARTED", project_id=project_id, task_id=task_id, attempt_id=attempt_id)
+        verify_op_id = None
+        if self.operations:
+            verify_op_id = self.operations.record_intent(
+                OperationType.VERIFICATION_COMMAND,
+                {"commands": self.verifier.commands(), "label": f"{task_key}-a{attempt_id}"},
+                project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+            )
         verification = self.verifier.run(label=f"{task_key}-a{attempt_id}")
+        if self.operations and verify_op_id:
+            self.operations.record_result(
+                verify_op_id, OperationStatus.COMPLETED,
+                {"passed": verification.passed,
+                 "exit_codes": [s.exit_code for s in verification.steps]},
+            )
         self.artifacts.save_model(
             self.artifacts.task_artifact_path(task_key, "verification-result.json"), verification
+        )
+        # Verification evidence is recorded per attempt so "COMPLETED implies
+        # a deterministic PASS" is checkable later (invariant checker).
+        self.runs.record_evaluation(
+            attempt_id, VERIFY_PASS if verification.passed else VERIFY_FAIL,
+            verification.model_dump(),
         )
         if decide_after_verification(verification.passed) == Role.DEVELOPER:
             self.events.emit(
@@ -244,11 +282,11 @@ class TaskRunner:
         # Independent Reviewer (fresh session, read-only)
         self.tasks.set_status(task_id, TaskState.REVIEWING)
         self.events.emit("REVIEW_STARTED", project_id=project_id, task_id=task_id, attempt_id=attempt_id)
-        diff = self._safe_diff()
+        diff_preview = self._bounded_diff(f"{task_key}-a{attempt_id}-review.diff",
+                                          limit=REVIEW_DIFF_LIMIT)
         extra = (
             "## Change under review (uncommitted diff)\n```diff\n"
-            + diff[:REVIEW_DIFF_LIMIT]
-            + ("\n... (truncated)" if len(diff) > REVIEW_DIFF_LIMIT else "")
+            + diff_preview
             + "\n```\n\n## Deterministic verification result\n```json\n"
             + json.dumps(verification.model_dump(), indent=2)[:4000]
             + "\n```"
@@ -359,7 +397,23 @@ class TaskRunner:
     def _complete_task(
         self, project_id: int, task_id: int, task_key: str, attempt_id: int, task_row: sqlite3.Row
     ) -> TaskOutcome:
-        commit_hash = self.checkpoint.commit_task(task_key, task_row["title"])
+        # Completion evidence is deterministic, not an agent claim: the
+        # attempt must carry a recorded verification PASS and a Reviewer
+        # PASS before the checkpoint commit may happen.
+        if not self.runs.has_evaluation(attempt_id, VERIFY_PASS):
+            raise RuntimeError(
+                f"refusing to complete {task_key}: attempt {attempt_id} has no "
+                "recorded deterministic verification PASS"
+            )
+        if not self.runs.has_evaluation(attempt_id, ReviewVerdict.PASS.value):
+            raise RuntimeError(
+                f"refusing to complete {task_key}: attempt {attempt_id} has no "
+                "recorded Reviewer PASS"
+            )
+        commit_hash = self.checkpoint.commit_task(
+            task_key, task_row["title"],
+            project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+        )
         self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
         if commit_hash:
             self.tasks.set_commit(task_id, commit_hash)
@@ -419,6 +473,19 @@ class TaskRunner:
         except Exception as exc:
             logger.warning("could not capture diff: %s", exc)
             return ""
+
+    def _bounded_diff(self, spill_name: str, limit: int | None = None) -> str:
+        """The current dirty diff, spilled to an artifact when oversized.
+
+        The full diff is always retained on disk; agent context receives at
+        most a bounded head/tail preview plus the artifact locator.
+        """
+        diff = self._safe_diff()
+        threshold = limit or self.config.limits.max_inline_output_chars
+        if len(diff) <= threshold:
+            return diff
+        spilled = self.artifacts.spill_text_output(spill_name, diff, threshold=threshold)
+        return spilled.render()
 
     def _build_task_ctx(self, task_row: sqlite3.Row) -> TaskContext:
         return TaskContext(

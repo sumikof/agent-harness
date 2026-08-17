@@ -93,7 +93,12 @@ class GitRepository:
     def add_all(self) -> None:
         self._run("add", "-A")
 
-    def commit(self, message: str, allow_empty: bool = False) -> str:
+    def commit(
+        self, message: str, allow_empty: bool = False, trailers: dict[str, str] | None = None
+    ) -> str:
+        if trailers:
+            trailer_block = "\n".join(f"{key}: {value}" for key, value in trailers.items())
+            message = f"{message}\n\n{trailer_block}"
         args = [
             "-c", "user.name=agent-harness",
             "-c", "user.email=agent-harness@localhost",
@@ -103,6 +108,29 @@ class GitRepository:
             args.append("--allow-empty")
         self._run(*args)
         return self.head_commit() or ""
+
+    def find_commit_by_trailer(self, key: str, value: str, limit: int = 500) -> str | None:
+        """Find a recent commit whose message carries `key: value`.
+
+        Used by crash recovery to decide whether a journaled GIT_COMMIT
+        intent was already executed before the process died.
+        """
+        result = self._run(
+            "log", f"-{limit}", "--fixed-strings", f"--grep={key}: {value}",
+            "--format=%H", check=False,
+        )
+        if result.returncode != 0:
+            return None
+        commits = result.stdout.split()
+        return commits[0] if commits else None
+
+    def commit_message(self, ref: str) -> str:
+        result = self._run("log", "-1", "--format=%B", ref, check=False)
+        return result.stdout if result.returncode == 0 else ""
+
+    def commit_exists(self, ref: str) -> bool:
+        result = self._run("cat-file", "-e", f"{ref}^{{commit}}", check=False)
+        return result.returncode == 0
 
     def reset_hard(self, ref: str = "HEAD") -> None:
         # `clean -fd` deliberately leaves ignored files alone: build caches

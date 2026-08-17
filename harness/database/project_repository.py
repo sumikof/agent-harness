@@ -6,11 +6,13 @@ import sqlite3
 
 from ..orchestrator.state_machine import ProjectState, assert_project_transition
 from .connection import Database, utcnow
+from .event_repository import EventRepository, EventType
 
 
 class ProjectRepository:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, events: EventRepository | None = None):
         self.db = db
+        self.events = events
 
     def create(
         self,
@@ -42,10 +44,17 @@ class ProjectRepository:
             raise ValueError(f"unknown project id {project_id}")
         if not force:
             assert_project_transition(ProjectState(row["status"]), status)
-        self.db.execute(
-            "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
-            (status.value, utcnow(), project_id),
-        )
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, utcnow(), project_id),
+            )
+            if self.events:
+                self.events.emit(
+                    EventType.PROJECT_STATE_CHANGED,
+                    project_id=project_id,
+                    payload={"from": row["status"], "to": status.value, "forced": force},
+                )
 
     def update_identity(self, project_id: int, repository: str, base_branch: str) -> None:
         """Correct a misconfigured project before any work has begun."""

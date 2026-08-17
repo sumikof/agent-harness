@@ -17,16 +17,18 @@ from ..config import HarnessConfig
 from ..context.builder import ContextBuilder, render_plan_for_replan
 from ..context.project_context import DEFAULT_FORBIDDEN_OPERATIONS, ProjectContext
 from ..database.connection import Database
-from ..database.event_repository import EventRepository
+from ..database.event_repository import EventRepository, EventType
+from ..database.operation_repository import OperationRepository
 from ..database.project_repository import ProjectRepository
 from ..database.run_repository import RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.repository import GitRepository
 from ..verification.runner import VerificationRunner
-from .agent_invoker import AgentInvoker, AgentRunFailed
+from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded, BudgetManager
-from .recovery import RecoveryManager
+from .invariants import InvariantChecker, Severity
+from .recovery import RecoveryIntegrityError, RecoveryManager
 from .state_machine import ProjectState, TaskState
 from .task_runner import TaskOutcome, TaskRunner
 
@@ -42,28 +44,34 @@ class ProjectOrchestrator:
         config.logs_path.mkdir(parents=True, exist_ok=True)
 
         self.db = Database(config.db_path)
-        self.projects = ProjectRepository(self.db)
-        self.tasks = TaskRepository(self.db)
-        self.runs = RunRepository(self.db)
         self.events = EventRepository(self.db)
+        # Repositories share the EventRepository so every state change and
+        # its ledger event are written in one transaction.
+        self.projects = ProjectRepository(self.db, self.events)
+        self.tasks = TaskRepository(self.db, self.events)
+        self.runs = RunRepository(self.db)
+        self.operations = OperationRepository(self.db, self.events)
         self.artifacts = ArtifactManager(config.artifacts_path)
         self.git = GitRepository(config.repository_path)
-        self.checkpoint = CheckpointManager(self.git)
+        self.checkpoint = CheckpointManager(self.git, self.operations)
         self.verifier = VerificationRunner(
             config.verification, config.repository_path, config.logs_path / "verification"
         )
         self.context_builder = ContextBuilder(config.prompts_path)
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(
-            config, self.context_builder, self.artifacts, self.runs, self.events, self.budget
+            config, self.context_builder, self.artifacts, self.runs, self.events,
+            self.budget, self.operations, self.git,
         )
         self.task_runner = TaskRunner(
             config, self.invoker, self.tasks, self.runs, self.events,
-            self.artifacts, self.git, self.checkpoint, self.verifier,
+            self.artifacts, self.git, self.checkpoint, self.verifier, self.operations,
         )
         self.recovery = RecoveryManager(
-            self.tasks, self.events, self.artifacts, self.git, self.checkpoint
+            self.tasks, self.events, self.artifacts, self.git, self.checkpoint,
+            operations=self.operations, runs=self.runs,
         )
+        self.invariants = InvariantChecker(self.db, self.git)
         self._replan_for_new_goal = False
 
     # ------------------------------------------------------------------
@@ -168,7 +176,36 @@ class ProjectOrchestrator:
     async def run(self) -> ProjectState:
         project = self.ensure_project()
         project_id = project["id"]
-        self.recovery.recover(project)
+        try:
+            self.recovery.recover(project)
+        except RecoveryIntegrityError as exc:
+            # The state plane itself cannot be trusted; never run on top of it.
+            logger.error("recovery integrity failure: %s", exc)
+            self.projects.set_status(project_id, ProjectState.BLOCKED, force=True)
+            self.events.emit(EventType.PROJECT_BLOCKED, project_id=project_id,
+                             payload={"reason": str(exc)})
+            return ProjectState.BLOCKED
+
+        # Invariant validation after recovery: ERROR-severity violations
+        # block loudly instead of being silently repaired; warnings are
+        # recorded to the ledger.
+        violations = self.invariants.check_all(project_id)
+        errors = [v for v in violations if v.severity == Severity.ERROR]
+        for violation in violations:
+            self.events.emit(
+                EventType.INVARIANT_VIOLATION if violation.severity == Severity.ERROR
+                else EventType.INVARIANT_WARNING,
+                project_id=project_id,
+                payload={"code": violation.code, "message": violation.message},
+            )
+            logger.log(
+                logging.ERROR if violation.severity == Severity.ERROR else logging.WARNING,
+                "invariant %s: %s", violation.code, violation.message,
+            )
+        if errors:
+            self.projects.set_status(project_id, ProjectState.BLOCKED, force=True)
+            return ProjectState.BLOCKED
+
         project = self.projects.get(project_id)
         state = ProjectState(project["status"])
         project_ctx = self.project_context()
@@ -204,6 +241,14 @@ class ProjectOrchestrator:
             self.projects.set_status(project_id, ProjectState.PAUSED, force=True)
             self.events.emit("PROJECT_PAUSED", project_id=project_id, payload={"reason": str(exc)})
             return ProjectState.PAUSED
+        except AgentConfigurationError as exc:
+            # Misconfiguration (missing capability, bad provider) is not
+            # retryable at any layer — fail the project explicitly.
+            logger.error("project failed (configuration): %s", exc)
+            self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+            self.events.emit("PROJECT_FAILED", project_id=project_id,
+                             payload={"reason": f"configuration error: {exc.detail}"})
+            return ProjectState.FAILED
         except AgentRunFailed as exc:
             logger.error("project failed: %s", exc)
             self.projects.set_status(project_id, ProjectState.FAILED, force=True)

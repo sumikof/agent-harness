@@ -96,15 +96,30 @@ workspace/
 └── logs/
 ```
 
+## 耐障害性レイヤー
+
+状態の正本(SQLite + Git + Artifacts)の上に、durable executionのための層を持つ:
+
+- **Event Ledger** — `events` はappend-onlyのstream台帳。`(stream_type, stream_id, seq)` で連続番号が保証され、State変更(`UPDATE tasks` 等)と対応するEventのINSERTは同一トランザクションでatomicに行われる。
+- **Operation Intent/Result** — 外部副作用(Agent dispatch / Verification / Git commit)は「Intentを永続化 → 副作用実行 → Resultを永続化」の順で `operations` にjournalされる。HarnessのGit Commitには `Harness-Task` / `Harness-Operation-Id` trailerが付く。
+- **ContextManifest** — Agent起動前に、そのAgentへ渡す全Contextセクションをartifactとして固定・ハッシュ化する。Manifestの保存に失敗したAgentは起動しない。
+- **ResolvedAgentRunSpec** — provider / model / profile hash / allowed tools / timeout 等、実際に実行される内容をdispatch前に確定しdurableに保存する。
+- **AgentCapabilities / AgentProfile** — Providerの能力差を明示し、必要Capabilityを満たさないProviderは実行前に設定エラー(BLOCKED/FAILED)として拒否する。各AgentRunはprofile hash/versionを記録する。
+- **Retry 3層** — Provider Retry(transientのみ・有限・指数backoff・attempt消費なし)/ Episode Recovery(中断復旧、原則Fresh Session)/ Reasoning Retry(Verification FAIL・REPAIR、常に新AgentRun + attempt増加)。Permanent failure(認証・設定エラー)はretryしない。
+- **Invariant Checker** — 起動時に「COMPLETEDにはVerification PASS / Reviewer PASS / 解決可能なCommitがある」「RUNNING AgentRunは最大1件かつManifest/Specを持つ」「stream seqにgapがない」等を検証し、違反は黙って修復せずBLOCKEDにする。
+- **Large Output Spill** — 巨大なdiff・ログはartifactへ全量保存し、Agent Contextにはhead/tail preview + locator(path / sha256 / bytes)のみ渡す。
+- **Repeat Action Guard** — 同一Tool Callの連続繰り返しを検出し、警告→拒否+LOOP_DETECTEDをOrchestratorへ報告する(pre-tool hookを持つProviderのみ)。
+
 ## 中断・復旧
 
-Harnessプロセスは途中終了を前提とする。起動時にSQLiteとGitの状態を照合し、
-RUNNINGのままのAttemptを検出した場合:
+Harnessプロセスは途中終了を前提とする。起動時は次の順で照合する:
 
-1. Dirty Diff を `artifacts/diagnostics/` へ保存
-2. `git reset --hard HEAD`(最後の正常Commitへ)
-3. Attempt を INTERRUPTED として記録
-4. Task を READY に戻し、Fresh Session で再実行
+1. SQLite integrity check → Event Ledgerのseq連続性検証(破損は修復せずBLOCKED)
+2. 未完了Operationの検出。GIT_COMMIT Intentは `Harness-Operation-Id` trailerでGit実状態とreconcileする — Commit済みならDB側を追いつかせ(二重Commitしない)、未実行ならFAILEDとして通常のretryへ
+3. RUNNINGのままのAttemptがあれば: Dirty Diffを `artifacts/diagnostics/` へ保存 → `git reset --hard HEAD` → AttemptをINTERRUPTED記録 → TaskをREADYへ戻しFresh Sessionで再実行
+4. RUNNINGのままのAgentRunをINTERRUPTEDとして閉じ、Invariant検証後にProject Loopを再開
+
+RUNNINGのAttemptで説明できないdirty treeはユーザの作業とみなし、破壊せず起動を拒否する。
 
 ## Budget管理
 
@@ -116,8 +131,12 @@ PAUSEDのProjectは予算を引き上げて `run` し直せば継続する。
 ## Provider抽象化
 
 Claude Agent SDKへの依存は `harness/agents/base.py` の `ClaudeAgentRunner` に閉じている。
-`AgentRunner` Protocolを実装すれば他のエンジン(Codex、ローカルLLM等)へ差し替え可能で、
-`config.yaml` の `provider.roles` によりロールごとに異なるProvider/Modelを選択できる。
+`AgentRunner` Protocolは `capabilities()` / `resolve(request) -> ResolvedAgentRunSpec` /
+`run(spec)` の3段階で、実行内容の確定と実行が分離されている。これを実装すれば
+他のエンジン(Codex、ローカルLLM等)へ差し替え可能で、`config.yaml` の
+`provider.roles` によりロールごとに異なるProvider/Modelを選択できる。
+Provider固有機能(hook / telemetry / resume等)はCapabilityで宣言し、
+Coreの正当性条件には含めない。
 
 ## 開発
 
@@ -130,7 +149,7 @@ python -m pytest -q     # LLM不要。FakeRunnerでオーケストレーショ�
 - `harness/orchestrator/` — Project/Taskループ、State Machine、Recovery、Budget
 - `harness/agents/` — Provider抽象化とロール定義
 - `harness/context/` — Project / Task / Attempt の3階層Context Builder
-- `harness/database/` — SQLiteリポジトリ層(projects / tasks / task_attempts / agent_runs / evaluations / events)
+- `harness/database/` — SQLiteリポジトリ層(projects / tasks / task_attempts / agent_runs / evaluations / events / operations)
 - `harness/verification/` — Deterministic Verification(java / python / node プリセット)
 - `harness/git/` — Git操作とCheckpoint
 - `harness/security/` — 禁止コマンド・Tool Permission・PreToolUse Hook

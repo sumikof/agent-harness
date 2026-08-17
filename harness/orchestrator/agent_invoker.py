@@ -1,33 +1,69 @@
 """Runs one agent role as a fresh session and returns its validated artifact.
 
-Owns the mechanics every role invocation shares: budget checks, DB run
+Owns the mechanics every role invocation shares: budget checks, capability
+validation, ContextManifest + ResolvedAgentRunSpec persistence (both are
+durable BEFORE dispatch), AGENT_DISPATCH intent/result journaling, DB run
 records, prompt assembly, structured-output validation (with one guided
-retry), artifact persistence, and technical-failure retries.
+retry), artifact persistence, and provider-failure retries.
+
+Retry layering (see also task_runner.py):
+- Provider retry: transient infrastructure failures, bounded, exponential
+  backoff, same task attempt. Permanent failures are never provider-retried.
+- Episode recovery: crash/interruption handling lives in recovery.py;
+  resume is only used when a provider supports it AND the episode is known
+  safe to continue — otherwise a fresh session.
+- Reasoning retry: verification FAIL / review REPAIR — always a new
+  AgentRun with a fresh session and an incremented task attempt
+  (decided in task_runner.py, never here).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel
 
-from ..agents.base import AgentRequest, AgentResult, RoleSpec, create_runner, validate_output
-from ..artifacts.manager import ArtifactManager
+from ..agents.base import (
+    AgentRequest,
+    AgentResult,
+    FailureKind,
+    RoleSpec,
+    create_runner,
+    validate_output,
+)
+from ..agents.profile import (
+    ROLE_REQUIRED_CAPABILITIES,
+    AgentProfile,
+    RepeatGuardConfig,
+    ResolvedAgentRunSpec,
+)
+from ..artifacts.manager import ArtifactManager, sha256_text
 from ..config import HarnessConfig
 from ..context.attempt_context import AttemptContext
 from ..context.builder import ContextBuilder
+from ..context.manifest import ContextManifest, ContextRef
 from ..context.project_context import ProjectContext
 from ..context.task_context import TaskContext
-from ..database.event_repository import EventRepository
+from ..database.connection import utcnow
+from ..database.event_repository import EventRepository, EventType
+from ..database.operation_repository import (
+    OperationRepository,
+    OperationStatus,
+    OperationType,
+)
 from ..database.run_repository import RunRepository
+from ..git.repository import GitRepository
+from ..security.permissions import TEST_WRITE_GLOBS, allowed_tools_for
 from .budget import BudgetManager
+from .state_machine import Role
 
 logger = logging.getLogger(__name__)
 
-TECHNICAL_RETRIES = 2          # transient API/transport failures
+TECHNICAL_RETRIES = 2          # transient provider failures (rate limit, transport, 5xx)
 TECHNICAL_RETRY_DELAY = 15.0   # seconds, doubled per retry
 SCHEMA_RETRIES = 1             # one guided re-ask if JSON fails validation
 
@@ -39,6 +75,23 @@ class AgentRunFailed(Exception):
         super().__init__(f"agent run failed ({role}): {detail}")
 
 
+class AgentConfigurationError(Exception):
+    """Provider/profile misconfiguration (e.g. missing capability).
+
+    Never retried at any layer: the run would fail identically every time.
+    Surfaces as BLOCKED/FAILED, not as a burned attempt cycle.
+    """
+
+    def __init__(self, role: str, detail: str):
+        self.role = role
+        self.detail = detail
+        super().__init__(f"agent configuration error ({role}): {detail}")
+
+
+class ConcurrentRunError(Exception):
+    """A second RUNNING AgentRun would violate the max-1 invariant."""
+
+
 class AgentInvoker:
     def __init__(
         self,
@@ -48,6 +101,8 @@ class AgentInvoker:
         runs: RunRepository,
         events: EventRepository,
         budget: BudgetManager,
+        operations: Optional[OperationRepository] = None,
+        git: Optional[GitRepository] = None,
     ):
         self.config = config
         self.context_builder = context_builder
@@ -55,6 +110,33 @@ class AgentInvoker:
         self.runs = runs
         self.events = events
         self.budget = budget
+        self.operations = operations
+        self.git = git
+
+    # ------------------------------------------------------------------
+
+    def build_profile(self, spec: RoleSpec) -> AgentProfile:
+        provider_type, model = self.config.provider.for_role(spec.role.value)
+        writable: list[str] = []
+        if spec.role == Role.DEVELOPER:
+            writable = ["**"]
+        elif spec.role == Role.TESTER:
+            writable = list(TEST_WRITE_GLOBS)
+        return AgentProfile(
+            profile_id=f"{spec.role.value}@{provider_type}",
+            role=spec.role.value,
+            provider=provider_type,
+            model=model,
+            prompt_file=spec.prompt_file,
+            prompt_template_hash=self.context_builder.prompt_template_hash(spec.prompt_file),
+            required_capabilities=list(ROLE_REQUIRED_CAPABILITIES[spec.role]),
+            allowed_tools=allowed_tools_for(spec.role),
+            writable_paths=writable,
+            output_schema=spec.output_model.__name__ if spec.output_model else "",
+            max_turns=self.config.limits.max_turns,
+            timeout_seconds=self.config.limits.agent_run_timeout_seconds,
+            budget_usd=self.config.budget.agent_run_usd,
+        )
 
     async def invoke(
         self,
@@ -73,27 +155,33 @@ class AgentInvoker:
         if task_id is not None:
             self.budget.check_task(task_id)
 
-        provider_type, model = self.config.provider.for_role(spec.role.value)
-        runner = create_runner(provider_type)
+        profile = self.build_profile(spec)
+        runner = create_runner(profile.provider)
+
+        # Capability validation happens BEFORE anything is dispatched. A
+        # provider missing a required capability is a configuration error,
+        # never a silently degraded run.
+        missing = runner.capabilities().missing(profile.required_capabilities)
+        if missing:
+            raise AgentConfigurationError(
+                spec.role.value,
+                f"provider '{profile.provider}' lacks required capabilities: {', '.join(missing)}",
+            )
+
         system_prompt = self.context_builder.system_prompt(spec.prompt_file)
-        prompt = self.context_builder.build_prompt(
+        sections = self.context_builder.build_sections(
             spec.role, project_ctx, task_ctx, attempt_ctx, extra
         )
 
         schema_feedback = ""
         last_error = "unknown"
         for schema_round in range(SCHEMA_RETRIES + 1):
-            result = await self._run_with_technical_retries(
+            result, run_id = await self._run_with_technical_retries(
                 runner,
-                AgentRequest(
-                    role=spec.role,
-                    system_prompt=system_prompt,
-                    prompt=prompt + schema_feedback,
-                    cwd=self.config.repository_path,
-                    repo_root=self.config.repository_path,
-                    model=model,
-                    max_turns=self.config.limits.max_turns,
-                ),
+                profile,
+                system_prompt,
+                sections,
+                schema_feedback,
                 spec,
                 project_id,
                 task_id,
@@ -105,7 +193,20 @@ class AgentInvoker:
             model_obj, validation_error = validate_output(result, spec.output_model)
             if model_obj is not None:
                 if artifact_path is not None:
-                    self.artifacts.save_model(artifact_path, model_obj)
+                    attempt_no = None
+                    if attempt_ctx is not None:
+                        attempt_no = attempt_ctx.attempt_no
+                    self.artifacts.save_enveloped(
+                        artifact_path,
+                        model_obj,
+                        project_id=project_id,
+                        task_id=task_id,
+                        attempt_no=attempt_no,
+                        producer_role=spec.role.value,
+                        producer_run_id=run_id,
+                        base_commit=self.git.head_commit() if self.git else None,
+                        created_at=utcnow(),
+                    )
                 return model_obj
 
             last_error = validation_error or "invalid output"
@@ -118,32 +219,172 @@ class AgentInvoker:
 
         raise AgentRunFailed(spec.role.value, f"structured output invalid after retries: {last_error}")
 
+    # ------------------------------------------------------------------
+
+    def _persist_manifest(
+        self,
+        profile: AgentProfile,
+        system_prompt: str,
+        sections: list[tuple[str, str]],
+        schema_feedback: str,
+        prompt: str,
+        project_id: int,
+        task_id: Optional[int],
+        attempt_no: Optional[int],
+    ) -> tuple[ContextManifest, Path]:
+        """Write every context section + the manifest to artifact files.
+
+        Raises on any I/O failure — the agent must not start without a
+        durable manifest.
+        """
+        manifest_key = uuid.uuid4().hex
+        manifest_dir = self.artifacts.root / "manifests" / manifest_key
+        refs: dict[str, ContextRef] = {}
+        all_sections = list(sections)
+        if schema_feedback:
+            all_sections.append(("correction", schema_feedback))
+        for name, text in all_sections:
+            section_path = manifest_dir / f"{name}.md"
+            self.artifacts.save_text(section_path, text)
+            refs[name] = ContextRef(
+                artifact=str(section_path), sha256=sha256_text(text)
+            )
+        manifest = ContextManifest(
+            project_id=project_id,
+            task_id=task_id,
+            attempt_no=attempt_no,
+            role=profile.role,
+            base_commit=self.git.head_commit() if self.git else None,
+            sections=refs,
+            prompt_template_hash=profile.prompt_template_hash,
+            agent_profile_hash=profile.profile_hash(),
+            prompt_sha256=sha256_text(prompt),
+            system_prompt_sha256=sha256_text(system_prompt),
+            created_at=utcnow(),
+        )
+        manifest_path = manifest_dir / "manifest.json"
+        self.artifacts.save_model(manifest_path, manifest)
+        # Read back: the manifest existing on disk is a dispatch precondition.
+        if self.artifacts.load_json(manifest_path) is None:
+            raise AgentRunFailed(profile.role, "context manifest could not be persisted")
+        return manifest, manifest_path
+
     async def _run_with_technical_retries(
         self,
         runner,
-        request: AgentRequest,
+        profile: AgentProfile,
+        system_prompt: str,
+        sections: list[tuple[str, str]],
+        schema_feedback: str,
         spec: RoleSpec,
         project_id: int,
         task_id: Optional[int],
         attempt_id: Optional[int],
-    ) -> AgentResult:
+    ) -> tuple[AgentResult, Optional[int]]:
         delay = TECHNICAL_RETRY_DELAY
+        prompt = "\n\n".join(text for _, text in sections) + schema_feedback
+        attempt_no = None
+        if attempt_id is not None:
+            row = self.runs.db.query_one(
+                "SELECT attempt_no FROM task_attempts WHERE id = ?", (attempt_id,)
+            )
+            attempt_no = row["attempt_no"] if row else None
         result: AgentResult = AgentResult(status="FAILED", error="not run")
+        run_id: Optional[int] = None
         for attempt in range(TECHNICAL_RETRIES + 1):
             # Every physical provider call spends money — failed runs and
             # schema retries included — so limits are re-checked before each.
             self.budget.check_project(project_id)
             if task_id is not None:
                 self.budget.check_task(task_id)
-            run_id = self.runs.start_run(project_id, spec.role.value, attempt_id)
-            self.events.emit(
-                "AGENT_STARTED",
-                project_id=project_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                payload={"role": spec.role.value, "run_id": run_id, "technical_attempt": attempt},
+            # Only one agent may ever be in flight (deterministic invariant).
+            stale = self.runs.running_runs(project_id)
+            if stale:
+                raise ConcurrentRunError(
+                    f"agent run(s) {[r['id'] for r in stale]} still RUNNING; "
+                    "refusing to dispatch a second concurrent agent"
+                )
+
+            # 1. ContextManifest — durable before anything else. Failure to
+            #    persist it aborts the dispatch entirely.
+            manifest, manifest_path = self._persist_manifest(
+                profile, system_prompt, sections, schema_feedback, prompt,
+                project_id, task_id, attempt_no,
             )
-            result = await runner.run(request)
+
+            # 2. Resolve the run spec (still nothing dispatched).
+            request = AgentRequest(
+                role=spec.role,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                cwd=self.config.repository_path,
+                repo_root=self.config.repository_path,
+                model=profile.model,
+                max_turns=profile.max_turns,
+                timeout_seconds=profile.timeout_seconds,
+                profile=profile,
+                context_manifest_path=str(manifest_path),
+                context_manifest_hash=sha256_text(manifest.model_dump_json()),
+                repeat_guard=RepeatGuardConfig(
+                    enabled=self.config.repeat_guard.enabled,
+                    warn_after=self.config.repeat_guard.warn_after,
+                    abort_after=self.config.repeat_guard.abort_after,
+                    exempt_tools=list(self.config.repeat_guard.exempt_tools),
+                ),
+            )
+            resolved: ResolvedAgentRunSpec = await runner.resolve(request)
+
+            # 3. One transaction: run row + resolved spec + dispatch intent.
+            #    Durable COMMIT happens before the side effect (dispatch).
+            db = self.runs.db
+            with db.transaction():
+                run_id = self.runs.start_run(
+                    project_id,
+                    spec.role.value,
+                    attempt_id,
+                    provider=resolved.provider,
+                    model=resolved.model,
+                    profile_hash=resolved.profile_hash,
+                    profile_version=resolved.profile_version,
+                    context_manifest_path=resolved.context_manifest_path,
+                    context_manifest_hash=resolved.context_manifest_hash,
+                    resolved_spec=resolved.persistable_dump(),
+                )
+                dispatch_op_id = None
+                if self.operations:
+                    dispatch_op_id = self.operations.record_intent(
+                        OperationType.AGENT_DISPATCH,
+                        {
+                            "role": spec.role.value,
+                            "provider": resolved.provider,
+                            "model": resolved.model,
+                            "technical_attempt": attempt,
+                            "run_id": run_id,
+                        },
+                        project_id=project_id,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        agent_run_id=run_id,
+                    )
+                    db.execute(
+                        "UPDATE agent_runs SET dispatch_operation_id = ? WHERE id = ?",
+                        (dispatch_op_id, run_id),
+                    )
+                self.events.emit(
+                    EventType.AGENT_STARTED,
+                    project_id=project_id,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    agent_run_id=run_id,
+                    operation_id=dispatch_op_id,
+                    payload={"role": spec.role.value, "run_id": run_id,
+                             "technical_attempt": attempt},
+                )
+
+            # 4. Side effect: the actual agent session.
+            result = await runner.run(resolved)
+
+            # 5. Result — run row, operation result, cost, events.
             self.runs.finish_run(
                 run_id,
                 status=result.status,
@@ -153,6 +394,15 @@ class AgentInvoker:
                 cost_usd=result.cost_usd,
                 error=result.error,
             )
+            if self.operations and dispatch_op_id:
+                self.operations.record_result(
+                    dispatch_op_id,
+                    OperationStatus.COMPLETED
+                    if result.status == "COMPLETED"
+                    else OperationStatus.FAILED,
+                    {"status": result.status, "error": result.error,
+                     "cost_usd": result.cost_usd},
+                )
             self.budget.record_cost(project_id, task_id, result.cost_usd)
             # Per-run budget: the SDK offers no mid-run cost cutoff, so the
             # cap is enforced right after every run — failed ones included.
@@ -169,25 +419,51 @@ class AgentInvoker:
                     spec.role.value,
                     f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
                 )
+            for warning in result.loop_warnings:
+                self.events.emit(
+                    EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
+                    attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                )
+            if result.loop_detected:
+                # The guard only flags; the Orchestrator (this code path and
+                # the task loop above it) owns the resulting transition.
+                self.events.emit(
+                    EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
+                    attempt_id=attempt_id, agent_run_id=run_id,
+                    payload={"role": spec.role.value, "run_id": run_id},
+                )
+            if result.telemetry:
+                self.events.emit(
+                    EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
+                    attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                )
             self.events.emit(
-                "AGENT_COMPLETED" if result.status == "COMPLETED" else "AGENT_FAILED",
+                EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
                 project_id=project_id,
                 task_id=task_id,
                 attempt_id=attempt_id,
+                agent_run_id=run_id,
                 payload={
                     "role": spec.role.value,
                     "run_id": run_id,
                     "cost_usd": result.cost_usd,
                     "turns": result.num_turns,
                     "error": result.error,
+                    "failure_kind": result.failure_kind.value if result.failure_kind else None,
                 },
             )
             if result.status == "COMPLETED":
-                return result
+                return result, run_id
+            # Permanent failures (auth, config, missing model) fail
+            # identically on retry — surface immediately instead.
+            if result.failure_kind == FailureKind.PERMANENT:
+                raise AgentRunFailed(
+                    spec.role.value, f"permanent provider failure: {result.error}"
+                )
             if attempt < TECHNICAL_RETRIES:
                 logger.warning(
                     "%s failed technically (%s); retrying in %.0fs", spec.role, result.error, delay
                 )
                 await asyncio.sleep(delay)
                 delay *= 2
-        return result
+        return result, run_id
