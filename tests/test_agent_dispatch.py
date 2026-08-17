@@ -211,6 +211,64 @@ async def test_running_agent_in_another_project_also_blocks_dispatch(config, mon
     assert runner.specs == []
 
 
+async def test_cap_exceeded_run_is_recorded_consistently(config, monkeypatch):
+    """When a COMPLETED provider result blows the per-run cost cap, the run
+    row, dispatch-operation result and events must all say FAILED — recorded
+    together — with only the raise outside the transaction."""
+    config.budget.agent_run_usd = 1.0
+    orchestrator = ProjectOrchestrator(config)
+    expensive = ok_result()
+    expensive.cost_usd = 5.0
+    runner = ScriptedRunner([expensive])
+    install(monkeypatch, runner)
+
+    with pytest.raises(agent_invoker_module.AgentRunFailed, match="cap"):
+        await invoke_planner(orchestrator)
+
+    run = orchestrator.db.query_one("SELECT * FROM agent_runs")
+    assert run["status"] == "FAILED" and "cap" in run["error"]
+    op = orchestrator.operations.get(run["dispatch_operation_id"])
+    assert op["status"] == "FAILED"                       # not a dangling COMPLETED
+    assert orchestrator.db.query_one(
+        "SELECT 1 FROM events WHERE event_type = 'AGENT_COMPLETED'") is None
+    assert orchestrator.db.query_one(
+        "SELECT 1 FROM events WHERE event_type = 'AGENT_FAILED'") is not None
+    assert orchestrator.projects.get(1)["spent_usd"] == pytest.approx(5.0)
+
+
+def test_workspace_lock_blocks_second_process(tmp_path):
+    """A second harness process on the same workspace must refuse to start —
+    otherwise its recovery would 'reclaim' the first process's live run."""
+    import subprocess
+    import sys
+
+    from harness.workspace_lock import WorkspaceLock
+
+    lock_path = tmp_path / "harness.lock"
+    lock = WorkspaceLock(lock_path)
+    lock.acquire()
+    lock.acquire()  # reentrant within the same process
+
+    probe = (
+        "import sys\n"
+        "from harness.workspace_lock import WorkspaceLock, WorkspaceLocked\n"
+        f"lock = WorkspaceLock({str(lock_path)!r})\n"
+        "try:\n"
+        "    lock.acquire()\n"
+        "except WorkspaceLocked:\n"
+        "    sys.exit(42)\n"
+        "sys.exit(0)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe],
+                            cwd=str(Path(__file__).resolve().parent.parent))
+    assert result.returncode == 42  # the other process was refused
+
+    lock.release()
+    result = subprocess.run([sys.executable, "-c", probe],
+                            cwd=str(Path(__file__).resolve().parent.parent))
+    assert result.returncode == 0   # released lock is acquirable again
+
+
 def test_classify_provider_error():
     assert classify_provider_error("429 rate limit exceeded") == FailureKind.TRANSIENT
     assert classify_provider_error("Connection reset by peer") == FailureKind.TRANSIENT

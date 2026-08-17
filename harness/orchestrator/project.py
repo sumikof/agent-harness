@@ -25,6 +25,7 @@ from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.repository import GitRepository
 from ..verification.runner import VerificationRunner
+from ..workspace_lock import WorkspaceLock
 from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded, BudgetManager
 from .invariants import InvariantChecker, Severity
@@ -42,6 +43,13 @@ class ProjectOrchestrator:
         self.config = config
         config.workspace_path.mkdir(parents=True, exist_ok=True)
         config.logs_path.mkdir(parents=True, exist_ok=True)
+
+        # One process per workspace: without this, a second process's
+        # startup recovery would treat the first process's LIVE RUNNING run
+        # as a crash leftover — interrupting it, freeing the max-1-agent
+        # slot, and resetting a tree an agent is still working in.
+        self.lock = WorkspaceLock(config.workspace_path / "harness.lock")
+        self.lock.acquire()
 
         self.db = Database(config.db_path)
         self.events = EventRepository(self.db)

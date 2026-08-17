@@ -413,6 +413,14 @@ class AgentInvoker:
             if result.loop_detected and result.status == "COMPLETED":
                 result.status = "FAILED"
                 result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
+            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
+            # cap is applied to the run's EFFECTIVE status before anything is
+            # recorded — run row, operation result and events then agree.
+            cap = self.config.budget.agent_run_usd
+            cap_exceeded = result.cost_usd > cap
+            if cap_exceeded and result.status == "COMPLETED":
+                result.status = "FAILED"
+                result.error = f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}"
 
             # 5. Result — run row, operation result, billing and every event
             #    land in ONE transaction, so a crash right after the provider
@@ -473,18 +481,11 @@ class AgentInvoker:
                         "failure_kind": result.failure_kind.value if result.failure_kind else None,
                     },
                 )
-            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
-            # cap is enforced right after every run — failed ones included.
             # An over-budget run fails the attempt (normal retry/diagnosis
-            # path) instead of being retried. Deliberately OUTSIDE the result
-            # transaction: the raise must not roll the recording back.
-            cap = self.config.budget.agent_run_usd
-            if result.cost_usd > cap:
-                self.runs.finish_run(
-                    run_id, status="FAILED", session_id=result.session_id,
-                    token_usage=result.token_usage, cost_usd=result.cost_usd,
-                    error=f"run cost exceeded agent_run_usd cap ${cap:.2f}",
-                )
+            # path) instead of being retried — failed runs included, so a
+            # high-cost failure is never blindly redispatched. Only the raise
+            # lives outside the transaction; the state was recorded above.
+            if cap_exceeded:
                 raise AgentRunFailed(
                     spec.role.value,
                     f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
