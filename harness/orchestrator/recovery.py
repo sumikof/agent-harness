@@ -112,18 +112,32 @@ class RecoveryManager:
         # here — they stay open until the tree is settled below, so a crash
         # inside recovery itself keeps the evidence for the next startup.
         pending_side_effects = 0
+        unexecuted_commit_intents: list[sqlite3.Row] = []
         if self.operations is not None:
             for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
-                self._reconcile_git_commit(project_id, op)
-                acted = True
-            # Both kinds of in-flight side effects can dirty the tree: a
-            # verification command, or a MUTATING agent session whose attempt
-            # was already closed by a previous recovery pass that crashed
-            # mid-reset. A read-only dispatch (e.g. the Planner, which runs
-            # without an attempt) cannot have produced the diff — counting it
-            # would let user edits made while stopped be destroyed.
+                commit_hash = self.checkpoint.find_committed_operation(op["operation_id"])
+                if commit_hash is not None:
+                    # The commit exists — reconcile the DB now; this touches
+                    # no worktree state and must precede any reset.
+                    self._reconcile_executed_commit(project_id, op, commit_hash)
+                    acted = True
+                else:
+                    # Intent journaled but never executed. A commit intent is
+                    # only ever written over a dirty tree, so it stays
+                    # PENDING as dirty-tree evidence until the reset below
+                    # has completed (double-crash safety), and is closed
+                    # FAILED afterwards.
+                    unexecuted_commit_intents.append(op)
+            # In-flight side effects that can explain a dirty tree: a
+            # verification command, an unexecuted checkpoint commit, or a
+            # MUTATING agent session whose attempt was already closed by a
+            # previous recovery pass that crashed mid-reset. A read-only
+            # dispatch (e.g. the Planner, which runs without an attempt)
+            # cannot have produced the diff — counting it would let user
+            # edits made while stopped be destroyed.
             pending_side_effects = len(self.operations.unfinished(
                 OperationType.VERIFICATION_COMMAND, project_id=project_id))
+            pending_side_effects += len(unexecuted_commit_intents)
             for op in self.operations.unfinished(
                     OperationType.AGENT_DISPATCH, project_id=project_id):
                 payload = json.loads(op["payload"] or "{}")
@@ -176,6 +190,15 @@ class RecoveryManager:
         # closed. Crash-before-this-point keeps them PENDING, so the next
         # startup still sees the evidence and repeats the steps above.
         if self.operations is not None:
+            for op in unexecuted_commit_intents:
+                self.operations.record_result(
+                    op["operation_id"], OperationStatus.FAILED,
+                    {"reason": "intent journaled but commit never executed"},
+                )
+                logger.warning(
+                    "recovery: git commit intent %s never executed", op["operation_id"]
+                )
+                acted = True
             acted |= self._close_interrupted_operations(project_id)
 
         # 6. Project / task state reconciliation.
@@ -221,27 +244,19 @@ class RecoveryManager:
                 acted = True
         return acted
 
-    def _reconcile_git_commit(self, project_id: int, op: sqlite3.Row) -> None:
-        """A GIT_COMMIT intent has no result: did the commit happen?
-
-        If a commit carrying the operation's trailer exists, the side effect
-        is real — the DB is caught up to it and the commit is NEVER re-run.
-        If not, the intent simply never executed and is closed as FAILED;
-        normal retry logic will produce a fresh attempt.
+    def _reconcile_executed_commit(
+        self, project_id: int, op: sqlite3.Row, commit_hash: str
+    ) -> None:
+        """A GIT_COMMIT intent whose commit exists in the repository: the
+        side effect is real — the DB is caught up to it and the commit is
+        NEVER re-run. (Unexecuted intents are handled by the caller: kept
+        PENDING as dirty-tree evidence until the reset completed, then
+        closed FAILED so normal retry produces a fresh attempt.)
         """
         operation_id = op["operation_id"]
         payload = json.loads(op["payload"] or "{}")
         task_id = payload.get("task_id") or op["task_id"]
         attempt_id = payload.get("attempt_id") or op["attempt_id"]
-        commit_hash = self.checkpoint.find_committed_operation(operation_id)
-
-        if commit_hash is None:
-            self.operations.record_result(
-                operation_id, OperationStatus.FAILED,
-                {"reason": "intent journaled but commit never executed"},
-            )
-            logger.warning("recovery: git commit intent %s never executed", operation_id)
-            return
 
         logger.warning(
             "recovery: git commit intent %s already executed as %s; reconciling DB",

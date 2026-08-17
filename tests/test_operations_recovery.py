@@ -179,8 +179,9 @@ def test_reconciliation_is_atomic(world, monkeypatch):
 
     monkeypatch.setattr(world.operations, "record_result", failing_record_result)
     op_row = world.operations.get(op_id)
+    commit = world.git.head_commit()
     with pytest.raises(RuntimeError):
-        world.recovery._reconcile_git_commit(world.pid, op_row)
+        world.recovery._reconcile_executed_commit(world.pid, op_row, commit)
 
     # everything rolled back together — nothing half-applied
     assert world.tasks.get(tid)["status"] == "REVIEWING"
@@ -265,6 +266,29 @@ def test_dirty_tree_from_interrupted_dispatch_after_partial_recovery(world):
     assert world.operations.get(op_id)["status"] == "INTERRUPTED"
     diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
     assert len(diffs) == 1 and "half-done developer edit" in diffs[0].read_text()
+
+
+def test_unexecuted_commit_intent_survives_crashed_recovery(world):
+    """Double-crash: commit intent journaled but never executed, a first
+    recovery closed the attempt then died mid-reset. The still-PENDING
+    intent must explain the dirty tree on the next startup."""
+    tid = world.tasks.create(world.pid, "T001", "task")
+    aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    op_id = world.operations.record_intent(
+        OperationType.GIT_COMMIT, {"task_key": "T001", "task_id": tid, "attempt_id": aid},
+        project_id=world.pid, task_id=tid, attempt_id=aid,
+    )
+    (world.git.path / "feature.txt").write_text("passed but uncommitted work\n")
+    # first recovery pass closed the attempt, then crashed before the reset
+    world.tasks.finish_attempt(aid, AttemptState.INTERRUPTED)
+
+    acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
+
+    assert acted
+    assert not world.git.is_dirty()
+    assert world.operations.get(op_id)["status"] == "FAILED"  # closed after the reset
+    diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(diffs) == 1 and "passed but uncommitted" in diffs[0].read_text()
 
 
 def test_readonly_dispatch_does_not_explain_user_dirty_tree(world):
