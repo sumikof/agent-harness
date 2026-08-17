@@ -227,6 +227,30 @@ async def test_agent_run_budget_cap_enforced(config, monkeypatch):
     assert state != ProjectState.COMPLETED
 
 
+async def test_empty_split_diagnosis_blocks_instead_of_dropping(config, monkeypatch):
+    """SPLIT with no replacement tasks must not silently drop the work (Codex P1)."""
+    config.limits.max_attempts = 1
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(
+        config.repository_path, review_verdicts=["REPAIR", "REPAIR", "REPAIR"]
+    )
+    original_payload = fake._payload
+
+    def split_without_tasks(role):
+        if role == Role.DIAGNOSTICIAN:
+            return {"root_causes": ["scope"], "recommendation": "SPLIT"}  # no split_tasks
+        return original_payload(role)
+
+    fake._payload = split_without_tasks
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    task = orchestrator.tasks.get_by_key(1, "T001")
+    assert task["status"] == "BLOCKED"       # not SKIPPED — nothing replaced it
+    assert state == ProjectState.BLOCKED     # so the project cannot complete
+
+
 async def test_diagnostician_sees_diff_after_agent_failure(config, monkeypatch):
     """The Diagnostician must receive the failed attempt's diff even when the
     failure was an aborted agent run (Codex P1)."""

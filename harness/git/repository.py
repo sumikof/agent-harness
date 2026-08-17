@@ -93,9 +93,11 @@ class GitRepository:
 
     def discard_all_unborn(self) -> None:
         """Empty the tree of a repository that has no commits yet
-        (reset --hard has no HEAD to reset to)."""
+        (reset --hard has no HEAD to reset to). Includes ignored files (-x):
+        with no commits there is no build state worth preserving, and a
+        deleted .gitignore would otherwise leave them behind as dirt."""
         self._run("rm", "-r", "--cached", "--ignore-unmatch", "-f", ".", check=False)
-        self._run("clean", "-fd", check=False)
+        self._run("clean", "-fdx", check=False)
 
     def log_oneline(self, limit: int = 20) -> str:
         return self._run("log", "--oneline", f"-{limit}", check=False).stdout

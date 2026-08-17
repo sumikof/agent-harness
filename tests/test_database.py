@@ -1,5 +1,6 @@
 import pytest
 
+from harness.config import HarnessConfig, ProjectConfig
 from harness.database.connection import Database
 from harness.database.event_repository import EventRepository
 from harness.database.project_repository import ProjectRepository
@@ -75,6 +76,27 @@ def test_illegal_task_transition_rejected(db, project_id):
         tasks.set_status(t1, TaskState.COMPLETED)
     # force bypasses (used by recovery / exceptional paths)
     tasks.set_status(t1, TaskState.COMPLETED, force=True)
+
+
+def test_wall_clock_limit_survives_restart(db, project_id, tmp_path):
+    """max_execution_seconds is measured from project creation, so a fresh
+    BudgetManager (= harness restart) cannot grant a new interval (Codex P2)."""
+    from harness.orchestrator.budget import BudgetExceeded, BudgetManager
+
+    projects = ProjectRepository(db)
+    tasks = TaskRepository(db)
+    runs = RunRepository(db)
+    # simulate a project created far in the past
+    db.execute(
+        "UPDATE projects SET created_at = ? WHERE id = ?",
+        ("2020-01-01T00:00:00.000Z", project_id),
+    )
+    config = HarnessConfig(project=ProjectConfig(name="x"), workspace_dir=str(tmp_path))
+    config.limits.max_execution_seconds = 3600
+
+    manager = BudgetManager(config, projects, tasks, runs)  # fresh manager = restart
+    with pytest.raises(BudgetExceeded):
+        manager.check_project(project_id)
 
 
 def test_runs_and_events(db, project_id):

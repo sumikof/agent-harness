@@ -139,6 +139,12 @@ class TestWriteHints:
             "cmd &> capture.txt",
             "pytest >& src/main.py",
             r"s\ed -i 's/a/b/' src/x.py",
+            # git subcommands that write to the working tree
+            "git apply <<'EOF'",
+            "git apply patch.diff",
+            "git -C . apply -",
+            "git restore src/x.py",
+            "git checkout-index -a",
         ]:
             assert find_write_hint(cmd) is not None, cmd
 

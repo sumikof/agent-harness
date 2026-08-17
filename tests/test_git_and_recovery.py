@@ -84,14 +84,19 @@ def test_discard_working_tree_in_unborn_repo(tmp_path):
     git = GitRepository(tmp_path / "unborn")
     git.init()
     (git.path / "staged.txt").write_text("staged\n")
+    # a staged .gitignore hiding an ignored output must not leave dirt behind
+    (git.path / ".gitignore").write_text("build/\n")
     git.add_all()
     (git.path / "untracked.txt").write_text("untracked\n")
+    (git.path / "build").mkdir()
+    (git.path / "build" / "result").write_text("out\n")
 
     CheckpointManager(git).discard_working_tree()
 
     assert not git.is_dirty()
     assert not (git.path / "staged.txt").exists()
     assert not (git.path / "untracked.txt").exists()
+    assert not (git.path / "build").exists()
 
 
 def test_recovery_refuses_unexplained_dirty_tree(tmp_path, repo):

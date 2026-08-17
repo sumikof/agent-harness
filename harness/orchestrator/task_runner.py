@@ -334,10 +334,17 @@ class TaskRunner:
             feedback.diagnosis = diagnosis.model_dump()
             return None
         if verdict == DiagnosisVerdict.SPLIT:
-            self._insert_split_tasks(project_id, task_id, diagnosis)
+            inserted = self._insert_split_tasks(project_id, task_id, diagnosis)
+            if not inserted:
+                # A SPLIT with no usable replacement tasks would silently drop
+                # the work (SKIPPED is terminal) — treat it as BLOCKED instead.
+                self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
+                self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
+                                 payload={"reason": "SPLIT diagnosis contained no replacement tasks"})
+                return TaskOutcome.BLOCKED
             self.tasks.set_status(task_id, TaskState.SKIPPED, force=True)
             self.events.emit("TASK_SPLIT", project_id=project_id, task_id=task_id,
-                             payload={"new_tasks": [t.task_key for t in diagnosis.split_tasks]})
+                             payload={"new_tasks": inserted})
             return TaskOutcome.SPLIT
         if verdict == DiagnosisVerdict.REPLAN:
             self.tasks.set_status(task_id, TaskState.PENDING, force=True)
@@ -362,13 +369,17 @@ class TaskRunner:
         logger.info("task %s completed (commit %s)", task_key, commit_hash)
         return TaskOutcome.COMPLETED
 
-    def _insert_split_tasks(self, project_id: int, task_id: int, diagnosis: Diagnosis) -> None:
+    def _insert_split_tasks(
+        self, project_id: int, task_id: int, diagnosis: Diagnosis
+    ) -> list[str]:
+        """Insert the diagnosis's replacement tasks; returns the inserted keys."""
         original = self.tasks.get(task_id)
         base_seq = original["sequence"]
         all_tasks = self.tasks.list_for_project(project_id)
         next_seqs = sorted(t["sequence"] for t in all_tasks if t["sequence"] > base_seq)
         upper = next_seqs[0] if next_seqs else base_seq + 100
         count = len(diagnosis.split_tasks)
+        inserted: list[str] = []
         for index, planned in enumerate(diagnosis.split_tasks, start=1):
             seq = base_seq + max(1, (upper - base_seq) * index // (count + 1))
             if self.tasks.get_by_key(project_id, planned.task_key) is not None:
@@ -382,6 +393,8 @@ class TaskRunner:
                 planned.dependencies,
                 sequence=seq,
             )
+            inserted.append(planned.task_key)
+        return inserted
 
     def _archive_and_discard(self, task_key: str, label: str) -> None:
         """Save the current dirty diff as an artifact, then reset the tree."""

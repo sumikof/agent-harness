@@ -7,7 +7,8 @@ budget never crashes the harness; it transitions work to BLOCKED/PAUSED.
 
 from __future__ import annotations
 
-import time
+import sqlite3
+from datetime import datetime, timezone
 
 from ..config import HarnessConfig
 from ..database.project_repository import ProjectRepository
@@ -34,10 +35,6 @@ class BudgetManager:
         self.projects = projects
         self.tasks = tasks
         self.runs = runs
-        self.started_at = time.monotonic()
-
-    def elapsed_seconds(self) -> float:
-        return time.monotonic() - self.started_at
 
     def check_project(self, project_id: int) -> None:
         row = self.projects.get(project_id)
@@ -45,10 +42,26 @@ class BudgetManager:
             raise BudgetExceeded(
                 "project", f"spent ${row['spent_usd']:.2f} of ${self.config.budget.project_usd:.2f}"
             )
-        if self.elapsed_seconds() > self.config.limits.max_execution_seconds:
+        # Wall clock is measured from the project's persisted creation time,
+        # not process start — restarting the harness must not grant a fresh
+        # max_execution_seconds interval.
+        elapsed = self._project_elapsed_seconds(row)
+        if elapsed > self.config.limits.max_execution_seconds:
             raise BudgetExceeded(
-                "project", f"wall clock exceeded {self.config.limits.max_execution_seconds}s"
+                "project",
+                f"wall clock {elapsed:.0f}s exceeded {self.config.limits.max_execution_seconds}s "
+                "(measured from project creation)",
             )
+
+    @staticmethod
+    def _project_elapsed_seconds(row: sqlite3.Row) -> float:
+        try:
+            started = datetime.fromisoformat(row["created_at"])
+        except (ValueError, TypeError):
+            return 0.0
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - started).total_seconds()
 
     def check_task(self, task_id: int) -> None:
         row = self.tasks.get(task_id)

@@ -115,6 +115,13 @@ _WRITE_HINTS: list[tuple[re.Pattern, str]] = [
         ),
         "file mutation command",
     ),
+    # git subcommands that write to the working tree (patches from stdin /
+    # here-docs included). Lifecycle commands are banned globally; these are
+    # legitimate for the Developer only.
+    (
+        re.compile(r"\bgit\b[^|;&]*?\b(apply|restore|checkout-index)\b"),
+        "git working-tree write",
+    ),
 ]
 
 
