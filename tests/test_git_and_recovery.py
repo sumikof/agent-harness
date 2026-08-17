@@ -79,6 +79,21 @@ def test_recovery_after_crash(tmp_path, repo):
     db.close()
 
 
+def test_discard_working_tree_in_unborn_repo(tmp_path):
+    """A repo with no commits must still be resettable to an empty tree (Codex P2)."""
+    git = GitRepository(tmp_path / "unborn")
+    git.init()
+    (git.path / "staged.txt").write_text("staged\n")
+    git.add_all()
+    (git.path / "untracked.txt").write_text("untracked\n")
+
+    CheckpointManager(git).discard_working_tree()
+
+    assert not git.is_dirty()
+    assert not (git.path / "staged.txt").exists()
+    assert not (git.path / "untracked.txt").exists()
+
+
 def test_recovery_refuses_unexplained_dirty_tree(tmp_path, repo):
     """User work without a RUNNING attempt must never be reset (Codex P1)."""
     db = Database(tmp_path / "harness.db")

@@ -227,6 +227,35 @@ async def test_agent_run_budget_cap_enforced(config, monkeypatch):
     assert state != ProjectState.COMPLETED
 
 
+async def test_diagnostician_sees_diff_after_agent_failure(config, monkeypatch):
+    """The Diagnostician must receive the failed attempt's diff even when the
+    failure was an aborted agent run (Codex P1)."""
+    config.limits.max_attempts = 1
+    monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=[])
+    prompts: dict[Role, list[str]] = {}
+    original_run = fake.run
+
+    async def recording_run(request):
+        prompts.setdefault(request.role, []).append(request.prompt)
+        if request.role == Role.TESTER:  # dies AFTER the Developer edited files
+            fake.calls.append(request.role)
+            return AgentResult(status="FAILED", error="tester crashed")
+        return await original_run(request)
+
+    fake.run = recording_run
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    assert state == ProjectState.BLOCKED  # fake diagnostician recommends BLOCKED
+    diag_prompts = prompts.get(Role.DIAGNOSTICIAN)
+    assert diag_prompts, "diagnostician was never invoked"
+    assert "feature.txt" in diag_prompts[0]      # the diff made it into the context
+    assert not orchestrator.git.is_dirty()       # and the tree was still reset
+
+
 async def test_budget_pause_leaves_clean_tree(config, monkeypatch):
     """PAUSED must leave the repo at the last good commit so the next startup
     can recover; the dirty diff is archived first (Codex P1)."""

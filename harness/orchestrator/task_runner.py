@@ -134,8 +134,11 @@ class TaskRunner:
                 # failure counts toward consecutive_failures().
                 self._finish_running_attempts(task_id, AttemptState.FAILED)
                 self.tasks.set_status(task_id, TaskState.FAILED, force=True)
+                # Capture the half-done diff now: the Diagnostician needs it
+                # in its context, and the tree is reset before diagnosis.
                 feedback = AttemptContext(
-                    previous_attempt_summary=f"Previous attempt aborted: {exc.detail}"
+                    previous_attempt_summary=f"Previous attempt aborted: {exc.detail}",
+                    current_diff=self._safe_diff(),
                 )
                 kind, payload = ("AGENT_FAILURE", None)
 

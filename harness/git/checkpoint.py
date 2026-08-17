@@ -32,3 +32,6 @@ class CheckpointManager:
     def discard_working_tree(self) -> None:
         if self.repo.head_commit() is not None:
             self.repo.reset_hard("HEAD")
+        else:
+            # No commits yet: the "last good state" is an empty tree.
+            self.repo.discard_all_unborn()

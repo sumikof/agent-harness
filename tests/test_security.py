@@ -68,6 +68,17 @@ class TestCommandPolicy:
         for cmd in ["git branch -v", "git branch -a", "git branch -r", "git branch --merged"]:
             assert check_command(cmd).allowed, cmd
 
+    def test_optionless_branch_creation_forbidden(self):
+        for cmd in [
+            "git branch new-feature",
+            "git branch new-feature HEAD~2",
+            "git -C repo branch topic",
+        ]:
+            assert not check_command(cmd).allowed, cmd
+        # flags-only listing still allowed
+        assert check_command("git branch").allowed
+        assert check_command("git branch -av").allowed
+
     def test_shell_escaping_does_not_bypass(self):
         # the shell resolves these to plain `git commit` etc. before executing
         for cmd in [

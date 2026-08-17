@@ -91,5 +91,11 @@ class GitRepository:
         self._run("reset", "--hard", ref)
         self._run("clean", "-fd")
 
+    def discard_all_unborn(self) -> None:
+        """Empty the tree of a repository that has no commits yet
+        (reset --hard has no HEAD to reset to)."""
+        self._run("rm", "-r", "--cached", "--ignore-unmatch", "-f", ".", check=False)
+        self._run("clean", "-fd", check=False)
+
     def log_oneline(self, limit: int = 20) -> str:
         return self._run("log", "--oneline", f"-{limit}", check=False).stdout

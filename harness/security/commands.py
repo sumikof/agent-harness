@@ -31,6 +31,13 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
         r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[a-zA-Z]*[dDfmMcC]|--delete|--force|--move|--copy)",
         "branch mutation is forbidden",
     ),
+    (
+        # `git branch <name>` creates a ref even with no options. Only pure
+        # listing forms (bare `git branch` or flags-only) are allowed; any
+        # positional argument is treated as creation.
+        r"\bgit\b[^|;&]*?\bbranch\b(\s+-[^\s|;&]*)*\s+[^-\s|;&]",
+        "branch creation is forbidden",
+    ),
     # Destructive / privileged operations
     (r"\bsudo\b", "sudo is forbidden"),
     (r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+(/|~|\$HOME)(\s|$)", "recursive delete of root/home is forbidden"),
