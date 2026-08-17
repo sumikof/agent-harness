@@ -107,7 +107,7 @@ def test_interrupted_migration_leaves_previous_version_intact(tmp_path, monkeypa
     db = Database(db_path)  # real v2 must now apply cleanly — no duplicate columns
     try:
         versions = [r[0] for r in db.conn.execute("SELECT version FROM schema_migrations")]
-        assert versions == [1, 2]
+        assert versions == list(range(1, len(original) + 1))
         db.execute("SELECT stream_type, seq FROM events LIMIT 0")  # columns exist once
     finally:
         db.close()

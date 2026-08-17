@@ -127,6 +127,18 @@ MIGRATIONS: list[str] = [
     ALTER TABLE agent_runs ADD COLUMN resolved_spec TEXT;
     ALTER TABLE agent_runs ADD COLUMN dispatch_operation_id TEXT;
     """,
+    # 3: enforce the max-1-RUNNING-agent invariant at the DB level, so two
+    #    concurrent harness processes cannot both create a RUNNING row.
+    #    Stale RUNNING rows (crash leftovers) are closed first — the index
+    #    could not be created over more than one of them.
+    """
+    UPDATE agent_runs
+        SET status = 'INTERRUPTED',
+            error = COALESCE(error, 'closed by migration v3 (stale RUNNING row)')
+        WHERE status = 'RUNNING';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_single_running
+        ON agent_runs(status) WHERE status = 'RUNNING'
+    """,
 ]
 
 

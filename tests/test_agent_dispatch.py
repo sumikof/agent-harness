@@ -259,6 +259,42 @@ def test_oversized_output_spills_to_artifact(tmp_path):
     assert not small.truncated and small.render() == "tiny"
 
 
+def test_spill_preview_honors_small_thresholds(tmp_path):
+    """A deployment that lowers max_inline_output_chars must get a preview
+    that actually fits it — head+tail never exceed the threshold."""
+    artifacts = ArtifactManager(tmp_path / "artifacts")
+    text = "x" * 2000
+    spilled = artifacts.spill_text_output("small-threshold.log", text, threshold=1000)
+    assert spilled.truncated
+    assert len(spilled.head) + len(spilled.tail) <= 1000
+    assert Path(spilled.artifact_path).read_text() == text  # full copy intact
+
+
+async def test_result_recording_is_atomic(config, monkeypatch):
+    """finish_run, dispatch-operation result, billing and events commit
+    together: a crash mid-recording rolls all of it back, leaving the
+    PENDING dispatch for recovery instead of a half-recorded run."""
+    orchestrator = ProjectOrchestrator(config)
+    runner = ScriptedRunner([ok_result()])
+    install(monkeypatch, runner)
+
+    original_record_cost = orchestrator.budget.record_cost
+
+    def crashing_record_cost(*args, **kwargs):
+        raise RuntimeError("dies mid result recording")
+
+    monkeypatch.setattr(orchestrator.budget, "record_cost", crashing_record_cost)
+    with pytest.raises(RuntimeError):
+        await invoke_planner(orchestrator)
+
+    run = orchestrator.db.query_one("SELECT * FROM agent_runs")
+    assert run["status"] == "RUNNING"  # result rollback — nothing half-recorded
+    op = orchestrator.operations.get(run["dispatch_operation_id"])
+    assert op["status"] == "PENDING"   # recovery will settle it
+    assert orchestrator.projects.get(1)["spent_usd"] == 0
+    monkeypatch.setattr(orchestrator.budget, "record_cost", original_record_cost)
+
+
 async def test_complete_task_refuses_without_recorded_evidence(config):
     """The commit checkpoint is gated on recorded verification + review
     evidence, not on control flow having 'obviously' passed through them."""

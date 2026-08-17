@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -310,15 +311,6 @@ class AgentInvoker:
             self.budget.check_project(project_id)
             if task_id is not None:
                 self.budget.check_task(task_id)
-            # Only one agent may ever be in flight — across the WHOLE
-            # workspace, not just this project: every project in this DB
-            # shares the max-1-agent guarantee.
-            stale = self.runs.running_runs()
-            if stale:
-                raise ConcurrentRunError(
-                    f"agent run(s) {[r['id'] for r in stale]} still RUNNING; "
-                    "refusing to dispatch a second concurrent agent"
-                )
 
             # 1. ContextManifest — durable before anything else. Failure to
             #    persist it aborts the dispatch entirely.
@@ -349,22 +341,39 @@ class AgentInvoker:
             )
             resolved: ResolvedAgentRunSpec = await runner.resolve(request)
 
-            # 3. One transaction: run row + resolved spec + dispatch intent.
+            # 3. One WRITE-LOCKED transaction: RUNNING check + run row +
+            #    resolved spec + dispatch intent. BEGIN IMMEDIATE serializes
+            #    the check-then-insert against other processes, and a partial
+            #    unique index on agent_runs(status='RUNNING') enforces the
+            #    max-1-agent invariant even if a racer slips through.
             #    Durable COMMIT happens before the side effect (dispatch).
             db = self.runs.db
-            with db.transaction():
-                run_id = self.runs.start_run(
-                    project_id,
-                    spec.role.value,
-                    attempt_id,
-                    provider=resolved.provider,
-                    model=resolved.model,
-                    profile_hash=resolved.profile_hash,
-                    profile_version=resolved.profile_version,
-                    context_manifest_path=resolved.context_manifest_path,
-                    context_manifest_hash=resolved.context_manifest_hash,
-                    resolved_spec=resolved.persistable_dump(),
-                )
+            with db.transaction(immediate=True):
+                stale = self.runs.running_runs()
+                if stale:
+                    raise ConcurrentRunError(
+                        f"agent run(s) {[r['id'] for r in stale]} still RUNNING; "
+                        "refusing to dispatch a second concurrent agent"
+                    )
+                try:
+                    run_id = self.runs.start_run(
+                        project_id,
+                        spec.role.value,
+                        attempt_id,
+                        provider=resolved.provider,
+                        model=resolved.model,
+                        profile_hash=resolved.profile_hash,
+                        profile_version=resolved.profile_version,
+                        context_manifest_path=resolved.context_manifest_path,
+                        context_manifest_hash=resolved.context_manifest_hash,
+                        resolved_spec=resolved.persistable_dump(),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # The partial unique index caught a concurrent RUNNING
+                    # row that slipped in from another process.
+                    raise ConcurrentRunError(
+                        f"another agent run became RUNNING concurrently: {exc}"
+                    )
                 dispatch_op_id = None
                 if self.operations:
                     dispatch_op_id = self.operations.record_intent(
@@ -405,30 +414,70 @@ class AgentInvoker:
                 result.status = "FAILED"
                 result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
 
-            # 5. Result — run row, operation result, cost, events.
-            self.runs.finish_run(
-                run_id,
-                status=result.status,
-                session_id=result.session_id,
-                output_artifact=spec.output_artifact,
-                token_usage=result.token_usage,
-                cost_usd=result.cost_usd,
-                error=result.error,
-            )
-            if self.operations and dispatch_op_id:
-                self.operations.record_result(
-                    dispatch_op_id,
-                    OperationStatus.COMPLETED
-                    if result.status == "COMPLETED"
-                    else OperationStatus.FAILED,
-                    {"status": result.status, "error": result.error,
-                     "cost_usd": result.cost_usd},
+            # 5. Result — run row, operation result, billing and every event
+            #    land in ONE transaction, so a crash right after the provider
+            #    returned cannot leave a COMPLETED run with a dangling
+            #    PENDING dispatch or unrecorded cost.
+            with db.transaction():
+                self.runs.finish_run(
+                    run_id,
+                    status=result.status,
+                    session_id=result.session_id,
+                    output_artifact=spec.output_artifact,
+                    token_usage=result.token_usage,
+                    cost_usd=result.cost_usd,
+                    error=result.error,
                 )
-            self.budget.record_cost(project_id, task_id, result.cost_usd)
+                if self.operations and dispatch_op_id:
+                    self.operations.record_result(
+                        dispatch_op_id,
+                        OperationStatus.COMPLETED
+                        if result.status == "COMPLETED"
+                        else OperationStatus.FAILED,
+                        {"status": result.status, "error": result.error,
+                         "cost_usd": result.cost_usd},
+                    )
+                self.budget.record_cost(project_id, task_id, result.cost_usd)
+                for warning in result.loop_warnings:
+                    self.events.emit(
+                        EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
+                        attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                    )
+                if result.loop_detected:
+                    # The guard only flags; the Orchestrator owns the
+                    # transition: the run fails the attempt (reasoning-retry
+                    # path — fresh session, possibly diagnosis), never a
+                    # provider retry of the same context.
+                    self.events.emit(
+                        EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
+                        attempt_id=attempt_id, agent_run_id=run_id,
+                        payload={"role": spec.role.value, "run_id": run_id},
+                    )
+                if result.telemetry:
+                    self.events.emit(
+                        EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
+                        attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                    )
+                self.events.emit(
+                    EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
+                    project_id=project_id,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    agent_run_id=run_id,
+                    payload={
+                        "role": spec.role.value,
+                        "run_id": run_id,
+                        "cost_usd": result.cost_usd,
+                        "turns": result.num_turns,
+                        "error": result.error,
+                        "failure_kind": result.failure_kind.value if result.failure_kind else None,
+                    },
+                )
             # Per-run budget: the SDK offers no mid-run cost cutoff, so the
             # cap is enforced right after every run — failed ones included.
             # An over-budget run fails the attempt (normal retry/diagnosis
-            # path) instead of being retried.
+            # path) instead of being retried. Deliberately OUTSIDE the result
+            # transaction: the raise must not roll the recording back.
             cap = self.config.budget.agent_run_usd
             if result.cost_usd > cap:
                 self.runs.finish_run(
@@ -440,41 +489,6 @@ class AgentInvoker:
                     spec.role.value,
                     f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
                 )
-            for warning in result.loop_warnings:
-                self.events.emit(
-                    EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
-                    attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
-                )
-            if result.loop_detected:
-                # The guard only flags; the Orchestrator owns the transition:
-                # the run fails the attempt (reasoning-retry path — fresh
-                # session, possibly diagnosis), never a provider retry of the
-                # same context, which would loop identically.
-                self.events.emit(
-                    EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
-                    attempt_id=attempt_id, agent_run_id=run_id,
-                    payload={"role": spec.role.value, "run_id": run_id},
-                )
-            if result.telemetry:
-                self.events.emit(
-                    EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
-                    attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
-                )
-            self.events.emit(
-                EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
-                project_id=project_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                agent_run_id=run_id,
-                payload={
-                    "role": spec.role.value,
-                    "run_id": run_id,
-                    "cost_usd": result.cost_usd,
-                    "turns": result.num_turns,
-                    "error": result.error,
-                    "failure_kind": result.failure_kind.value if result.failure_kind else None,
-                },
-            )
             if result.status == "COMPLETED":
                 return result, run_id
             if result.loop_detected:

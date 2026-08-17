@@ -126,10 +126,17 @@ class ArtifactManager:
         tail_chars: int = SPILL_TAIL_CHARS,
     ) -> SpilledOutput:
         """Persist `text` fully under artifacts/spill/ and return a bounded
-        preview safe to place in agent context. The full output is never lost."""
+        preview safe to place in agent context. The full output is never lost.
+
+        The head+tail preview is capped at `threshold` characters total, so a
+        deployment that lowers the inline limit gets a preview that actually
+        honors it — never more context than an un-spilled output would use.
+        """
         path = self.root / "spill" / name
         self.save_text(path, text)
         truncated = len(text) > threshold
+        head_chars = min(head_chars, max(1, threshold // 2))
+        tail_chars = min(tail_chars, max(0, threshold - head_chars))
         return SpilledOutput(
             artifact_path=str(path),
             sha256=sha256_text(text),

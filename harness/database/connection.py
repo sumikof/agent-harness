@@ -32,13 +32,20 @@ class Database:
         apply_migrations(self.conn)
 
     @contextlib.contextmanager
-    def transaction(self):
+    def transaction(self, immediate: bool = False):
         """Group several execute() calls into one atomic SQLite transaction.
 
         Nested use joins the outermost transaction; commit happens only when
         the outermost block exits cleanly, rollback when it raises. This is
         how a state UPDATE and its ledger event INSERT stay atomic.
+
+        immediate=True takes the write lock up front (BEGIN IMMEDIATE), so a
+        read-then-insert sequence (e.g. the RUNNING-agent check before run
+        creation) is serialized against other processes, not just other
+        statements.
         """
+        if immediate and self._tx_depth == 0:
+            self.conn.execute("BEGIN IMMEDIATE")
         self._tx_depth += 1
         try:
             yield self

@@ -95,9 +95,21 @@ def test_at_most_one_running_agent_run(world):
     world.runs.start_run(world.pid, "developer")
     # one RUNNING run alone trips only provenance checks, not concurrency
     assert "CONCURRENT_AGENT_RUNS" not in codes(world.checker.check_all(world.pid))
+    # the DB-level unique index makes a second RUNNING row impossible via
+    # normal writes — the checker guards the case where that constraint is
+    # absent (externally modified / legacy database), so simulate it
+    world.db.execute("DROP INDEX idx_agent_runs_single_running")
     world.runs.start_run(world.pid, "reviewer")
     violations = world.checker.check_all(world.pid)
     assert "CONCURRENT_AGENT_RUNS" in codes(violations, Severity.ERROR)
+
+
+def test_second_running_run_rejected_by_db_constraint(world):
+    import sqlite3
+
+    world.runs.start_run(world.pid, "developer")
+    with pytest.raises(sqlite3.IntegrityError):
+        world.runs.start_run(world.pid, "reviewer")
 
 
 def test_running_run_requires_manifest_spec_and_intent(world):
