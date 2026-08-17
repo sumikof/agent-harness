@@ -25,6 +25,7 @@ import json
 import logging
 import sqlite3
 
+from ..agents import analyst, developer, diagnostician, planner, reviewer, tester
 from ..artifacts.manager import ArtifactManager
 from ..database.event_repository import EventRepository, EventType
 from ..database.operation_repository import (
@@ -39,6 +40,15 @@ from ..git.repository import GitRepository
 from .state_machine import AttemptState, TaskState
 
 logger = logging.getLogger(__name__)
+
+# Roles whose sessions may write to the worktree (from the role specs) —
+# only their in-flight dispatches can explain a dirty tree.
+MUTATING_ROLES = {
+    spec.role.value
+    for spec in (planner.SPEC, analyst.SPEC, developer.SPEC,
+                 tester.SPEC, reviewer.SPEC, diagnostician.SPEC)
+    if spec.mutates_repo
+}
 
 # Task states that only exist while an episode is actively running.
 IN_FLIGHT_STATES = {
@@ -107,13 +117,18 @@ class RecoveryManager:
                 self._reconcile_git_commit(project_id, op)
                 acted = True
             # Both kinds of in-flight side effects can dirty the tree: a
-            # verification command, or an agent session whose attempt was
-            # already closed by a previous recovery pass that crashed
-            # mid-reset.
+            # verification command, or a MUTATING agent session whose attempt
+            # was already closed by a previous recovery pass that crashed
+            # mid-reset. A read-only dispatch (e.g. the Planner, which runs
+            # without an attempt) cannot have produced the diff — counting it
+            # would let user edits made while stopped be destroyed.
             pending_side_effects = len(self.operations.unfinished(
-                OperationType.VERIFICATION_COMMAND, project_id=project_id)
-            ) + len(self.operations.unfinished(
-                OperationType.AGENT_DISPATCH, project_id=project_id))
+                OperationType.VERIFICATION_COMMAND, project_id=project_id))
+            for op in self.operations.unfinished(
+                    OperationType.AGENT_DISPATCH, project_id=project_id):
+                payload = json.loads(op["payload"] or "{}")
+                if op["attempt_id"] is not None and payload.get("role") in MUTATING_ROLES:
+                    pending_side_effects += 1
 
         # 5. Workspace dirty-state recovery.
         running = self.tasks.running_attempts(project_id)

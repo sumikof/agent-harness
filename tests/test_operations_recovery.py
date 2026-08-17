@@ -267,6 +267,24 @@ def test_dirty_tree_from_interrupted_dispatch_after_partial_recovery(world):
     assert len(diffs) == 1 and "half-done developer edit" in diffs[0].read_text()
 
 
+def test_readonly_dispatch_does_not_explain_user_dirty_tree(world):
+    """A pending Planner dispatch (read-only, no attempt) cannot have dirtied
+    the tree — user edits made while the harness was stopped must be
+    preserved, not archived and reset."""
+    from harness.orchestrator.recovery import UnexplainedDirtyWorktree
+
+    world.operations.record_intent(
+        OperationType.AGENT_DISPATCH, {"role": "planner"}, project_id=world.pid
+    )
+    (world.git.path / "hello.txt").write_text("precious user edit while stopped\n")
+
+    with pytest.raises(UnexplainedDirtyWorktree):
+        world.recovery.recover(world.projects.get(world.pid))
+
+    assert world.git.is_dirty()  # untouched
+    assert (world.git.path / "hello.txt").read_text() == "precious user edit while stopped\n"
+
+
 def test_recovery_never_settles_another_projects_journal(world):
     """A workspace can hold several projects; recovering project A must not
     destroy project B's pending crash evidence."""
