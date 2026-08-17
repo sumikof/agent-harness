@@ -159,6 +159,27 @@ class ArtifactManager:
         path.write_bytes(data)
         return path
 
+    def archive_worktree_files(
+        self, tar_path: Path, repo_root: Path, paths: list[str]
+    ) -> Optional[Path]:
+        """Tar the actual on-disk files (byte-exact, no git filters).
+
+        A git patch passes through the repository's clean filters (LFS,
+        redaction filters, ...), so it may not reproduce the working-tree
+        bytes. The tar is the ground-truth copy alongside the patch.
+        Returns the tar path, or None when nothing existed to archive.
+        """
+        import tarfile
+
+        existing = [rel for rel in paths if (repo_root / rel).exists()]
+        if not existing:
+            return None
+        tar_path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tar_path, "w") as tar:
+            for rel in existing:
+                tar.add(repo_root / rel, arcname=rel)
+        return tar_path
+
     def relpath(self, path: Path) -> str:
         try:
             return str(path.relative_to(self.root))

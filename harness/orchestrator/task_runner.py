@@ -482,8 +482,11 @@ class TaskRunner:
         """
         diff = self.git.snapshot_dirty_bytes()
         if diff.strip():
-            self.artifacts.save_bytes(
-                self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff", diff
+            archive_path = self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff"
+            self.artifacts.save_bytes(archive_path, diff)
+            self.artifacts.archive_worktree_files(
+                archive_path.with_suffix(".files.tar"), self.git.path,
+                self.git.changed_paths(),
             )
         self.checkpoint.discard_working_tree()
 
@@ -506,11 +509,11 @@ class TaskRunner:
         import hashlib
 
         try:
-            diff = self.git.dirty_diff_readonly()
+            diff = self.git.dirty_diff_readonly_bytes()
         except Exception as exc:
             logger.warning("could not hash diff: %s", exc)
             return ""
-        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        return hashlib.sha256(diff).hexdigest()
 
     def _bounded_diff(self, spill_name: str, limit: int | None = None) -> str:
         """The current dirty diff, spilled to an artifact when oversized.

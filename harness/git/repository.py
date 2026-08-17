@@ -108,15 +108,20 @@ class GitRepository:
         return untracked
 
     def dirty_diff_readonly(self) -> str:
-        """full_dirty_diff() that leaves the index as it found it.
+        return self.dirty_diff_readonly_bytes().decode("utf-8", errors="replace")
+
+    def dirty_diff_readonly_bytes(self) -> bytes:
+        """snapshot_dirty_bytes() that leaves the index as it found it.
 
         Read-only inspection (e.g. recovery deciding whether a tree may be
         reset) must not convert the user's untracked files into
         intent-to-add entries; the ita entries created for the diff are
-        removed again afterwards.
+        removed again afterwards. Raw bytes, filter-free — the SAME basis
+        as the archived snapshot, so evidence hashes always compare like
+        with like regardless of file encodings.
         """
         newly_untracked = self.untracked_paths()
-        diff = self.full_dirty_diff()
+        diff = self.snapshot_dirty_bytes()
         if newly_untracked:
             if self.head_commit():
                 self._run("reset", "-q", "--", *newly_untracked)
@@ -126,6 +131,26 @@ class GitRepository:
                 # be recursive.
                 self._run("rm", "--cached", "-r", "-q", "--", *newly_untracked)
         return diff
+
+    def changed_paths(self) -> list[str]:
+        """Every path with uncommitted changes (untracked included), parsed
+        NUL-safely. Directories may appear as 'dir/' entries."""
+        out = self._run("status", "--porcelain", "-z").stdout
+        fields = out.split("\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(fields):
+            entry = fields[index]
+            if not entry:
+                index += 1
+                continue
+            status = entry[:2]
+            paths.append(entry[3:])
+            if "R" in status or "C" in status:
+                index += 2  # rename/copy source in the extra field
+            else:
+                index += 1
+        return paths
 
     def snapshot_dirty(self) -> str:
         """Binary-safe patch of everything uncommitted (incl. untracked).

@@ -63,8 +63,9 @@ class CheckpointManager:
             return self.repo.commit(message)
 
         base_head = self.repo.head_commit()
-        diff = self.repo.full_dirty_diff()
-        diff_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        # Same byte basis as recovery's evidence hashing (filter-free,
+        # binary-safe), so reconciliation compares like with like.
+        diff_hash = hashlib.sha256(self.repo.snapshot_dirty_bytes()).hexdigest()
         operation_id = self.operations.record_intent(
             OperationType.GIT_COMMIT,
             {

@@ -387,7 +387,9 @@ class AgentInvoker:
                     base_diff_hash = None
                     if spec.mutates_repo and self.git is not None:
                         try:
-                            base_diff_hash = sha256_text(self.git.dirty_diff_readonly())
+                            import hashlib
+                            base_diff_hash = hashlib.sha256(
+                                self.git.dirty_diff_readonly_bytes()).hexdigest()
                         except Exception as exc:
                             logger.warning("could not hash pre-dispatch diff: %s", exc)
                     dispatch_op_id = self.operations.record_intent(

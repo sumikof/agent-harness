@@ -256,11 +256,11 @@ class RecoveryManager:
 
     def _current_diff_hash(self) -> str | None:
         try:
-            diff = self.git.dirty_diff_readonly()
+            diff = self.git.dirty_diff_readonly_bytes()
         except Exception as exc:
             logger.warning("recovery: could not hash dirty diff: %s", exc)
             return None
-        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        return hashlib.sha256(diff).hexdigest()
 
     @staticmethod
     def _commit_intent_matches(op: sqlite3.Row, current_diff_hash: str | None) -> bool:
@@ -398,4 +398,9 @@ class RecoveryManager:
                 index += 1
                 path = self.artifacts.root / "diagnostics" / f"interrupted-worktree-{index}.diff"
             self.artifacts.save_bytes(path, diff)
+            # Ground truth alongside the patch: the real on-disk bytes,
+            # untouched by clean filters (LFS, redaction, ...).
+            self.artifacts.archive_worktree_files(
+                path.with_suffix(".files.tar"), self.git.path, self.git.changed_paths()
+            )
             logger.info("recovery: archived interrupted diff to %s", path)

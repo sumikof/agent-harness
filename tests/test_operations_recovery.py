@@ -198,7 +198,7 @@ def test_reconciliation_is_atomic(world, monkeypatch):
 def diff_hash(world) -> str:
     import hashlib
 
-    return hashlib.sha256(world.git.dirty_diff_readonly().encode("utf-8")).hexdigest()
+    return hashlib.sha256(world.git.dirty_diff_readonly_bytes()).hexdigest()
 
 
 def test_dirty_tree_matching_verification_intent_is_recovered(world):
@@ -510,6 +510,50 @@ def test_archived_diff_preserves_non_utf8_text(world):
     assert len(diffs) == 1
     world.git.apply_patch_bytes(diffs[0].read_bytes())
     assert (world.git.path / "notes.txt").read_bytes() == latin1_content
+
+
+def test_non_utf8_diff_still_matches_evidence_hash(world):
+    """Evidence hashing works on raw bytes, so a pending verification that
+    produced non-UTF-8 content is still settled instead of refused."""
+    (world.git.path / "notes.txt").write_bytes("café résumé\n".encode("latin-1"))
+    op_id = world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND,
+        {"commands": ["make"], "label": "final", "base_diff_sha256": diff_hash(world)},
+        project_id=world.pid,
+    )
+
+    acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
+
+    assert acted
+    assert not world.git.is_dirty()
+    assert world.operations.get(op_id)["status"] == "INTERRUPTED"
+
+
+def test_archive_tar_preserves_pre_clean_filter_bytes(world):
+    """A clean filter (LFS-style redaction) rewrites what git diff emits;
+    the tar archived alongside the patch must hold the real on-disk bytes."""
+    import tarfile
+
+    (world.git.path / ".gitattributes").write_text("*.env filter=redact\n")
+    world.git._run("config", "filter.redact.clean", "sed s/SECRET/REDACTED/")
+    world.git.add_all()
+    world.git.commit("configure clean filter")
+
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    world.tasks.start_attempt(tid, world.git.head_commit())
+    (world.git.path / "app.env").write_text("TOKEN=SECRET\n")
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    patches = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(patches) == 1
+    assert b"REDACTED" in patches[0].read_bytes()  # the patch went through the filter...
+    tars = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.files.tar"))
+    assert len(tars) == 1
+    with tarfile.open(tars[0]) as tar:
+        content = tar.extractfile("app.env").read()
+    assert content == b"TOKEN=SECRET\n"          # ...but the tar holds ground truth
 
 
 def test_readonly_diff_restores_index_for_awkward_paths(world):
