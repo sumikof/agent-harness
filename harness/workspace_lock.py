@@ -25,8 +25,12 @@ try:
     import fcntl
 except ImportError:  # non-POSIX platform
     fcntl = None
+try:
+    import msvcrt
+except ImportError:  # non-Windows platform
+    msvcrt = None
 
-# path -> open fd holding the flock, for this process. Process-global by
+# path -> open fd holding the lock, for this process. Process-global by
 # design: the lock's scope IS the process.
 _HELD: dict[str, int] = {}
 
@@ -35,35 +39,61 @@ class WorkspaceLocked(Exception):
     """Another harness process is already operating on this workspace."""
 
 
+class UnsupportedPlatform(Exception):
+    """No OS file-locking primitive is available — the exclusion guarantee
+    cannot be enforced, so the harness refuses to run (fail-closed)."""
+
+
+def _lock_fd(fd: int, path: Path) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+    raise UnsupportedPlatform(
+        f"this platform provides neither fcntl nor msvcrt file locking; "
+        f"cannot enforce single-process exclusion on {path}. Refusing to run."
+    )
+
+
+def _unlock_fd(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 class WorkspaceLock:
     def __init__(self, lock_path: str | Path):
         self.path = Path(lock_path)
 
     def acquire(self) -> None:
-        if fcntl is None:
-            return  # no flock on this platform; single-process is by convention
         key = str(self.path.resolve())
         if key in _HELD:
             return  # reentrant within this process
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_fd(fd, self.path)
+        except UnsupportedPlatform:
+            os.close(fd)
+            raise
         except OSError:
             os.close(fd)
             raise WorkspaceLocked(
                 f"another harness process holds {self.path}. Only one process may "
                 "run per workspace; stop it (or wait for it to exit) and rerun."
             )
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode("ascii"))
+        # Written AFTER the byte-0 lock region is held; only informational.
+        os.write(fd, f" {os.getpid()}".encode("ascii"))
         _HELD[key] = fd
 
     def release(self) -> None:
-        if fcntl is None:
-            return
         key = str(self.path.resolve())
         fd = _HELD.pop(key, None)
         if fd is not None:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _unlock_fd(fd)
             os.close(fd)

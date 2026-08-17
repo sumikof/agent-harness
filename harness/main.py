@@ -23,7 +23,7 @@ from .database.task_repository import TaskRepository
 from .git.repository import GitRepository
 from .orchestrator.project import ProjectOrchestrator
 from .orchestrator.recovery import UnexplainedDirtyWorktree
-from .workspace_lock import WorkspaceLocked
+from .workspace_lock import UnsupportedPlatform, WorkspaceLocked
 
 
 def setup_logging(config: HarnessConfig) -> None:
@@ -57,7 +57,7 @@ def cmd_run(config: HarnessConfig) -> int:
     try:
         orchestrator = ProjectOrchestrator(config)
         final_state = asyncio.run(orchestrator.run())
-    except (UnexplainedDirtyWorktree, WorkspaceLocked) as exc:
+    except (UnexplainedDirtyWorktree, WorkspaceLocked, UnsupportedPlatform) as exc:
         print(f"refusing to start: {exc}")
         return 1
     print(f"project finished in state: {final_state}")

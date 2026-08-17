@@ -232,7 +232,7 @@ class AgentInvoker:
         project_id: int,
         task_id: Optional[int],
         attempt_no: Optional[int],
-    ) -> tuple[ContextManifest, Path]:
+    ) -> tuple[ContextManifest, Path, str]:
         """Write every context section + the manifest to artifact files.
 
         Raises on any I/O failure — the agent must not start without a
@@ -268,10 +268,13 @@ class AgentInvoker:
         )
         manifest_path = manifest_dir / "manifest.json"
         self.artifacts.save_model(manifest_path, manifest)
-        # Read back: the manifest existing on disk is a dispatch precondition.
+        # Read back: the manifest existing on disk is a dispatch precondition,
+        # and the recorded hash covers the actual persisted bytes so a later
+        # integrity check compares like with like.
+        persisted = manifest_path.read_text(encoding="utf-8")
         if self.artifacts.load_json(manifest_path) is None:
             raise AgentRunFailed(profile.role, "context manifest could not be persisted")
-        return manifest, manifest_path
+        return manifest, manifest_path, sha256_text(persisted)
 
     async def _run_with_technical_retries(
         self,
@@ -314,7 +317,7 @@ class AgentInvoker:
 
             # 1. ContextManifest — durable before anything else. Failure to
             #    persist it aborts the dispatch entirely.
-            manifest, manifest_path = self._persist_manifest(
+            manifest, manifest_path, manifest_hash = self._persist_manifest(
                 profile, system_prompt, sections, schema_feedback, prompt,
                 project_id, task_id, attempt_no,
             )
@@ -331,7 +334,7 @@ class AgentInvoker:
                 timeout_seconds=profile.timeout_seconds,
                 profile=profile,
                 context_manifest_path=str(manifest_path),
-                context_manifest_hash=sha256_text(manifest.model_dump_json()),
+                context_manifest_hash=manifest_hash,
                 repeat_guard=RepeatGuardConfig(
                     enabled=self.config.repeat_guard.enabled,
                     warn_after=self.config.repeat_guard.warn_after,

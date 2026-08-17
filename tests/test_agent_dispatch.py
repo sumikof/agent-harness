@@ -104,6 +104,11 @@ async def test_manifest_and_spec_are_durable_before_dispatch(config, monkeypatch
     spec = json.loads(observed["resolved_spec"])
     assert spec["prompt_sha256"] and spec["profile_hash"]
     assert "prompt" not in spec  # bodies live in the manifest artifacts, not the DB
+    # the recorded manifest hash matches the persisted file bytes, so an
+    # integrity check against the artifact compares like with like
+    from harness.artifacts.manager import sha256_text
+    assert spec["context_manifest_hash"] == sha256_text(
+        Path(observed["manifest_path"]).read_text(encoding="utf-8"))
     op = orchestrator.operations.get(observed["dispatch_op"])
     assert op is not None and op["operation_type"] == "AGENT_DISPATCH"
     assert op["status"] == "COMPLETED"  # result recorded after the run
@@ -326,6 +331,12 @@ def test_spill_preview_honors_small_thresholds(tmp_path):
     assert spilled.truncated
     assert len(spilled.head) + len(spilled.tail) <= 1000
     assert Path(spilled.artifact_path).read_text() == text  # full copy intact
+
+    # threshold=1 -> tail_chars becomes 0; text[-0:] must NOT leak the whole
+    # string back into the preview
+    tiny = artifacts.spill_text_output("tiny-threshold.log", text, threshold=1)
+    assert tiny.truncated
+    assert len(tiny.head) + len(tiny.tail) <= 1
 
 
 async def test_result_recording_is_atomic(config, monkeypatch):

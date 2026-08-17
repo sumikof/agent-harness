@@ -137,13 +137,15 @@ class ArtifactManager:
         truncated = len(text) > threshold
         head_chars = min(head_chars, max(1, threshold // 2))
         tail_chars = min(tail_chars, max(0, threshold - head_chars))
+        # text[-0:] is the WHOLE string, not "" — guard the zero-tail case.
+        tail = "" if not truncated or tail_chars <= 0 else text[-tail_chars:]
         return SpilledOutput(
             artifact_path=str(path),
             sha256=sha256_text(text),
             total_bytes=len(text.encode("utf-8")),
             truncated=truncated,
             head=text if not truncated else text[:head_chars],
-            tail="" if not truncated else text[-tail_chars:],
+            tail=tail,
         )
 
     def save_text(self, path: Path, text: str) -> Path:
