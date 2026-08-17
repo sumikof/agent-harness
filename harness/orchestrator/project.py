@@ -215,19 +215,47 @@ class ProjectOrchestrator:
             extra=extra,
             artifact_path=self.artifacts.project_plan_path(),
         )
-        inserted = []
+        terminal = {TaskState.COMPLETED.value, TaskState.SKIPPED.value}
+        created, updated = [], []
         for planned in plan.tasks:
-            if self.tasks.get_by_key(project_id, planned.task_key) is not None:
-                continue  # completed and existing tasks are never re-planned
-            self.tasks.create(
-                project_id,
-                planned.task_key,
-                planned.title,
-                planned.goal,
-                planned.acceptance_criteria,
-                planned.dependencies,
-            )
-            inserted.append(planned.task_key)
-        self.events.emit("PLAN_CREATED", project_id=project_id,
-                         payload={"tasks": inserted, "replan": replan})
-        logger.info("plan %s: %d new task(s)", "revised" if replan else "created", len(inserted))
+            existing = self.tasks.get_by_key(project_id, planned.task_key)
+            if existing is None:
+                self.tasks.create(
+                    project_id,
+                    planned.task_key,
+                    planned.title,
+                    planned.goal,
+                    planned.acceptance_criteria,
+                    planned.dependencies,
+                )
+                created.append(planned.task_key)
+            elif existing["status"] not in terminal:
+                # A revised plan replaces the definition of unfinished work;
+                # completed/skipped tasks are never re-planned.
+                self.tasks.update_definition(
+                    existing["id"],
+                    planned.title,
+                    planned.goal,
+                    planned.acceptance_criteria,
+                    planned.dependencies,
+                )
+                if existing["status"] == TaskState.BLOCKED.value:
+                    self.tasks.set_status(existing["id"], TaskState.PENDING, force=True)
+                updated.append(planned.task_key)
+        dropped = []
+        if replan:
+            # Unfinished tasks the revised plan no longer mentions are dropped,
+            # not silently retried with their stale definition.
+            plan_keys = {t.task_key for t in plan.tasks}
+            for task in self.tasks.list_for_project(project_id):
+                if task["status"] not in terminal and task["task_key"] not in plan_keys:
+                    self.tasks.set_status(task["id"], TaskState.SKIPPED, force=True)
+                    dropped.append(task["task_key"])
+        self.events.emit(
+            "PLAN_CREATED", project_id=project_id,
+            payload={"created": created, "updated": updated, "dropped": dropped, "replan": replan},
+        )
+        logger.info(
+            "plan %s: %d created, %d updated, %d dropped",
+            "revised" if replan else "created", len(created), len(updated), len(dropped),
+        )

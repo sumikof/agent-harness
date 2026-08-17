@@ -22,6 +22,7 @@ from .database.project_repository import ProjectRepository
 from .database.task_repository import TaskRepository
 from .git.repository import GitRepository
 from .orchestrator.project import ProjectOrchestrator
+from .orchestrator.recovery import UnexplainedDirtyWorktree
 
 
 def setup_logging(config: HarnessConfig) -> None:
@@ -53,7 +54,11 @@ def cmd_init(config: HarnessConfig) -> int:
 
 def cmd_run(config: HarnessConfig) -> int:
     orchestrator = ProjectOrchestrator(config)
-    final_state = asyncio.run(orchestrator.run())
+    try:
+        final_state = asyncio.run(orchestrator.run())
+    except UnexplainedDirtyWorktree as exc:
+        print(f"refusing to start: {exc}")
+        return 1
     print(f"project finished in state: {final_state}")
     return 0 if final_state.value in ("COMPLETED", "PAUSED") else 1
 

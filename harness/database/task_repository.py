@@ -113,6 +113,31 @@ class TaskRepository:
             (status.value, utcnow(), task_id),
         )
 
+    def update_definition(
+        self,
+        task_id: int,
+        title: str,
+        goal: str,
+        acceptance_criteria: list[str] | None,
+        dependencies: list[str] | None,
+    ) -> None:
+        """Replace an unfinished task's definition with a revised plan's version."""
+        self.db.execute(
+            """
+            UPDATE tasks SET title = ?, goal = ?, acceptance_criteria = ?,
+                             dependencies = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                title,
+                goal,
+                json.dumps(acceptance_criteria or [], ensure_ascii=False),
+                json.dumps(dependencies or [], ensure_ascii=False),
+                utcnow(),
+                task_id,
+            ),
+        )
+
     def set_commit(self, task_id: int, commit_hash: str) -> None:
         self.db.execute(
             "UPDATE tasks SET current_commit = ?, updated_at = ? WHERE id = ?",

@@ -15,7 +15,7 @@ from harness.agents.base import AgentRequest, AgentResult
 from harness.config import HarnessConfig, ProjectConfig, VerificationConfig
 from harness.git.repository import GitRepository
 from harness.orchestrator.project import ProjectOrchestrator
-from harness.orchestrator.state_machine import ProjectState, Role
+from harness.orchestrator.state_machine import ProjectState, Role, TaskState
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -219,6 +219,66 @@ async def test_agent_run_budget_cap_enforced(config, monkeypatch):
 
     # planner run itself blows the cap -> project fails fast, never COMPLETED
     assert state != ProjectState.COMPLETED
+
+
+async def test_replan_updates_and_drops_existing_tasks(config, monkeypatch):
+    """A revised plan must replace unfinished task definitions, not be discarded (Codex P1)."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    orchestrator.tasks.create(pid, "T001", "old title", "old goal")
+    orchestrator.tasks.create(pid, "T002", "obsolete task")
+    t3 = orchestrator.tasks.create(pid, "T003", "already done")
+    orchestrator.tasks.set_status(t3, TaskState.COMPLETED, force=True)
+
+    fake = FakeRunner(config.repository_path, review_verdicts=[])
+
+    def replan_payload(role):
+        assert role == Role.PLANNER
+        return {
+            "summary": "revised",
+            "tasks": [
+                {"task_key": "T000", "title": "new prerequisite"},
+                {"task_key": "T001", "title": "new title", "goal": "new goal",
+                 "dependencies": ["T000"]},
+                {"task_key": "T003", "title": "must not touch completed"},
+            ],
+        }
+
+    fake._payload = replan_payload
+    install_fake(monkeypatch, fake)
+
+    await orchestrator._plan(pid, orchestrator.project_context(), replan=True)
+
+    t1 = orchestrator.tasks.get_by_key(pid, "T001")
+    assert t1["title"] == "new title"
+    assert json.loads(t1["dependencies"]) == ["T000"]          # revised definition applied
+    assert orchestrator.tasks.get_by_key(pid, "T000") is not None  # new task inserted
+    assert orchestrator.tasks.get_by_key(pid, "T002")["status"] == "SKIPPED"  # dropped
+    assert orchestrator.tasks.get_by_key(pid, "T003")["title"] == "already done"  # untouched
+
+
+async def test_failed_run_cost_still_hits_run_cap(config, monkeypatch):
+    """Failed runs spend money too; the per-run cap must stop retries (Codex P2)."""
+    config.budget.agent_run_usd = 1.0
+    monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
+    orchestrator = ProjectOrchestrator(config)
+    calls = []
+
+    class ExpensiveFailingRunner:
+        async def run(self, request):
+            calls.append(request.role)
+            return AgentResult(status="FAILED", error="boom", cost_usd=5.0)
+
+    monkeypatch.setattr(agent_invoker_module, "create_runner",
+                        lambda provider: ExpensiveFailingRunner())
+
+    state = await orchestrator.run()
+
+    assert state == ProjectState.FAILED   # planner attempt aborted
+    assert len(calls) == 1                # cap raised immediately — no blind retries
+    project = orchestrator.projects.get(1)
+    assert project["spent_usd"] == pytest.approx(5.0)  # cost still recorded
 
 
 async def test_verification_failure_triggers_fresh_developer(config, monkeypatch):

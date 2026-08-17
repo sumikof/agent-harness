@@ -102,16 +102,6 @@ class AgentInvoker:
             if result.status != "COMPLETED":
                 raise AgentRunFailed(spec.role.value, result.error or "agent session failed")
 
-            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
-            # cap is enforced right after the run. An over-budget run fails
-            # the attempt, which feeds the normal retry/diagnosis path.
-            cap = self.config.budget.agent_run_usd
-            if result.cost_usd > cap:
-                raise AgentRunFailed(
-                    spec.role.value,
-                    f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
-                )
-
             model_obj, validation_error = validate_output(result, spec.output_model)
             if model_obj is not None:
                 if artifact_path is not None:
@@ -140,6 +130,11 @@ class AgentInvoker:
         delay = TECHNICAL_RETRY_DELAY
         result: AgentResult = AgentResult(status="FAILED", error="not run")
         for attempt in range(TECHNICAL_RETRIES + 1):
+            # Every physical provider call spends money — failed runs and
+            # schema retries included — so limits are re-checked before each.
+            self.budget.check_project(project_id)
+            if task_id is not None:
+                self.budget.check_task(task_id)
             run_id = self.runs.start_run(project_id, spec.role.value, attempt_id)
             self.events.emit(
                 "AGENT_STARTED",
@@ -159,6 +154,21 @@ class AgentInvoker:
                 error=result.error,
             )
             self.budget.record_cost(project_id, task_id, result.cost_usd)
+            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
+            # cap is enforced right after every run — failed ones included.
+            # An over-budget run fails the attempt (normal retry/diagnosis
+            # path) instead of being retried.
+            cap = self.config.budget.agent_run_usd
+            if result.cost_usd > cap:
+                self.runs.finish_run(
+                    run_id, status="FAILED", session_id=result.session_id,
+                    token_usage=result.token_usage, cost_usd=result.cost_usd,
+                    error=f"run cost exceeded agent_run_usd cap ${cap:.2f}",
+                )
+                raise AgentRunFailed(
+                    spec.role.value,
+                    f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
+                )
             self.events.emit(
                 "AGENT_COMPLETED" if result.status == "COMPLETED" else "AGENT_FAILED",
                 project_id=project_id,

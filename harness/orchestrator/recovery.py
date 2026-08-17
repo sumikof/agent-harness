@@ -4,6 +4,9 @@ The harness process is expected to die mid-run. On startup we reconcile
 SQLite state with the Git working tree: any RUNNING attempt is treated as
 interrupted, its dirty diff is archived as an artifact, the tree is reset
 to the last good commit, and the task is re-queued for a fresh attempt.
+
+A dirty tree WITHOUT a recorded RUNNING attempt is not the harness's work
+to destroy: recovery refuses to start instead of resetting it.
 """
 
 from __future__ import annotations
@@ -32,6 +35,10 @@ IN_FLIGHT_STATES = {
 }
 
 
+class UnexplainedDirtyWorktree(Exception):
+    """The repository has uncommitted changes the harness did not create."""
+
+
 class RecoveryManager:
     def __init__(
         self,
@@ -55,7 +62,7 @@ class RecoveryManager:
         running = self.tasks.running_attempts(project_id)
         dirty = self.git.is_repo() and self.git.is_dirty()
 
-        if running or dirty:
+        if running:
             logger.warning(
                 "recovery: %d running attempt(s), working tree dirty=%s", len(running), dirty
             )
@@ -72,6 +79,13 @@ class RecoveryManager:
             if dirty:
                 self.checkpoint.discard_working_tree()
             acted = True
+        elif dirty:
+            # No interrupted attempt explains this diff — it is user work.
+            # Never destroy it; make the operator decide.
+            raise UnexplainedDirtyWorktree(
+                f"repository {self.git.path} has uncommitted changes but no interrupted "
+                "attempt is recorded. Commit, stash, or clean it manually, then rerun."
+            )
 
         for task in self.tasks.list_for_project(project_id):
             if task["status"] in IN_FLIGHT_STATES:

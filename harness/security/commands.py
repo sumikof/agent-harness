@@ -20,10 +20,14 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     # command past the hook. False positives (a keyword appearing later in
     # the same segment) are accepted by design.
     (
-        r"\bgit\b[^|;&]*?\b(push|commit|merge|rebase|reset|checkout|switch|stash|clean|tag|remote)\b",
+        r"\bgit\b[^|;&]*?\b(push|commit|merge|rebase|reset|checkout|switch|stash|clean|tag|remote"
+        r"|cherry-pick|revert|am|update-ref|symbolic-ref|filter-branch|replace|reflog|worktree|gc|prune)\b",
         "git lifecycle commands are reserved for the harness",
     ),
-    (r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-d\b|\s-D\b|--delete)", "branch deletion is forbidden"),
+    (
+        r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[dDfmM]\b|--delete|--force|--move)",
+        "branch mutation is forbidden",
+    ),
     # Destructive / privileged operations
     (r"\bsudo\b", "sudo is forbidden"),
     (r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+(/|~|\$HOME)(\s|$)", "recursive delete of root/home is forbidden"),
@@ -69,10 +73,11 @@ def check_command(command: str) -> CommandDecision:
 # defense-in-depth, not a sandbox: false positives only force the agent to
 # use the dedicated file tools, which are properly permission-checked.
 _WRITE_HINTS: list[tuple[re.Pattern, str]] = [
-    # Redirections that create/overwrite files. `2>` (fd redirect) and
-    # redirects to /dev/null are allowed; `>&`-style fd duplication too.
-    (re.compile(r"(?:^|[^&\d])>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
-    (re.compile(r"&>\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
+    # Any redirection that targets a regular file (`> f`, `2> f`, `>> f`,
+    # `&> f`) — including stderr redirects. Exempt only /dev/null targets
+    # and fd duplication (`2>&1`). The lookbehind avoids `->` / `<>` noise.
+    (re.compile(r"(?<![<>-])\d*>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
+    (re.compile(r"&>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
     (re.compile(r"\btee\b"), "tee writes files"),
     (re.compile(r"\bsed\b[^|;&]*\s-i\b"), "sed -i edits files in place"),
     (re.compile(r"\b(perl|python[0-9.]*|ruby)\b[^|;&]*\s-i\b"), "in-place edit flag"),

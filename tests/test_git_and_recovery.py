@@ -7,7 +7,7 @@ from harness.database.project_repository import ProjectRepository
 from harness.database.task_repository import TaskRepository
 from harness.git.checkpoint import CheckpointManager
 from harness.git.repository import GitRepository
-from harness.orchestrator.recovery import RecoveryManager
+from harness.orchestrator.recovery import RecoveryManager, UnexplainedDirtyWorktree
 from harness.orchestrator.state_machine import TaskState
 
 
@@ -76,6 +76,27 @@ def test_recovery_after_crash(tmp_path, repo):
     diffs = list((artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
     assert len(diffs) == 1
     assert "half-finished" in diffs[0].read_text()
+    db.close()
+
+
+def test_recovery_refuses_unexplained_dirty_tree(tmp_path, repo):
+    """User work without a RUNNING attempt must never be reset (Codex P1)."""
+    db = Database(tmp_path / "harness.db")
+    projects = ProjectRepository(db)
+    tasks = TaskRepository(db)
+    events = EventRepository(db)
+    artifacts = ArtifactManager(tmp_path / "artifacts")
+    project_id = projects.create("p", str(repo.path), "main", "g", 10.0)
+
+    # dirty tree, but NO running attempt recorded — this is user work
+    (repo.path / "hello.txt").write_text("precious uncommitted user work\n")
+
+    recovery = RecoveryManager(tasks, events, artifacts, repo, CheckpointManager(repo))
+    with pytest.raises(UnexplainedDirtyWorktree):
+        recovery.recover(projects.get(project_id))
+
+    assert repo.is_dirty()  # untouched
+    assert (repo.path / "hello.txt").read_text() == "precious uncommitted user work\n"
     db.close()
 
 

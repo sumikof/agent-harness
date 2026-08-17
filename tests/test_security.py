@@ -30,6 +30,27 @@ class TestCommandPolicy:
         ]:
             assert not check_command(cmd).allowed, cmd
 
+    def test_commit_producing_subcommands_forbidden(self):
+        # cherry-pick / revert / am create commits; update-ref & friends move
+        # harness-owned ref state directly.
+        for cmd in [
+            "git cherry-pick abc123",
+            "git revert HEAD",
+            "git am patch.mbox",
+            "git update-ref refs/heads/main abc123",
+            "git symbolic-ref HEAD refs/heads/other",
+            "git filter-branch --all",
+            "git worktree add ../scratch",
+            "git branch -f main HEAD~3",
+            "git branch -m old new",
+            "git reflog expire --all",
+            "git gc --prune=now",
+        ]:
+            assert not check_command(cmd).allowed, cmd
+        # plain listing stays allowed
+        assert check_command("git branch").allowed
+        assert check_command("git branch --list").allowed
+
     def test_dangerous_commands_forbidden(self):
         for cmd in [
             "sudo apt install x",
@@ -71,6 +92,10 @@ class TestWriteHints:
             "touch marker",
             "mkdir newdir",
             "pip install requests",
+            # stderr / fd-numbered redirects to regular files are writes too
+            "pytest 2> src/main.py",
+            "make 2>> build-errors.log",
+            "cmd &> capture.txt",
         ]:
             assert find_write_hint(cmd) is not None, cmd
 
@@ -83,6 +108,9 @@ class TestWriteHints:
             "./mvnw test 2>&1 | tail -20",
             "git status",
             "sed -n '1,10p' src/x.py",
+            "make 2> /dev/null",
+            "cmd &> /dev/null",
+            "grep -- '->' src/x.py",
         ]:
             assert find_write_hint(cmd) is None, cmd
 
