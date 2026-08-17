@@ -88,6 +88,31 @@ def test_stream_gap_detection(db):
     assert gaps[0]["stream_type"] == "global"
 
 
+def test_interrupted_migration_leaves_previous_version_intact(tmp_path, monkeypatch):
+    """A crash mid-migration must roll the whole migration back: a partial
+    set of ALTERs with no version record would fail forever with
+    'duplicate column name' on the next start."""
+    db_path = tmp_path / "harness.db"
+    original = list(migrations_module.MIGRATIONS)
+    monkeypatch.setattr(migrations_module, "MIGRATIONS", original[:1])
+    Database(db_path).close()  # a v1 workspace
+
+    # v2 that dies on its last statement (simulated crash mid-script)
+    broken_v2 = original[1] + "; INSERT INTO no_such_table VALUES (1)"
+    monkeypatch.setattr(migrations_module, "MIGRATIONS", [original[0], broken_v2])
+    with pytest.raises(Exception):
+        Database(db_path)
+
+    monkeypatch.undo()
+    db = Database(db_path)  # real v2 must now apply cleanly — no duplicate columns
+    try:
+        versions = [r[0] for r in db.conn.execute("SELECT version FROM schema_migrations")]
+        assert versions == [1, 2]
+        db.execute("SELECT stream_type, seq FROM events LIMIT 0")  # columns exist once
+    finally:
+        db.close()
+
+
 def test_migration_preserves_v1_workspace(tmp_path, monkeypatch):
     """A workspace created before the ledger migration must open, keep its
     data, and accept new ledger events afterwards."""

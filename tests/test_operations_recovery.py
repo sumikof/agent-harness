@@ -68,11 +68,18 @@ def test_commit_records_intent_and_result_with_trailers(world):
 
     assert commit
     op = world.db.query_one("SELECT * FROM operations WHERE operation_type = 'GIT_COMMIT'")
-    assert op["status"] == "COMPLETED"
+    # the RESULT is deliberately left to the caller's completion transaction:
+    # until then the intent stays PENDING (reconcilable from the trailer)
+    assert op["status"] == "PENDING"
+    assert world.checkpoint.pending_operation_id == op["operation_id"]
     message = world.git.commit_message("HEAD")
     assert f"{OPERATION_TRAILER}: {op['operation_id']}" in message
     assert "Harness-Task: T001" in message
-    # intent and result share the operation_id in the ledger
+
+    # caller-side finalize (as _complete_task does, atomically with task state)
+    world.operations.record_result(
+        op["operation_id"], OperationStatus.COMPLETED, {"commit": commit}
+    )
     rows = world.db.query_all(
         "SELECT event_type FROM events WHERE operation_id = ? ORDER BY id",
         (op["operation_id"],),
@@ -148,3 +155,21 @@ def test_interrupted_agent_dispatch_operation_is_closed(world):
     world.recovery.recover(world.projects.get(world.pid))
     assert world.operations.get(op_id)["status"] == "INTERRUPTED"
     assert world.operations.unfinished() == []
+
+
+def test_recovery_never_settles_another_projects_journal(world):
+    """A workspace can hold several projects; recovering project A must not
+    destroy project B's pending crash evidence."""
+    other_pid = world.projects.create("other", "/elsewhere", "main", "g", 10.0)
+    other_commit = world.operations.record_intent(
+        OperationType.GIT_COMMIT, {"task_key": "X001"}, project_id=other_pid
+    )
+    other_dispatch = world.operations.record_intent(
+        OperationType.AGENT_DISPATCH, {"role": "developer"}, project_id=other_pid
+    )
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    # the other project's journal is untouched — still PENDING for its own startup
+    assert world.operations.get(other_commit)["status"] == "PENDING"
+    assert world.operations.get(other_dispatch)["status"] == "PENDING"

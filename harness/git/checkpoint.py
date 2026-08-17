@@ -16,11 +16,7 @@ from __future__ import annotations
 
 import hashlib
 
-from ..database.operation_repository import (
-    OperationRepository,
-    OperationStatus,
-    OperationType,
-)
+from ..database.operation_repository import OperationRepository, OperationType
 from .repository import GitRepository
 
 TASK_TRAILER = "Harness-Task"
@@ -31,6 +27,11 @@ class CheckpointManager:
     def __init__(self, repo: GitRepository, operations: OperationRepository | None = None):
         self.repo = repo
         self.operations = operations
+        # operation_id of the last journaled commit. The RESULT for it is
+        # deliberately NOT recorded here: the caller records it in the same
+        # transaction as the task-completion updates, so there is no window
+        # where the operation looks settled but the task state was lost.
+        self.pending_operation_id: str | None = None
 
     def commit_task(
         self,
@@ -45,7 +46,14 @@ class CheckpointManager:
 
         Returns the new commit hash, or None if there was nothing to commit
         (a task may legitimately produce no diff, e.g. verification-only).
+
+        When journaled, the operation is left PENDING with its id in
+        `pending_operation_id`; the caller must record the result together
+        with the task-state updates (one transaction). A crash before that
+        leaves the intent PENDING and the commit discoverable by trailer,
+        which is exactly what recovery reconciles.
         """
+        self.pending_operation_id = None
         if not self.repo.is_dirty():
             return None
         message = f"agent({task_key}): {title}"
@@ -77,9 +85,7 @@ class CheckpointManager:
             message,
             trailers={TASK_TRAILER: task_key, OPERATION_TRAILER: operation_id},
         )
-        self.operations.record_result(
-            operation_id, OperationStatus.COMPLETED, {"commit": commit_hash}
-        )
+        self.pending_operation_id = operation_id
         return commit_hash
 
     def find_committed_operation(self, operation_id: str) -> str | None:

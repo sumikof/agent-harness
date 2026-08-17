@@ -414,12 +414,24 @@ class TaskRunner:
             task_key, task_row["title"],
             project_id=project_id, task_id=task_id, attempt_id=attempt_id,
         )
-        self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
-        if commit_hash:
-            self.tasks.set_commit(task_id, commit_hash)
-        self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
-        self.events.emit("TASK_COMPLETED", project_id=project_id, task_id=task_id,
-                         attempt_id=attempt_id, payload={"commit": commit_hash})
+        # The GIT_COMMIT result and every task-completion update land in ONE
+        # transaction: either the operation stays PENDING (and recovery
+        # reconciles the whole completion from the commit trailer) or all of
+        # it is durable. No window where the journal says done but the task
+        # state was lost.
+        commit_op_id = self.checkpoint.pending_operation_id
+        with self.tasks.db.transaction():
+            if commit_op_id and self.operations:
+                self.operations.record_result(
+                    commit_op_id, OperationStatus.COMPLETED, {"commit": commit_hash}
+                )
+            self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
+            if commit_hash:
+                self.tasks.set_commit(task_id, commit_hash)
+            self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+            self.events.emit("TASK_COMPLETED", project_id=project_id, task_id=task_id,
+                             attempt_id=attempt_id, operation_id=commit_op_id,
+                             payload={"commit": commit_hash})
         logger.info("task %s completed (commit %s)", task_key, commit_hash)
         return TaskOutcome.COMPLETED
 

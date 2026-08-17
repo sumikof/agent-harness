@@ -240,7 +240,10 @@ class AgentInvoker:
         manifest_key = uuid.uuid4().hex
         manifest_dir = self.artifacts.root / "manifests" / manifest_key
         refs: dict[str, ContextRef] = {}
-        all_sections = list(sections)
+        # The system prompt body is persisted too — a hash alone cannot
+        # reconstruct the input once the packaged prompt file changes. The
+        # user prompt is the join of the remaining sections in order.
+        all_sections = [("system_prompt", system_prompt)] + list(sections)
         if schema_feedback:
             all_sections.append(("correction", schema_feedback))
         for name, text in all_sections:
@@ -384,6 +387,12 @@ class AgentInvoker:
             # 4. Side effect: the actual agent session.
             result = await runner.run(resolved)
 
+            # A run that tripped the repeat-action guard is never adopted as
+            # a success: its output came from a session stuck in a loop.
+            if result.loop_detected and result.status == "COMPLETED":
+                result.status = "FAILED"
+                result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
+
             # 5. Result — run row, operation result, cost, events.
             self.runs.finish_run(
                 run_id,
@@ -425,8 +434,10 @@ class AgentInvoker:
                     attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
                 )
             if result.loop_detected:
-                # The guard only flags; the Orchestrator (this code path and
-                # the task loop above it) owns the resulting transition.
+                # The guard only flags; the Orchestrator owns the transition:
+                # the run fails the attempt (reasoning-retry path — fresh
+                # session, possibly diagnosis), never a provider retry of the
+                # same context, which would loop identically.
                 self.events.emit(
                     EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
                     attempt_id=attempt_id, agent_run_id=run_id,
@@ -454,6 +465,11 @@ class AgentInvoker:
             )
             if result.status == "COMPLETED":
                 return result, run_id
+            if result.loop_detected:
+                raise AgentRunFailed(
+                    spec.role.value,
+                    "loop detected (repeated identical tool call) — aborting for a fresh attempt",
+                )
             # Permanent failures (auth, config, missing model) fail
             # identically on retry — surface immediately instead.
             if result.failure_kind == FailureKind.PERMANENT:
@@ -461,9 +477,35 @@ class AgentInvoker:
                     spec.role.value, f"permanent provider failure: {result.error}"
                 )
             if attempt < TECHNICAL_RETRIES:
+                # A mutating role may have half-edited the tree before the
+                # transient failure; redispatching on top of that would run
+                # the same assignment against an unknown base. Archive the
+                # partial diff and restore the attempt's base state first.
+                self._restore_worktree_for_retry(spec, run_id)
                 logger.warning(
                     "%s failed technically (%s); retrying in %.0fs", spec.role, result.error, delay
                 )
                 await asyncio.sleep(delay)
                 delay *= 2
         return result, run_id
+
+    def _restore_worktree_for_retry(self, spec: RoleSpec, run_id: Optional[int]) -> None:
+        if not spec.mutates_repo or self.git is None:
+            return
+        try:
+            if self.git.head_commit() is None or not self.git.is_dirty():
+                return
+            diff = self.git.full_dirty_diff()
+            if diff.strip():
+                self.artifacts.save_text(
+                    self.artifacts.root / "diagnostics"
+                    / f"{spec.role.value}-run{run_id}-transient-retry.diff",
+                    diff,
+                )
+            self.git.reset_hard("HEAD")
+        except Exception as exc:
+            # Without a known-clean base a blind redispatch is worse than
+            # failing the attempt — surface instead of retrying.
+            raise AgentRunFailed(
+                spec.role.value, f"could not restore worktree before provider retry: {exc}"
+            )

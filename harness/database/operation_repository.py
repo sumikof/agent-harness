@@ -139,14 +139,24 @@ class OperationRepository:
             "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
         )
 
-    def unfinished(self, operation_type: OperationType | None = None) -> list[sqlite3.Row]:
-        """Operations whose intent was persisted but no result was recorded."""
-        if operation_type is None:
-            return self.db.query_all(
-                "SELECT * FROM operations WHERE status = ? ORDER BY id",
-                (OperationStatus.PENDING.value,),
-            )
-        return self.db.query_all(
-            "SELECT * FROM operations WHERE status = ? AND operation_type = ? ORDER BY id",
-            (OperationStatus.PENDING.value, operation_type.value),
-        )
+    def unfinished(
+        self,
+        operation_type: OperationType | None = None,
+        project_id: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Operations whose intent was persisted but no result was recorded.
+
+        Recovery MUST scope by project_id: a workspace can hold several
+        projects, and settling another project's journal against this
+        project's repository would destroy its crash evidence.
+        """
+        sql = "SELECT * FROM operations WHERE status = ?"
+        params: list = [OperationStatus.PENDING.value]
+        if operation_type is not None:
+            sql += " AND operation_type = ?"
+            params.append(operation_type.value)
+        if project_id is not None:
+            sql += " AND project_id = ?"
+            params.append(project_id)
+        sql += " ORDER BY id"
+        return self.db.query_all(sql, tuple(params))

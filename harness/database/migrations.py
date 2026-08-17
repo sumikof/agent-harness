@@ -131,18 +131,42 @@ MIGRATIONS: list[str] = [
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-    )
-    applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+    """Apply pending migrations, each one atomically.
+
+    A migration's statements and its schema_migrations record are committed
+    in ONE explicit transaction, so a crash mid-migration leaves the file at
+    the previous version instead of half-ALTERed (which would make a
+    non-idempotent ADD COLUMN fail forever on the next start).
+
+    Migration scripts are split on ';' — they must not contain literal
+    semicolons inside string values.
+    """
     from .connection import utcnow
 
-    for version, sql in enumerate(MIGRATIONS, start=1):
-        if version in applied:
-            continue
-        conn.executescript(sql)
+    # Python's sqlite3 legacy transaction handling autocommits DDL, which
+    # would break atomicity — take explicit control for the whole pass.
+    old_isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-            (version, utcnow()),
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-    conn.commit()
+        applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+        for version, sql in enumerate(MIGRATIONS, start=1):
+            if version in applied:
+                continue
+            statements = [part.strip() for part in sql.split(";") if part.strip()]
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, utcnow()),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+    finally:
+        conn.isolation_level = old_isolation

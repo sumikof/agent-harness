@@ -156,12 +156,14 @@ class RecoveryManager:
     # ------------------------------------------------------------------
 
     def _settle_unfinished_operations(self, project_id: int) -> bool:
+        # Scoped to THIS project: other projects in the same workspace keep
+        # their pending journals for their own startup to settle.
         acted = False
-        for op in self.operations.unfinished(OperationType.GIT_COMMIT):
+        for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
             self._reconcile_git_commit(project_id, op)
             acted = True
         for op_type in (OperationType.AGENT_DISPATCH, OperationType.VERIFICATION_COMMAND):
-            for op in self.operations.unfinished(op_type):
+            for op in self.operations.unfinished(op_type, project_id=project_id):
                 # The side effect (an agent session / a verification process)
                 # died with the harness; its worktree effects are handled by
                 # the dirty-state step, so the operation is closed as

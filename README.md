@@ -108,7 +108,7 @@ workspace/
 - **Retry 3層** — Provider Retry(transientのみ・有限・指数backoff・attempt消費なし)/ Episode Recovery(中断復旧、原則Fresh Session)/ Reasoning Retry(Verification FAIL・REPAIR、常に新AgentRun + attempt増加)。Permanent failure(認証・設定エラー)はretryしない。
 - **Invariant Checker** — 起動時に「COMPLETEDにはVerification PASS / Reviewer PASS / 解決可能なCommitがある」「RUNNING AgentRunは最大1件かつManifest/Specを持つ」「stream seqにgapがない」等を検証し、違反は黙って修復せずBLOCKEDにする。
 - **Large Output Spill** — 巨大なdiff・ログはartifactへ全量保存し、Agent Contextにはhead/tail preview + locator(path / sha256 / bytes)のみ渡す。
-- **Repeat Action Guard** — 同一Tool Callの連続繰り返しを検出し、警告→拒否+LOOP_DETECTEDをOrchestratorへ報告する(pre-tool hookを持つProviderのみ)。
+- **Repeat Action Guard** — 同一Tool Callの連続繰り返しを検出し、警告→拒否+LOOP_DETECTEDをOrchestratorへ報告する(pre-tool hookを持つProviderのみ)。LOOP検出されたRunは成功出力があってもFAILED扱いとなり、Provider retryではなくreasoning retry(Fresh Attempt)経路へ送られる。
 
 ## 中断・復旧
 

@@ -98,6 +98,9 @@ async def test_manifest_and_spec_are_durable_before_dispatch(config, monkeypatch
     manifest = json.loads(Path(observed["manifest_path"]).read_text())
     assert manifest["role"] == "planner"
     assert manifest["sections"]["project_context"]["sha256"]
+    # the system prompt BODY is persisted, not just its hash
+    system_section = manifest["sections"]["system_prompt"]
+    assert Path(system_section["artifact"]).read_text(encoding="utf-8")
     spec = json.loads(observed["resolved_spec"])
     assert spec["prompt_sha256"] and spec["profile_hash"]
     assert "prompt" not in spec  # bodies live in the manifest artifacts, not the DB
@@ -261,6 +264,69 @@ async def test_complete_task_refuses_without_recorded_evidence(config):
     orchestrator.runs.record_evaluation(aid, "PASS", {"verdict": "PASS"})
     outcome = orchestrator.task_runner._complete_task(pid, tid, "T001", aid, task_row)
     assert outcome.value == "COMPLETED"
+    # the GIT_COMMIT operation result was settled in the same transaction
+    # as the task-completion updates — nothing is left PENDING
+    assert orchestrator.operations.unfinished() == []
+
+
+async def test_loop_detected_run_is_never_adopted(config, monkeypatch):
+    """A run that tripped the repeat-action guard fails the dispatch even if
+    the provider returned a formally valid COMPLETED result."""
+    orchestrator = ProjectOrchestrator(config)
+    looping = ok_result()
+    looping.loop_detected = True
+    runner = ScriptedRunner([looping, ok_result()])
+    install(monkeypatch, runner)
+
+    with pytest.raises(agent_invoker_module.AgentRunFailed, match="[Ll]oop"):
+        await invoke_planner(orchestrator)
+
+    assert len(runner.specs) == 1  # no provider retry of the same context
+    run = orchestrator.db.query_one("SELECT * FROM agent_runs")
+    assert run["status"] == "FAILED"
+    event = orchestrator.db.query_one(
+        "SELECT 1 FROM events WHERE event_type = 'LOOP_DETECTED'"
+    )
+    assert event is not None
+
+
+async def test_transient_retry_restores_worktree_for_mutating_roles(config, monkeypatch):
+    """A Developer session that half-edited files before a transient failure
+    must not be redispatched onto the mutated tree: the partial diff is
+    archived and the base state restored first."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    tid = orchestrator.tasks.create(pid, "T001", "task")
+    aid = orchestrator.tasks.start_attempt(tid, orchestrator.git.head_commit())
+    repo_path = config.repository_path
+    tree_states = []
+
+    class HalfEditingRunner(ScriptedRunner):
+        async def run(self, spec):
+            tree_states.append((repo_path / "junk.py").exists())
+            if len(self.specs) == 0:
+                (repo_path / "junk.py").write_text("partial\n")  # side effect...
+                self.specs.append(spec)
+                return AgentResult(status="FAILED", error="connection timeout",
+                                   failure_kind=FailureKind.TRANSIENT)  # ...then dies
+            self.specs.append(spec)
+            (repo_path / "feature.txt").write_text("done\n")
+            return ok_result({"task": "T001", "summary": "s"})
+
+    runner = HalfEditingRunner([])
+    install(monkeypatch, runner)
+
+    from harness.agents import developer
+    await orchestrator.invoker.invoke(
+        developer.SPEC, pid, orchestrator.project_context(), task_id=tid, attempt_id=aid,
+    )
+
+    assert tree_states == [False, False]  # retry started from a clean base
+    assert not (repo_path / "junk.py").exists()
+    archived = list((orchestrator.artifacts.root / "diagnostics").glob(
+        "developer-run*-transient-retry.diff"))
+    assert len(archived) == 1 and "junk.py" in archived[0].read_text()
 
 
 async def test_repair_produces_fresh_agent_run_without_resume(config, monkeypatch):
