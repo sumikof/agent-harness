@@ -18,7 +18,11 @@ from ..context.builder import ContextBuilder, render_plan_for_replan
 from ..context.project_context import DEFAULT_FORBIDDEN_OPERATIONS, ProjectContext
 from ..database.connection import Database
 from ..database.event_repository import EventRepository, EventType
-from ..database.operation_repository import OperationRepository
+from ..database.operation_repository import (
+    OperationRepository,
+    OperationStatus,
+    OperationType,
+)
 from ..database.project_repository import ProjectRepository
 from ..database.run_repository import RunRepository
 from ..database.task_repository import TaskRepository
@@ -306,7 +310,19 @@ class ProjectOrchestrator:
 
         self.projects.set_status(project_id, ProjectState.FINAL_VERIFICATION, force=True)
         self.events.emit("FINAL_VERIFICATION_STARTED", project_id=project_id)
+        # Journaled like every verification: a crash mid-run is visible as an
+        # unfinished VERIFICATION_COMMAND intent at the next startup instead
+        # of a silent re-execution of possibly side-effecting commands.
+        verify_op_id = self.operations.record_intent(
+            OperationType.VERIFICATION_COMMAND,
+            {"commands": self.verifier.commands(), "label": "final"},
+            project_id=project_id,
+        )
         result = self.verifier.run(label="final")
+        self.operations.record_result(
+            verify_op_id, OperationStatus.COMPLETED,
+            {"passed": result.passed, "exit_codes": [s.exit_code for s in result.steps]},
+        )
         self.artifacts.save_model(self.artifacts.root / "final-verification.json", result)
         if result.passed:
             self.projects.set_status(project_id, ProjectState.COMPLETED)

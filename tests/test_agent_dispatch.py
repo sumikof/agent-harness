@@ -543,6 +543,29 @@ async def test_tester_retry_restores_developers_uncommitted_work(config, monkeyp
     assert not (repo_path / "tests" / "half.py").exists()    # tester's partial edit undone
 
 
+async def test_final_verification_is_journaled(config, monkeypatch):
+    """The project-level final verification records a VERIFICATION_COMMAND
+    intent/result like every other verification, so a crash mid-run is
+    detectable as an unfinished operation."""
+    from tests.test_orchestrator_loop import FakeRunner, install_fake
+
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+    assert state == ProjectState.COMPLETED
+
+    final_ops = [
+        op for op in orchestrator.db.query_all(
+            "SELECT * FROM operations WHERE operation_type = 'VERIFICATION_COMMAND'")
+        if json.loads(op["payload"]).get("label") == "final"
+    ]
+    assert len(final_ops) == 1
+    assert final_ops[0]["status"] == "COMPLETED"
+    assert orchestrator.operations.unfinished() == []
+
+
 async def test_repair_produces_fresh_agent_run_without_resume(config, monkeypatch):
     """Review REPAIR must start a brand-new Developer AgentRun (fresh
     session, own manifest) — never resume the previous session."""
