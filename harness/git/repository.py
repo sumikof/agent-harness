@@ -173,14 +173,23 @@ class GitRepository:
         return paths
 
     def expanded_changed_files(self) -> list[str]:
-        """changed_paths() with untracked directories expanded to files."""
+        """changed_paths() with untracked directories expanded to files.
+
+        Symlinks to directories inside an untracked tree appear in
+        os.walk()'s dirs list (never descended, followlinks=False) — they
+        are entries in their own right and must not be dropped.
+        """
         files: set[str] = set()
         for rel in self.changed_paths():
             full = self.path / rel
             if full.is_dir() and not full.is_symlink():
-                for root, _dirs, names in os.walk(full):
+                for root, dirs, names in os.walk(full):
                     for name in names:
                         files.add(str((Path(root) / name).relative_to(self.path)))
+                    for name in dirs:
+                        candidate = Path(root) / name
+                        if candidate.is_symlink():
+                            files.add(str(candidate.relative_to(self.path)))
             else:
                 files.add(rel.rstrip("/"))
         return sorted(files)

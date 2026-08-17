@@ -180,9 +180,15 @@ class ArtifactManager:
         def entries(rel: str):
             full = repo_root / rel
             if full.is_dir() and not full.is_symlink():
-                for walk_root, _dirs, names in os.walk(full):
+                for walk_root, walk_dirs, names in os.walk(full):
                     for name in names:
                         yield str((Path(walk_root) / name).relative_to(repo_root))
+                    # symlinks to directories show up in dirs (never
+                    # descended) — they are entries of their own
+                    for name in walk_dirs:
+                        candidate = Path(walk_root) / name
+                        if candidate.is_symlink():
+                            yield str(candidate.relative_to(repo_root))
             else:
                 yield rel
 

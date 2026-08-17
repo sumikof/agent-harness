@@ -726,6 +726,33 @@ def test_recovery_refuses_reset_when_archive_cannot_capture_socket(world):
         sock_path.unlink(missing_ok=True)
 
 
+def test_directory_symlinks_inside_untracked_trees_are_archived(world):
+    """A symlink-to-directory inside an untracked tree must be walked,
+    hashed, archived, and restored — not dropped by os.walk."""
+    import os
+    import tarfile
+
+    tree = world.git.path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "data.txt").write_text("payload\n")
+    os.symlink("sub", tree / "link")
+
+    assert "tree/link" in world.git.expanded_changed_files()
+
+    snap = world.git.snapshot_worktree_state()
+    world.git.reset_hard("HEAD")
+    assert not tree.exists()
+    world.git.restore_worktree_state(snap)
+    assert (tree / "link").is_symlink() and os.readlink(tree / "link") == "sub"
+
+    tar_path = world.artifacts.root / "diagnostics" / "symlink-test.files.tar"
+    world.artifacts.archive_worktree_files(tar_path, world.git.path,
+                                           world.git.changed_paths())
+    with tarfile.open(tar_path) as tar:
+        member = tar.getmember("tree/link")
+        assert member.issym() and member.linkname == "sub"
+
+
 def test_begin_run_claim_is_atomic_across_threads(tmp_path):
     """Two threads racing into begin_run must resolve to exactly one owner."""
     import threading
