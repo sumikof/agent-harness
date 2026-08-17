@@ -32,10 +32,22 @@ class Violation:
 
 
 class InvariantChecker:
-    def __init__(self, db: Database, git: GitRepository | None = None):
+    def __init__(
+        self,
+        db: Database,
+        git: GitRepository | None = None,
+        artifacts_root: Path | None = None,
+    ):
         self.db = db
         self.git = git
+        self.artifacts_root = Path(artifacts_root) if artifacts_root else None
         self.events = EventRepository(db)
+
+    def _resolve_artifact(self, stored_path: str) -> Path:
+        path = Path(stored_path)
+        if not path.is_absolute() and self.artifacts_root is not None:
+            return self.artifacts_root / path
+        return path
 
     def check_all(self, project_id: int | None = None) -> list[Violation]:
         violations: list[Violation] = []
@@ -82,7 +94,7 @@ class InvariantChecker:
                     "RUN_WITHOUT_MANIFEST", Severity.ERROR,
                     f"agent run {row['id']} is RUNNING without a ContextManifest",
                 ))
-            elif not Path(row["context_manifest_path"]).exists():
+            elif not self._resolve_artifact(row["context_manifest_path"]).exists():
                 violations.append(Violation(
                     "MANIFEST_ARTIFACT_MISSING", Severity.ERROR,
                     f"agent run {row['id']} references missing manifest "

@@ -34,6 +34,13 @@ except ImportError:  # non-Windows platform
 # design: the lock's scope IS the process.
 _HELD: dict[str, int] = {}
 
+# A fork()ed child inherits _HELD, which would let it "re-enter" a lock it
+# never acquired. Clearing the registry in the child forces a real acquire
+# attempt there — which fails, because the inherited (still open) parent
+# file description keeps holding the OS lock.
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_HELD.clear)
+
 
 class WorkspaceLocked(Exception):
     """Another harness process is already operating on this workspace."""

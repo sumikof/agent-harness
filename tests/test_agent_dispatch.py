@@ -94,13 +94,18 @@ async def test_manifest_and_spec_are_durable_before_dispatch(config, monkeypatch
     install(monkeypatch, runner)
     await invoke_planner(orchestrator)
 
-    assert observed["manifest_path"] and Path(observed["manifest_path"]).exists()
-    manifest = json.loads(Path(observed["manifest_path"]).read_text())
+    # references are stored workspace-relative so a moved/restored
+    # workspace can still reconstruct past inputs
+    assert observed["manifest_path"] and not Path(observed["manifest_path"]).is_absolute()
+    manifest_file = orchestrator.artifacts.resolve(observed["manifest_path"])
+    assert manifest_file.exists()
+    manifest = json.loads(manifest_file.read_text())
     assert manifest["role"] == "planner"
     assert manifest["sections"]["project_context"]["sha256"]
     # the system prompt BODY is persisted, not just its hash
     system_section = manifest["sections"]["system_prompt"]
-    assert Path(system_section["artifact"]).read_text(encoding="utf-8")
+    assert not Path(system_section["artifact"]).is_absolute()
+    assert orchestrator.artifacts.resolve(system_section["artifact"]).read_text(encoding="utf-8")
     spec = json.loads(observed["resolved_spec"])
     assert spec["prompt_sha256"] and spec["profile_hash"]
     assert "prompt" not in spec  # bodies live in the manifest artifacts, not the DB
@@ -108,7 +113,7 @@ async def test_manifest_and_spec_are_durable_before_dispatch(config, monkeypatch
     # integrity check against the artifact compares like with like
     from harness.artifacts.manager import sha256_text
     assert spec["context_manifest_hash"] == sha256_text(
-        Path(observed["manifest_path"]).read_text(encoding="utf-8"))
+        manifest_file.read_text(encoding="utf-8"))
     op = orchestrator.operations.get(observed["dispatch_op"])
     assert op is not None and op["operation_type"] == "AGENT_DISPATCH"
     assert op["status"] == "COMPLETED"  # result recorded after the run
@@ -239,6 +244,56 @@ async def test_cap_exceeded_run_is_recorded_consistently(config, monkeypatch):
     assert orchestrator.db.query_one(
         "SELECT 1 FROM events WHERE event_type = 'AGENT_FAILED'") is not None
     assert orchestrator.projects.get(1)["spent_usd"] == pytest.approx(5.0)
+
+
+async def test_artifact_envelope_carries_input_manifest_hash(config, monkeypatch):
+    """A stored artifact must name the ContextManifest it was produced from,
+    so provenance is verifiable even with the artifact alone."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    tid = orchestrator.tasks.create(pid, "T001", "task")
+    aid = orchestrator.tasks.start_attempt(tid, orchestrator.git.head_commit())
+    runner = ScriptedRunner([ok_result({"task": "T001", "summary": "s"})])
+    install(monkeypatch, runner)
+
+    from harness.agents import analyst
+    artifact_path = orchestrator.artifacts.task_artifact_path("T001", "task-brief.json")
+    await orchestrator.invoker.invoke(
+        analyst.SPEC, pid, orchestrator.project_context(),
+        task_id=tid, attempt_id=aid, artifact_path=artifact_path,
+    )
+
+    envelope = json.loads(artifact_path.read_text())
+    run = orchestrator.db.query_one("SELECT * FROM agent_runs ORDER BY id DESC LIMIT 1")
+    assert envelope["input_manifest_hash"]
+    assert envelope["input_manifest_hash"] == run["context_manifest_hash"]
+
+
+def test_forked_child_cannot_reenter_workspace_lock(tmp_path):
+    """fork() copies the reentrancy registry; the child must not inherit the
+    lock — its acquire has to hit the OS primitive and be refused."""
+    import os
+
+    from harness.workspace_lock import WorkspaceLock, WorkspaceLocked
+
+    if not hasattr(os, "fork"):
+        pytest.skip("fork not available on this platform")
+
+    lock = WorkspaceLock(tmp_path / "harness.lock")
+    lock.acquire()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            WorkspaceLock(tmp_path / "harness.lock").acquire()
+        except WorkspaceLocked:
+            os._exit(42)
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    lock.release()
+    assert os.waitstatus_to_exitcode(status) == 42
 
 
 def test_workspace_lock_blocks_second_process(tmp_path):

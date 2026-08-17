@@ -79,7 +79,7 @@ class ProjectOrchestrator:
             self.tasks, self.events, self.artifacts, self.git, self.checkpoint,
             operations=self.operations, runs=self.runs,
         )
-        self.invariants = InvariantChecker(self.db, self.git)
+        self.invariants = InvariantChecker(self.db, self.git, config.artifacts_path)
         self._replan_for_new_goal = False
 
     # ------------------------------------------------------------------

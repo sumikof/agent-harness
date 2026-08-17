@@ -158,3 +158,13 @@ class ArtifactManager:
             return str(path.relative_to(self.root))
         except ValueError:
             return str(path)
+
+    def resolve(self, stored_path: str | Path) -> Path:
+        """Resolve a stored artifact reference against the current root.
+
+        References are stored workspace-relative so a moved or restored
+        workspace keeps working; absolute paths (legacy records) pass
+        through unchanged.
+        """
+        path = Path(stored_path)
+        return path if path.is_absolute() else self.root / path

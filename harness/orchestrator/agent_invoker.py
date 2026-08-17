@@ -197,6 +197,7 @@ class AgentInvoker:
                     attempt_no = None
                     if attempt_ctx is not None:
                         attempt_no = attempt_ctx.attempt_no
+                    run_row = self.runs.get(run_id) if run_id is not None else None
                     self.artifacts.save_enveloped(
                         artifact_path,
                         model_obj,
@@ -206,6 +207,8 @@ class AgentInvoker:
                         producer_role=spec.role.value,
                         producer_run_id=run_id,
                         base_commit=self.git.head_commit() if self.git else None,
+                        input_manifest_hash=run_row["context_manifest_hash"]
+                        if run_row else None,
                         created_at=utcnow(),
                     )
                 return model_obj
@@ -250,8 +253,10 @@ class AgentInvoker:
         for name, text in all_sections:
             section_path = manifest_dir / f"{name}.md"
             self.artifacts.save_text(section_path, text)
+            # Stored workspace-relative: a moved/restored workspace resolves
+            # them against its current artifacts root (ArtifactManager.resolve).
             refs[name] = ContextRef(
-                artifact=str(section_path), sha256=sha256_text(text)
+                artifact=self.artifacts.relpath(section_path), sha256=sha256_text(text)
             )
         manifest = ContextManifest(
             project_id=project_id,
@@ -333,7 +338,7 @@ class AgentInvoker:
                 max_turns=profile.max_turns,
                 timeout_seconds=profile.timeout_seconds,
                 profile=profile,
-                context_manifest_path=str(manifest_path),
+                context_manifest_path=self.artifacts.relpath(manifest_path),
                 context_manifest_hash=manifest_hash,
                 repeat_guard=RepeatGuardConfig(
                     enabled=self.config.repeat_guard.enabled,
