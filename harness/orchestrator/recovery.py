@@ -229,9 +229,12 @@ class RecoveryManager:
                 acted = True
             acted |= self._close_interrupted_operations(project_id)
 
-        # 6. Project / task state reconciliation.
+        # 6. Project / task state reconciliation. RUNNING run rows are closed
+        # WORKSPACE-WIDE: the workspace lock guarantees no other live
+        # process, and a stale row from any project would block the shared
+        # max-1-agent slot for every project in this DB.
         if self.runs is not None:
-            interrupted_runs = self.runs.interrupt_running(project_id)
+            interrupted_runs = self.runs.interrupt_running()
             if interrupted_runs:
                 logger.warning("recovery: closed %d interrupted agent run(s)", len(interrupted_runs))
                 acted = True

@@ -596,6 +596,52 @@ def test_archive_tar_written_even_when_filtered_patch_is_empty(world):
         assert tar.extractfile("app.env").read() == b"TOKEN=SECRET\n"
 
 
+def test_snapshot_restores_file_to_directory_transition(world):
+    """A session that replaced a tracked file with a same-named directory
+    must be restorable: the HEAD file is cleared before extraction."""
+    (world.git.path / "foo").write_text("plain file\n")
+    world.git.add_all()
+    world.git.commit("add foo as a file")
+    (world.git.path / "foo").unlink()
+    (world.git.path / "foo").mkdir()
+    (world.git.path / "foo" / "x").write_text("now a directory\n")
+
+    snap = world.git.snapshot_worktree_state()
+    world.git.reset_hard("HEAD")
+    assert (world.git.path / "foo").is_file()  # HEAD restored the file form
+
+    world.git.restore_worktree_state(snap)     # must not raise
+
+    assert (world.git.path / "foo").is_dir()
+    assert (world.git.path / "foo" / "x").read_text() == "now a directory\n"
+
+
+def test_state_hash_includes_executable_bit(world):
+    """A mode-only change (chmod +x) is a real state difference: evidence
+    hashes must not treat it as identical to the recorded state."""
+    import stat
+
+    script = world.git.path / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    hash_plain = world.git.dirty_state_hash()
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    assert world.git.dirty_state_hash() != hash_plain
+
+
+def test_recovery_clears_stale_running_runs_of_other_projects(world):
+    """The workspace lock makes every remaining RUNNING row a crash
+    leftover; recovery must free the workspace-wide max-1-agent slot even
+    when the row belongs to another project."""
+    other_pid = world.projects.create("other", "/elsewhere", "main", "g", 10.0)
+    stale_run = world.runs.start_run(other_pid, "planner")
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    assert world.runs.running_runs() == []  # slot freed workspace-wide
+    row = world.runs.get(stale_run)
+    assert row["status"] == "INTERRUPTED"
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

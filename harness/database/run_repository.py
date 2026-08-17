@@ -99,8 +99,14 @@ class RunRepository:
             (project_id,),
         )
 
-    def interrupt_running(self, project_id: int) -> list[int]:
-        """Close RUNNING run rows left behind by a crash. Returns their ids."""
+    def interrupt_running(self, project_id: int | None = None) -> list[int]:
+        """Close RUNNING run rows left behind by a crash. Returns their ids.
+
+        Recovery passes None: the workspace lock guarantees no other live
+        process, so ANY remaining RUNNING row — regardless of project — is a
+        crash leftover, and leaving it would block the workspace-wide
+        max-1-agent slot for every project sharing the DB.
+        """
         rows = self.running_runs(project_id)
         for row in rows:
             self.finish_run(row["id"], "INTERRUPTED", error="interrupted (recovered at startup)")

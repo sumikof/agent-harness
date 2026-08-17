@@ -9,10 +9,11 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import shutil
 import subprocess
 import tarfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 class GitError(Exception):
@@ -200,7 +201,10 @@ class GitRepository:
                 digest.update(b"L")
                 digest.update(os.readlink(full).encode("utf-8", "surrogateescape"))
             elif full.is_file():
-                digest.update(b"F")
+                # Git tracks the executable bit — a mode-only change is a
+                # real state difference and must not hash alike.
+                executable = bool(full.stat().st_mode & 0o100)
+                digest.update(b"X" if executable else b"F")
                 digest.update(full.read_bytes())
             else:
                 digest.update(b"D")  # deleted / missing
@@ -230,6 +234,10 @@ class GitRepository:
         self.reset_hard("HEAD")
         if snapshot.tar_bytes:
             with tarfile.open(fileobj=io.BytesIO(snapshot.tar_bytes)) as tar:
+                # The snapshot may replace a HEAD file with a directory (or
+                # vice versa); clear conflicting HEAD paths before extracting.
+                for member in tar.getmembers():
+                    self._clear_conflicting_paths(member.name)
                 try:
                     tar.extractall(self.path, filter="data")
                 except TypeError:  # Python without the filter parameter
@@ -238,6 +246,18 @@ class GitRepository:
             full = self.path / rel
             if full.is_file() or full.is_symlink():
                 full.unlink()
+
+    def _clear_conflicting_paths(self, rel: str) -> None:
+        """Remove HEAD paths that block extracting `rel` as a file: an
+        ancestor that exists as a file, or the target existing as a dir."""
+        parts = PurePosixPath(rel).parts
+        for depth in range(1, len(parts)):
+            ancestor = self.path.joinpath(*parts[:depth])
+            if ancestor.is_symlink() or ancestor.is_file():
+                ancestor.unlink()
+        target = self.path / rel
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
 
     def snapshot_dirty(self) -> str:
         """Binary-safe patch of everything uncommitted (incl. untracked).
