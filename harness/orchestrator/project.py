@@ -186,6 +186,16 @@ class ProjectOrchestrator:
     # ------------------------------------------------------------------
 
     async def run(self) -> ProjectState:
+        # One ACTIVE project loop per workspace, in-process included: a
+        # concurrent second loop's recovery would reclaim this loop's live
+        # agent run. Raises WorkspaceLocked instead.
+        self.lock.begin_run()
+        try:
+            return await self._run_locked()
+        finally:
+            self.lock.end_run()
+
+    async def _run_locked(self) -> ProjectState:
         project = self.ensure_project()
         project_id = project["id"]
         try:

@@ -642,6 +642,21 @@ def test_recovery_clears_stale_running_runs_of_other_projects(world):
     assert row["status"] == "INTERRUPTED"
 
 
+def test_state_hash_distinguishes_special_nodes_from_deletion(world):
+    """A FIFO/socket at a tracked path is a different state than the file
+    being deleted — stale evidence must not get a user's node reset away."""
+    import os
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo not available on this platform")
+    target = world.git.path / "hello.txt"
+    target.unlink()
+    hash_deleted = world.git.dirty_state_hash()
+    os.mkfifo(target)
+    hash_fifo = world.git.dirty_state_hash()
+    assert hash_deleted != hash_fifo
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

@@ -10,6 +10,7 @@ import hashlib
 import io
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 from dataclasses import dataclass, field
@@ -207,7 +208,16 @@ class GitRepository:
                 digest.update(b"X" if executable else b"F")
                 digest.update(full.read_bytes())
             else:
-                digest.update(b"D")  # deleted / missing
+                try:
+                    node = os.lstat(full)
+                except (FileNotFoundError, NotADirectoryError):
+                    digest.update(b"D")  # genuinely deleted / missing
+                else:
+                    # A special node (FIFO, socket, device) at the path is a
+                    # different state than a deletion — never hash alike, or
+                    # stale evidence could get a user's node reset away.
+                    digest.update(b"N")
+                    digest.update(stat.S_IFMT(node.st_mode).to_bytes(4, "little"))
             digest.update(b"\0")
         return digest.hexdigest()
 

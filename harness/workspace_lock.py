@@ -34,12 +34,24 @@ except ImportError:  # non-Windows platform
 # design: the lock's scope IS the process.
 _HELD: dict[str, int] = {}
 
+# Workspaces with a project loop currently RUNNING in this process. The OS
+# lock is process-reentrant (sequential orchestrators over one workspace are
+# legitimate), but two CONCURRENT run loops are not — the second one's
+# startup recovery would reclaim the first one's live agent run.
+_ACTIVE_RUNS: set[str] = set()
+
+
+def _clear_fork_state() -> None:
+    _HELD.clear()
+    _ACTIVE_RUNS.clear()
+
+
 # A fork()ed child inherits _HELD, which would let it "re-enter" a lock it
 # never acquired. Clearing the registry in the child forces a real acquire
 # attempt there — which fails, because the inherited (still open) parent
 # file description keeps holding the OS lock.
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_HELD.clear)
+    os.register_at_fork(after_in_child=_clear_fork_state)
 
 
 class WorkspaceLocked(Exception):
@@ -104,3 +116,24 @@ class WorkspaceLock:
         if fd is not None:
             _unlock_fd(fd)
             os.close(fd)
+
+    # -- in-process run exclusivity ------------------------------------
+
+    def begin_run(self) -> None:
+        """Claim the single active project loop for this workspace.
+
+        The OS lock is reentrant within the process; this is not: a second
+        CONCURRENT run loop would recover — and thereby destroy — the first
+        one's live agent run. Sequential loops (end_run then begin_run)
+        remain allowed.
+        """
+        key = str(self.path.resolve())
+        if key in _ACTIVE_RUNS:
+            raise WorkspaceLocked(
+                f"another project loop is already running on {self.path} in this "
+                "process; wait for it to finish before starting another."
+            )
+        _ACTIVE_RUNS.add(key)
+
+    def end_run(self) -> None:
+        _ACTIVE_RUNS.discard(str(self.path.resolve()))

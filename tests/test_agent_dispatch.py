@@ -296,6 +296,26 @@ def test_forked_child_cannot_reenter_workspace_lock(tmp_path):
     assert os.waitstatus_to_exitcode(status) == 42
 
 
+async def test_concurrent_same_process_run_loops_are_rejected(config, monkeypatch):
+    """Two overlapping project loops in ONE process must not both run: the
+    second one's recovery would reclaim the first one's live agent run."""
+    from harness.workspace_lock import WorkspaceLocked
+
+    first = ProjectOrchestrator(config)
+    first.lock.begin_run()  # as if first.run() were still in flight
+    try:
+        second = ProjectOrchestrator(config)
+        with pytest.raises(WorkspaceLocked):
+            await second.run()
+    finally:
+        first.lock.end_run()
+
+    # once the first loop finished, a sequential loop is allowed again
+    third = ProjectOrchestrator(config)
+    third.lock.begin_run()  # no longer rejected
+    third.lock.end_run()
+
+
 def test_workspace_lock_blocks_second_process(tmp_path):
     """A second harness process on the same workspace must refuse to start —
     otherwise its recovery would 'reclaim' the first process's live run."""
