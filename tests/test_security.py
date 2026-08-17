@@ -51,6 +51,24 @@ class TestCommandPolicy:
         assert check_command("git branch").allowed
         assert check_command("git branch --list").allowed
 
+    def test_branch_copy_forbidden(self):
+        assert not check_command("git branch -c main copy").allowed
+        assert not check_command("git branch -C main copy").allowed
+        assert not check_command("git branch --copy main copy").allowed
+
+    def test_shell_escaping_does_not_bypass(self):
+        # the shell resolves these to plain `git commit` etc. before executing
+        for cmd in [
+            r"g\it commit -m x",
+            r"git co\mmit -m x",
+            "'git' commit -m x",
+            '"git" "push" origin main',
+            r"g\it -C . push origin main",
+        ]:
+            assert not check_command(cmd).allowed, cmd
+        # unparseable quoting fails closed
+        assert not check_command("git 'unclosed quote").allowed
+
     def test_dangerous_commands_forbidden(self):
         for cmd in [
             "sudo apt install x",
@@ -96,6 +114,8 @@ class TestWriteHints:
             "pytest 2> src/main.py",
             "make 2>> build-errors.log",
             "cmd &> capture.txt",
+            "pytest >& src/main.py",
+            r"s\ed -i 's/a/b/' src/x.py",
         ]:
             assert find_write_hint(cmd) is not None, cmd
 
@@ -111,6 +131,8 @@ class TestWriteHints:
             "make 2> /dev/null",
             "cmd &> /dev/null",
             "grep -- '->' src/x.py",
+            "cmd >& /dev/null",
+            "cmd >&2",
         ]:
             assert find_write_hint(cmd) is None, cmd
 

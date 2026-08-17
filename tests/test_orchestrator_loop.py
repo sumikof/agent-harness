@@ -148,6 +148,12 @@ async def test_repeated_repair_escalates_to_diagnostician(config, monkeypatch):
     assert task["status"] == "BLOCKED"          # diagnostician said BLOCKED
     assert state == ProjectState.BLOCKED        # project can't finish with blocked work
     assert not orchestrator.git.is_dirty()      # failed work was discarded
+    # diagnostician runs are attached to an attempt so they count toward
+    # max_agent_runs_per_task (Codex P2)
+    diag_run = orchestrator.db.query_one(
+        "SELECT attempt_id FROM agent_runs WHERE role = 'diagnostician'"
+    )
+    assert diag_run is not None and diag_run["attempt_id"] is not None
 
 
 async def test_analyst_failure_counts_toward_retry_limit(config, monkeypatch):

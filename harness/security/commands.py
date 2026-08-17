@@ -8,6 +8,7 @@ tries to run, before execution (PreToolUse hook).
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 # Patterns are matched against the whole command string (case-insensitive,
@@ -25,7 +26,7 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
         "git lifecycle commands are reserved for the harness",
     ),
     (
-        r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[dDfmM]\b|--delete|--force|--move)",
+        r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[dDfmMcC]\b|--delete|--force|--move|--copy)",
         "branch mutation is forbidden",
     ),
     # Destructive / privileged operations
@@ -59,11 +60,26 @@ class CommandDecision:
     reason: str = ""
 
 
+def _canonicalize(command: str) -> str | None:
+    """Resolve shell quoting/escaping so bans match the words the shell would
+    actually execute (`g\\it commit` -> `git commit`, `'git' commit` -> `git
+    commit`). Returns None when the command cannot be parsed."""
+    try:
+        return " ".join(shlex.split(command, posix=True))
+    except ValueError:
+        return None
+
+
 def check_command(command: str) -> CommandDecision:
     normalized = " ".join(command.split())
-    for regex, reason in _COMPILED:
-        if regex.search(normalized):
-            return CommandDecision(False, reason)
+    canonical = _canonicalize(normalized)
+    if canonical is None:
+        # Unparseable quoting is suspicious in itself; fail closed.
+        return CommandDecision(False, "command has unparseable shell quoting")
+    for candidate in {normalized, canonical}:
+        for regex, reason in _COMPILED:
+            if regex.search(candidate):
+                return CommandDecision(False, reason)
     return CommandDecision(True)
 
 
@@ -78,6 +94,9 @@ _WRITE_HINTS: list[tuple[re.Pattern, str]] = [
     # and fd duplication (`2>&1`). The lookbehind avoids `->` / `<>` noise.
     (re.compile(r"(?<![<>-])\d*>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
     (re.compile(r"&>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
+    # `>& word` is bash's alternate combined stdout/stderr redirect; only
+    # descriptor duplication (`>&1`, `2>&1`) and /dev/null are exempt.
+    (re.compile(r">&\s*(?!\d)(?!/dev/null\b)\S"), "shell redirection writes a file"),
     (re.compile(r"\btee\b"), "tee writes files"),
     (re.compile(r"\bsed\b[^|;&]*\s-i\b"), "sed -i edits files in place"),
     (re.compile(r"\b(perl|python[0-9.]*|ruby)\b[^|;&]*\s-i\b"), "in-place edit flag"),
@@ -93,7 +112,11 @@ _WRITE_HINTS: list[tuple[re.Pattern, str]] = [
 def find_write_hint(command: str) -> str | None:
     """Return a reason string if the command looks write-capable, else None."""
     normalized = " ".join(command.split())
-    for regex, reason in _WRITE_HINTS:
-        if regex.search(normalized):
-            return reason
+    canonical = _canonicalize(normalized)
+    if canonical is None:
+        return "command has unparseable shell quoting"
+    for candidate in {normalized, canonical}:
+        for regex, reason in _WRITE_HINTS:
+            if regex.search(candidate):
+                return reason
     return None

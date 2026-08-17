@@ -170,7 +170,8 @@ class TaskRunner:
 
             diagnosis_rounds += 1
             outcome = await self._diagnose(
-                project_id, task_id, task_key, project_ctx, task_ctx, feedback, diagnosis_rounds
+                project_id, task_id, task_key, attempt_id,
+                project_ctx, task_ctx, feedback, diagnosis_rounds,
             )
             if outcome is not None:
                 return outcome
@@ -271,6 +272,7 @@ class TaskRunner:
         project_id: int,
         task_id: int,
         task_key: str,
+        attempt_id: int,
         project_ctx: ProjectContext,
         task_ctx: TaskContext,
         feedback: AttemptContext,
@@ -290,6 +292,8 @@ class TaskRunner:
 
         attempt_no = self.tasks.get(task_id)["attempt_count"]
         try:
+            # attempt_id ties the diagnostician's runs to the task so they
+            # count toward max_agent_runs_per_task like every other run.
             diagnosis: Diagnosis = await self.invoker.invoke(
                 diagnostician.SPEC,
                 project_id,
@@ -297,6 +301,7 @@ class TaskRunner:
                 task_ctx=task_ctx,
                 attempt_ctx=feedback,
                 task_id=task_id,
+                attempt_id=attempt_id,
                 artifact_path=self.artifacts.diagnostics_path(task_key, attempt_no),
             )
         except (AgentRunFailed, BudgetExceeded) as exc:
