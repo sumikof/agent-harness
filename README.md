@@ -121,7 +121,9 @@ Harnessプロセスは途中終了を前提とする。起動時は次の順で�
 
 RUNNINGのAttemptで説明できないdirty treeはユーザの作業とみなし、破壊せず起動を拒否する。
 
-**Recoveryのreset原則**: recoveryが `reset --hard` してよいのは、「そのdiffの正確なsha256をdurableに記録済みの状態」だけである。副作用系Operation(dispatch / verification / commit)はintent作成時にbase diff hashを、検証はコマンド完了毎に更新hashを、recovery自身はreset直前にsettlement hashを記録し、現在のdiffがいずれかと一致する場合のみresetする。
+**Recoveryのreset原則**: RUNNING Attemptが存在しない場合、recoveryが `reset --hard` してよいのは「そのdiffの正確なsha256をdurableに記録済みの状態」だけである。副作用系Operation(dispatch / verification / commit)はintent作成時にbase diff hashを、検証はコマンド完了毎に更新hashを、recovery自身はreset直前にsettlement hashを記録し、現在のdiffがいずれかと一致する場合のみresetする。
+
+**明示的な例外 — RUNNING Attempt**: RUNNING Attemptが存在する場合のrecoveryは、hash照合なしで「diff全量アーカイブ → reset」を行う(v1からの中核Episode中断戦略)。RUNNING Episodeの実行中・中断中のworktreeはHarness所有であり、その間の人手編集は運用契約外となる。該当diffは破壊されず必ず `artifacts/diagnostics/` へ退避される。
 
 既知の受容制限: 「副作用がtreeを変更した直後〜そのhash永続化前」のcrash windowは、記録が副作用の後にしか行えない以上、原理的に閉じられない。このwindowに落ちた場合(かつRUNNING Attemptが無い場合)の帰結はデータ破壊ではなく**fail-safeな起動拒否**であり、operatorがtreeを確認・清掃してから再実行する。
 
