@@ -476,16 +476,13 @@ class TaskRunner:
     def _archive_and_discard(self, task_key: str, label: str) -> None:
         """Save the current dirty diff as an artifact, then reset the tree.
 
-        Archived as a binary-safe, re-applicable patch — the archive is the
-        only copy once the tree is reset.
+        Archived as a byte-exact, re-applicable patch — the archive is the
+        only copy once the tree is reset, so a failed archive aborts the
+        reset instead of proceeding without one.
         """
-        try:
-            diff = self.git.snapshot_dirty()
-        except Exception as exc:
-            logger.warning("could not capture archive diff: %s", exc)
-            diff = self._safe_diff()
+        diff = self.git.snapshot_dirty_bytes()
         if diff.strip():
-            self.artifacts.save_text(
+            self.artifacts.save_bytes(
                 self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff", diff
             )
         self.checkpoint.discard_working_tree()

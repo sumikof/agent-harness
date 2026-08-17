@@ -136,14 +136,42 @@ class GitRepository:
         — their output is presentation-only and NOT re-applicable, which
         would silently corrupt the archive.
         """
+        return self.snapshot_dirty_bytes().decode("utf-8", errors="replace")
+
+    def snapshot_dirty_bytes(self) -> bytes:
+        """snapshot_dirty() as raw bytes.
+
+        Diff content is arbitrary bytes (files need not be UTF-8); the
+        recovery archive must preserve them exactly, so patches are
+        captured, stored, and re-applied without any text decoding.
+        """
         self._run("add", "-A", "-N", check=False)  # intent-to-add so untracked shows
         args = ["diff", "--binary", "--no-color", "--no-textconv", "--no-ext-diff"]
         if self.head_commit():
             args.append("HEAD")
-        return self._run(*args).stdout
+        result = subprocess.run(
+            ["git", *args], cwd=str(self.path), capture_output=True
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git {' '.join(args)} failed: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        return result.stdout
 
     def apply_patch(self, patch: str) -> None:
-        self._run("apply", "--whitespace=nowarn", input_text=patch)
+        self.apply_patch_bytes(patch.encode("utf-8"))
+
+    def apply_patch_bytes(self, patch: bytes) -> None:
+        result = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            cwd=str(self.path), capture_output=True, input=patch,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                "git apply failed: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
 
     def changed_files(self) -> list[str]:
         out = self._run("status", "--porcelain").stdout

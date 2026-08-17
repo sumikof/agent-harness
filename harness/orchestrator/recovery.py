@@ -380,13 +380,16 @@ class RecoveryManager:
         if not (self.git.is_repo() and self.git.is_dirty()):
             return
         try:
-            # Binary-safe patch: the archive must be re-applicable, so new
-            # or changed binary files survive the reset as real content,
-            # not a "Binary files differ" notice.
-            diff = self.git.snapshot_dirty()
+            # Byte-exact, binary-safe, re-applicable patch: the archive is
+            # the only copy once the tree is reset, so nothing may be lost
+            # to text decoding or diff rendering.
+            diff = self.git.snapshot_dirty_bytes()
         except Exception as exc:
-            logger.warning("recovery: could not capture dirty diff: %s", exc)
-            return
+            # Without a verified archive there is nothing safe to reset —
+            # abort recovery loudly instead of destroying unarchived work.
+            raise RecoveryIntegrityError(
+                f"could not archive the dirty worktree before reset: {exc}"
+            )
         if diff.strip():
             path = self.artifacts.root / "diagnostics" / "interrupted-worktree.diff"
             # Keep prior archives; suffix with the event id ordering via count
@@ -394,5 +397,5 @@ class RecoveryManager:
             while path.exists():
                 index += 1
                 path = self.artifacts.root / "diagnostics" / f"interrupted-worktree-{index}.diff"
-            self.artifacts.save_text(path, diff)
+            self.artifacts.save_bytes(path, diff)
             logger.info("recovery: archived interrupted diff to %s", path)

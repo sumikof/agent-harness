@@ -494,6 +494,24 @@ def test_snapshot_ignores_textconv_and_external_diff(world):
     assert (world.git.path / "asset.bin").read_bytes() == binary_content
 
 
+def test_archived_diff_preserves_non_utf8_text(world):
+    """Files git treats as text but that are not UTF-8 (e.g. Latin-1) must
+    survive archive → reset → re-apply byte-exactly, not crash decoding."""
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    world.tasks.start_attempt(tid, world.git.head_commit())
+    latin1_content = "café résumé\n".encode("latin-1")
+    (world.git.path / "notes.txt").write_bytes(latin1_content)
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    assert not (world.git.path / "notes.txt").exists()  # tree was reset
+    diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(diffs) == 1
+    world.git.apply_patch_bytes(diffs[0].read_bytes())
+    assert (world.git.path / "notes.txt").read_bytes() == latin1_content
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

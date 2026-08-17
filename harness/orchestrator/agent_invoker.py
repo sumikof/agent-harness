@@ -307,10 +307,10 @@ class AgentInvoker:
         # (e.g. the Tester starts on top of the Developer's uncommitted
         # work) so a transient retry restores THIS state — never bare HEAD,
         # which would erase the previous role's finished changes.
-        pre_dispatch_snapshot: Optional[str] = None
+        pre_dispatch_snapshot: Optional[bytes] = None
         if spec.mutates_repo and self.git is not None and self.git.head_commit() is not None:
             try:
-                pre_dispatch_snapshot = self.git.snapshot_dirty()
+                pre_dispatch_snapshot = self.git.snapshot_dirty_bytes()
             except Exception as exc:
                 logger.warning("could not snapshot worktree before dispatch: %s", exc)
         for attempt in range(TECHNICAL_RETRIES + 1):
@@ -534,7 +534,7 @@ class AgentInvoker:
         return result, run_id
 
     def _restore_worktree_for_retry(
-        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[str]
+        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[bytes]
     ) -> None:
         """Bring the worktree back to its session-start state (snapshot),
         which may legitimately be dirty — e.g. the Tester runs on top of the
@@ -546,18 +546,18 @@ class AgentInvoker:
                 return
             if snapshot is None:
                 raise RuntimeError("no pre-dispatch worktree snapshot available")
-            # Binary-safe: the archive is the only copy of the partial work
+            # Byte-exact: the archive is the only copy of the partial work
             # once the tree is restored below.
-            diff = self.git.snapshot_dirty()
+            diff = self.git.snapshot_dirty_bytes()
             if diff.strip() and diff != snapshot:
-                self.artifacts.save_text(
+                self.artifacts.save_bytes(
                     self.artifacts.root / "diagnostics"
                     / f"{spec.role.value}-run{run_id}-transient-retry.diff",
                     diff,
                 )
             self.git.reset_hard("HEAD")
             if snapshot.strip():
-                self.git.apply_patch(snapshot)
+                self.git.apply_patch_bytes(snapshot)
         except Exception as exc:
             # Without a known base state a blind redispatch is worse than
             # failing the attempt — surface instead of retrying.

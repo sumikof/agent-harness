@@ -153,6 +153,12 @@ class ArtifactManager:
         path.write_text(text, encoding="utf-8")
         return path
 
+    def save_bytes(self, path: Path, data: bytes) -> Path:
+        """For content that is not guaranteed UTF-8 (e.g. recovery patches)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
     def relpath(self, path: Path) -> str:
         try:
             return str(path.relative_to(self.root))
