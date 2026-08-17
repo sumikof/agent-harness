@@ -454,6 +454,27 @@ def test_unborn_repo_readonly_diff_handles_untracked_directories(tmp_path):
     assert set(git.untracked_paths()) == {"pkg/"}  # back to untracked
 
 
+def test_archived_diff_preserves_binary_content(world):
+    """The archived diff is the only copy once the tree is reset — binary
+    files must survive as a re-applicable patch, not a 'Binary files
+    differ' notice."""
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    world.tasks.start_attempt(tid, world.git.head_commit())
+    binary_content = bytes(range(256))
+    (world.git.path / "asset.bin").write_bytes(binary_content)
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    assert not (world.git.path / "asset.bin").exists()  # tree was reset
+    diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(diffs) == 1
+    patch = diffs[0].read_text()
+    assert "GIT binary patch" in patch          # real content, not a notice
+    world.git.apply_patch(patch)                # and it round-trips
+    assert (world.git.path / "asset.bin").read_bytes() == binary_content
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

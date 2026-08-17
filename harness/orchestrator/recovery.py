@@ -380,7 +380,10 @@ class RecoveryManager:
         if not (self.git.is_repo() and self.git.is_dirty()):
             return
         try:
-            diff = self.git.full_dirty_diff()
+            # Binary-safe patch: the archive must be re-applicable, so new
+            # or changed binary files survive the reset as real content,
+            # not a "Binary files differ" notice.
+            diff = self.git.snapshot_dirty()
         except Exception as exc:
             logger.warning("recovery: could not capture dirty diff: %s", exc)
             return

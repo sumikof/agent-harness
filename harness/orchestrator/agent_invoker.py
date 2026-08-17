@@ -546,7 +546,9 @@ class AgentInvoker:
                 return
             if snapshot is None:
                 raise RuntimeError("no pre-dispatch worktree snapshot available")
-            diff = self.git.full_dirty_diff()
+            # Binary-safe: the archive is the only copy of the partial work
+            # once the tree is restored below.
+            diff = self.git.snapshot_dirty()
             if diff.strip() and diff != snapshot:
                 self.artifacts.save_text(
                     self.artifacts.root / "diagnostics"
