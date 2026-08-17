@@ -481,13 +481,15 @@ class TaskRunner:
         reset instead of proceeding without one.
         """
         diff = self.git.snapshot_dirty_bytes()
+        archive_path = self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff"
         if diff.strip():
-            archive_path = self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff"
             self.artifacts.save_bytes(archive_path, diff)
-            self.artifacts.archive_worktree_files(
-                archive_path.with_suffix(".files.tar"), self.git.path,
-                self.git.changed_paths(),
-            )
+        # Real-file tar regardless of the patch: a clean filter can render
+        # the diff empty while the on-disk bytes still differ.
+        self.artifacts.archive_worktree_files(
+            archive_path.with_suffix(".files.tar"), self.git.path,
+            self.git.changed_paths(),
+        )
         self.checkpoint.discard_working_tree()
 
     def _finish_running_attempts(
@@ -506,14 +508,11 @@ class TaskRunner:
             return ""
 
     def _diff_hash(self) -> str:
-        import hashlib
-
         try:
-            diff = self.git.dirty_diff_readonly_bytes()
+            return self.git.dirty_state_hash()
         except Exception as exc:
-            logger.warning("could not hash diff: %s", exc)
+            logger.warning("could not hash dirty state: %s", exc)
             return ""
-        return hashlib.sha256(diff).hexdigest()
 
     def _bounded_diff(self, spill_name: str, limit: int | None = None) -> str:
         """The current dirty diff, spilled to an artifact when oversized.

@@ -57,7 +57,7 @@ from ..database.operation_repository import (
     OperationType,
 )
 from ..database.run_repository import RunRepository
-from ..git.repository import GitRepository
+from ..git.repository import GitRepository, WorktreeSnapshot
 from ..security.permissions import TEST_WRITE_GLOBS, allowed_tools_for
 from .budget import BudgetManager
 from .state_machine import Role
@@ -306,11 +306,13 @@ class AgentInvoker:
         # For mutating roles, freeze the worktree state at session start
         # (e.g. the Tester starts on top of the Developer's uncommitted
         # work) so a transient retry restores THIS state — never bare HEAD,
-        # which would erase the previous role's finished changes.
-        pre_dispatch_snapshot: Optional[bytes] = None
+        # which would erase the previous role's finished changes. Captured
+        # from the actual on-disk bytes (tar + deletions), so git clean
+        # filters cannot distort what gets restored.
+        pre_dispatch_snapshot: Optional[WorktreeSnapshot] = None
         if spec.mutates_repo and self.git is not None and self.git.head_commit() is not None:
             try:
-                pre_dispatch_snapshot = self.git.snapshot_dirty_bytes()
+                pre_dispatch_snapshot = self.git.snapshot_worktree_state()
             except Exception as exc:
                 logger.warning("could not snapshot worktree before dispatch: %s", exc)
         for attempt in range(TECHNICAL_RETRIES + 1):
@@ -387,11 +389,9 @@ class AgentInvoker:
                     base_diff_hash = None
                     if spec.mutates_repo and self.git is not None:
                         try:
-                            import hashlib
-                            base_diff_hash = hashlib.sha256(
-                                self.git.dirty_diff_readonly_bytes()).hexdigest()
+                            base_diff_hash = self.git.dirty_state_hash()
                         except Exception as exc:
-                            logger.warning("could not hash pre-dispatch diff: %s", exc)
+                            logger.warning("could not hash pre-dispatch state: %s", exc)
                     dispatch_op_id = self.operations.record_intent(
                         OperationType.AGENT_DISPATCH,
                         {
@@ -536,11 +536,13 @@ class AgentInvoker:
         return result, run_id
 
     def _restore_worktree_for_retry(
-        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[bytes]
+        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[WorktreeSnapshot]
     ) -> None:
         """Bring the worktree back to its session-start state (snapshot),
         which may legitimately be dirty — e.g. the Tester runs on top of the
-        Developer's uncommitted implementation."""
+        Developer's uncommitted implementation. Byte-exact both ways: the
+        partial work is archived (patch + real-file tar) and the start state
+        restored from real-file bytes, immune to git clean filters."""
         if not spec.mutates_repo or self.git is None:
             return
         try:
@@ -548,18 +550,19 @@ class AgentInvoker:
                 return
             if snapshot is None:
                 raise RuntimeError("no pre-dispatch worktree snapshot available")
-            # Byte-exact: the archive is the only copy of the partial work
-            # once the tree is restored below.
-            diff = self.git.snapshot_dirty_bytes()
-            if diff.strip() and diff != snapshot:
-                self.artifacts.save_bytes(
+            if self.git.dirty_state_hash() != snapshot.state_hash:
+                archive_path = (
                     self.artifacts.root / "diagnostics"
-                    / f"{spec.role.value}-run{run_id}-transient-retry.diff",
-                    diff,
+                    / f"{spec.role.value}-run{run_id}-transient-retry.diff"
                 )
-            self.git.reset_hard("HEAD")
-            if snapshot.strip():
-                self.git.apply_patch_bytes(snapshot)
+                diff = self.git.snapshot_dirty_bytes()
+                if diff.strip():
+                    self.artifacts.save_bytes(archive_path, diff)
+                self.artifacts.archive_worktree_files(
+                    archive_path.with_suffix(".files.tar"), self.git.path,
+                    self.git.changed_paths(),
+                )
+            self.git.restore_worktree_state(snapshot)
         except Exception as exc:
             # Without a known base state a blind redispatch is worse than
             # failing the attempt — surface instead of retrying.

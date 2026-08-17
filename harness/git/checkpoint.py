@@ -14,8 +14,6 @@ and reconciles the DB instead of committing twice.
 
 from __future__ import annotations
 
-import hashlib
-
 from ..database.operation_repository import OperationRepository, OperationType
 from .repository import GitRepository
 
@@ -63,9 +61,9 @@ class CheckpointManager:
             return self.repo.commit(message)
 
         base_head = self.repo.head_commit()
-        # Same byte basis as recovery's evidence hashing (filter-free,
-        # binary-safe), so reconciliation compares like with like.
-        diff_hash = hashlib.sha256(self.repo.snapshot_dirty_bytes()).hexdigest()
+        # Same basis as recovery's evidence hashing (actual on-disk bytes),
+        # so reconciliation compares like with like.
+        diff_hash = self.repo.dirty_state_hash()
         operation_id = self.operations.record_intent(
             OperationType.GIT_COMMIT,
             {

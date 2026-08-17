@@ -543,6 +543,39 @@ async def test_tester_retry_restores_developers_uncommitted_work(config, monkeyp
     assert not (repo_path / "tests" / "half.py").exists()    # tester's partial edit undone
 
 
+async def test_tester_retry_restores_pre_clean_filter_bytes(config, monkeypatch):
+    """The retry restore is taken from real file bytes: a clean filter must
+    not rewrite the Developer's uncommitted content across a retry."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    repo_path = config.repository_path
+    (repo_path / ".gitattributes").write_text("*.env filter=redact\n")
+    orchestrator.git._run("config", "filter.redact.clean", "sed s/SECRET/REDACTED/")
+    orchestrator.git.add_all()
+    orchestrator.git.commit("configure clean filter")
+    tid = orchestrator.tasks.create(pid, "T001", "task")
+    aid = orchestrator.tasks.start_attempt(tid, orchestrator.git.head_commit())
+    (repo_path / "app.env").write_text("TOKEN=SECRET\n")  # developer's work
+
+    class FlakyTester(ScriptedRunner):
+        async def run(self, spec):
+            if len(self.specs) == 0:
+                self.specs.append(spec)
+                return AgentResult(status="FAILED", error="connection timeout",
+                                   failure_kind=FailureKind.TRANSIENT)
+            self.specs.append(spec)
+            return ok_result({"task": "T001", "summary": "s"})
+
+    install(monkeypatch, FlakyTester([]))
+    from harness.agents import tester
+    await orchestrator.invoker.invoke(
+        tester.SPEC, pid, orchestrator.project_context(), task_id=tid, attempt_id=aid,
+    )
+
+    assert (repo_path / "app.env").read_text() == "TOKEN=SECRET\n"  # not REDACTED
+
+
 async def test_final_verification_is_journaled(config, monkeypatch):
     """The project-level final verification records a VERIFICATION_COMMAND
     intent/result like every other verification, so a crash mid-run is

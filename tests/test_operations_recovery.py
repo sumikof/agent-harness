@@ -196,9 +196,7 @@ def test_reconciliation_is_atomic(world, monkeypatch):
 
 
 def diff_hash(world) -> str:
-    import hashlib
-
-    return hashlib.sha256(world.git.dirty_diff_readonly_bytes()).hexdigest()
+    return world.git.dirty_state_hash()
 
 
 def test_dirty_tree_matching_verification_intent_is_recovered(world):
@@ -299,15 +297,13 @@ def test_unexecuted_commit_intent_survives_crashed_recovery(world):
     """Double-crash: commit intent journaled but never executed, a first
     recovery closed the attempt then died mid-reset. The still-PENDING
     intent must explain the dirty tree on the next startup."""
-    import hashlib
-
     tid = world.tasks.create(world.pid, "T001", "task")
     aid = world.tasks.start_attempt(tid, world.git.head_commit())
     (world.git.path / "feature.txt").write_text("passed but uncommitted work\n")
-    diff_hash = hashlib.sha256(world.git.full_dirty_diff().encode("utf-8")).hexdigest()
     op_id = world.operations.record_intent(
         OperationType.GIT_COMMIT,
-        {"task_key": "T001", "task_id": tid, "attempt_id": aid, "diff_sha256": diff_hash},
+        {"task_key": "T001", "task_id": tid, "attempt_id": aid,
+         "diff_sha256": diff_hash(world)},
         project_id=world.pid, task_id=tid, attempt_id=aid,
     )
     # first recovery pass closed the attempt, then crashed before the reset
@@ -554,6 +550,50 @@ def test_archive_tar_preserves_pre_clean_filter_bytes(world):
     with tarfile.open(tars[0]) as tar:
         content = tar.extractfile("app.env").read()
     assert content == b"TOKEN=SECRET\n"          # ...but the tar holds ground truth
+
+
+def configure_redact_filter(world):
+    (world.git.path / ".gitattributes").write_text("*.env filter=redact\n")
+    world.git._run("config", "filter.redact.clean", "sed s/SECRET/REDACTED/")
+    world.git.add_all()
+    world.git.commit("configure clean filter")
+
+
+def test_state_hash_sees_through_clean_filters(world):
+    """Two worktrees whose FILTERED diffs coincide must still hash
+    differently when the on-disk bytes differ — otherwise a stale intent
+    could misattribute user edits."""
+    configure_redact_filter(world)
+    (world.git.path / "app.env").write_text("TOKEN=SECRET\n")
+    hash_secret = world.git.dirty_state_hash()
+    (world.git.path / "app.env").write_text("TOKEN=REDACTED\n")
+    hash_redacted = world.git.dirty_state_hash()
+    assert hash_secret != hash_redacted
+
+
+def test_archive_tar_written_even_when_filtered_patch_is_empty(world):
+    """A clean filter can normalize the diff to empty while the on-disk
+    bytes still differ from HEAD; the real files must be tarred anyway."""
+    import tarfile
+
+    configure_redact_filter(world)
+    (world.git.path / "app.env").write_text("TOKEN=REDACTED\n")
+    world.git.add_all()
+    world.git.commit("commit redacted env")
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    world.tasks.start_attempt(tid, world.git.head_commit())
+    # worktree SECRET cleans to REDACTED == index -> patch is empty, tree dirty
+    (world.git.path / "app.env").write_text("TOKEN=SECRET\n")
+    assert world.git.is_dirty()
+    assert not world.git.snapshot_dirty_bytes().strip()
+
+    world.recovery.recover(world.projects.get(world.pid))
+
+    tars = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.files.tar"))
+    assert len(tars) == 1
+    with tarfile.open(tars[0]) as tar:
+        assert tar.extractfile("app.env").read() == b"TOKEN=SECRET\n"
 
 
 def test_readonly_diff_restores_index_for_awkward_paths(world):

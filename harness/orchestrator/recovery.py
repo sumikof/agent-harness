@@ -21,7 +21,6 @@ to destroy: recovery refuses to start instead of resetting it.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -256,11 +255,12 @@ class RecoveryManager:
 
     def _current_diff_hash(self) -> str | None:
         try:
-            diff = self.git.dirty_diff_readonly_bytes()
+            # Fingerprint of the ACTUAL on-disk bytes — git filters cannot
+            # make two different worktree states hash alike.
+            return self.git.dirty_state_hash()
         except Exception as exc:
-            logger.warning("recovery: could not hash dirty diff: %s", exc)
+            logger.warning("recovery: could not hash dirty state: %s", exc)
             return None
-        return hashlib.sha256(diff).hexdigest()
 
     @staticmethod
     def _commit_intent_matches(op: sqlite3.Row, current_diff_hash: str | None) -> bool:
@@ -390,17 +390,18 @@ class RecoveryManager:
             raise RecoveryIntegrityError(
                 f"could not archive the dirty worktree before reset: {exc}"
             )
+        path = self.artifacts.root / "diagnostics" / "interrupted-worktree.diff"
+        # Keep prior archives; suffix with the event id ordering via count
+        index = 0
+        while path.exists() or path.with_suffix(".files.tar").exists():
+            index += 1
+            path = self.artifacts.root / "diagnostics" / f"interrupted-worktree-{index}.diff"
         if diff.strip():
-            path = self.artifacts.root / "diagnostics" / "interrupted-worktree.diff"
-            # Keep prior archives; suffix with the event id ordering via count
-            index = 0
-            while path.exists():
-                index += 1
-                path = self.artifacts.root / "diagnostics" / f"interrupted-worktree-{index}.diff"
             self.artifacts.save_bytes(path, diff)
-            # Ground truth alongside the patch: the real on-disk bytes,
-            # untouched by clean filters (LFS, redaction, ...).
-            self.artifacts.archive_worktree_files(
-                path.with_suffix(".files.tar"), self.git.path, self.git.changed_paths()
-            )
-            logger.info("recovery: archived interrupted diff to %s", path)
+        # Ground truth REGARDLESS of the patch: a clean filter can normalize
+        # the diff to empty while the on-disk bytes still differ, and the
+        # reset below would destroy them.
+        self.artifacts.archive_worktree_files(
+            path.with_suffix(".files.tar"), self.git.path, self.git.changed_paths()
+        )
+        logger.info("recovery: archived interrupted worktree to %s(.files.tar)", path)

@@ -6,12 +6,28 @@ lifecycle commands by the security hooks.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import os
 import subprocess
+import tarfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 class GitError(Exception):
     pass
+
+
+@dataclass
+class WorktreeSnapshot:
+    """Byte-exact capture of every uncommitted change: the actual on-disk
+    files (tarred, untouched by git clean filters) plus the deletions.
+    Restorable via GitRepository.restore_worktree_state()."""
+
+    tar_bytes: bytes
+    deleted: list[str] = field(default_factory=list)
+    state_hash: str = ""
 
 
 class GitRepository:
@@ -134,7 +150,8 @@ class GitRepository:
 
     def changed_paths(self) -> list[str]:
         """Every path with uncommitted changes (untracked included), parsed
-        NUL-safely. Directories may appear as 'dir/' entries."""
+        NUL-safely. Directories may appear as 'dir/' entries; rename/copy
+        entries contribute both sides."""
         out = self._run("status", "--porcelain", "-z").stdout
         fields = out.split("\0")
         paths: list[str] = []
@@ -147,10 +164,80 @@ class GitRepository:
             status = entry[:2]
             paths.append(entry[3:])
             if "R" in status or "C" in status:
-                index += 2  # rename/copy source in the extra field
-            else:
                 index += 1
+                if index < len(fields) and fields[index]:
+                    paths.append(fields[index])  # rename/copy source
+            index += 1
         return paths
+
+    def expanded_changed_files(self) -> list[str]:
+        """changed_paths() with untracked directories expanded to files."""
+        files: set[str] = set()
+        for rel in self.changed_paths():
+            full = self.path / rel
+            if full.is_dir() and not full.is_symlink():
+                for root, _dirs, names in os.walk(full):
+                    for name in names:
+                        files.add(str((Path(root) / name).relative_to(self.path)))
+            else:
+                files.add(rel.rstrip("/"))
+        return sorted(files)
+
+    def dirty_state_hash(self) -> str:
+        """Fingerprint of the ACTUAL uncommitted worktree state.
+
+        Computed from the real on-disk bytes of every changed path (plus
+        deletion markers), never from git diff output — clean filters,
+        textconv, and encodings cannot distort it. This is the single basis
+        for all recovery evidence hashes.
+        """
+        digest = hashlib.sha256()
+        for rel in self.expanded_changed_files():
+            full = self.path / rel
+            digest.update(rel.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            if full.is_symlink():
+                digest.update(b"L")
+                digest.update(os.readlink(full).encode("utf-8", "surrogateescape"))
+            elif full.is_file():
+                digest.update(b"F")
+                digest.update(full.read_bytes())
+            else:
+                digest.update(b"D")  # deleted / missing
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def snapshot_worktree_state(self) -> WorktreeSnapshot:
+        """Byte-exact snapshot of all uncommitted changes (files + deletions),
+        taken from the filesystem directly — no git filters involved."""
+        files = self.expanded_changed_files()
+        deleted: list[str] = []
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            for rel in files:
+                full = self.path / rel
+                if full.is_symlink() or full.is_file():
+                    tar.add(full, arcname=rel, recursive=False)
+                else:
+                    deleted.append(rel)
+        return WorktreeSnapshot(
+            tar_bytes=buffer.getvalue(), deleted=deleted,
+            state_hash=self.dirty_state_hash(),
+        )
+
+    def restore_worktree_state(self, snapshot: WorktreeSnapshot) -> None:
+        """reset to HEAD, then re-apply a snapshot byte-exactly."""
+        self.reset_hard("HEAD")
+        if snapshot.tar_bytes:
+            with tarfile.open(fileobj=io.BytesIO(snapshot.tar_bytes)) as tar:
+                try:
+                    tar.extractall(self.path, filter="data")
+                except TypeError:  # Python without the filter parameter
+                    tar.extractall(self.path)
+        for rel in snapshot.deleted:
+            full = self.path / rel
+            if full.is_file() or full.is_symlink():
+                full.unlink()
 
     def snapshot_dirty(self) -> str:
         """Binary-safe patch of everything uncommitted (incl. untracked).
