@@ -85,6 +85,25 @@ class GitRepository:
             return self._run("diff", "--no-color", "HEAD").stdout
         return self._run("diff", "--no-color").stdout
 
+    def dirty_diff_readonly(self) -> str:
+        """full_dirty_diff() that leaves the index as it found it.
+
+        Read-only inspection (e.g. recovery deciding whether a tree may be
+        reset) must not convert the user's untracked files into
+        intent-to-add entries; the ita entries created for the diff are
+        removed again afterwards.
+        """
+        before = self._run("status", "--porcelain").stdout
+        newly_untracked = [
+            line[3:].split(" -> ")[-1].strip()
+            for line in before.splitlines()
+            if line.startswith("??")
+        ]
+        diff = self.full_dirty_diff()
+        if newly_untracked:
+            self._run("reset", "-q", "--", *newly_untracked, check=False)
+        return diff
+
     def snapshot_dirty(self) -> str:
         """Binary-safe patch of everything uncommitted (incl. untracked).
 

@@ -112,8 +112,14 @@ class RecoveryManager:
         # tree reset; in-flight dispatch/verification intents are only READ
         # here — they stay open until the tree is settled below, so a crash
         # inside recovery itself keeps the evidence for the next startup.
+        dirty = self.git.is_repo() and self.git.is_dirty()
+        # Computed WITHOUT touching the user's index (no intent-to-add
+        # residue) — the tree may turn out to be user work we must not alter.
+        current_diff_hash = self._current_diff_hash() if dirty else None
+
         pending_side_effects = 0
         unexecuted_commit_intents: list[sqlite3.Row] = []
+        side_effect_intents: list[sqlite3.Row] = []
         if self.operations is not None:
             for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
                 commit_hash = self.checkpoint.find_committed_operation(op["operation_id"])
@@ -134,31 +140,39 @@ class RecoveryManager:
             # dispatch (e.g. the Planner, which runs without an attempt)
             # cannot have produced the diff — counting it would let user
             # edits made while stopped be destroyed.
-            pending_side_effects = len(self.operations.unfinished(
+            side_effect_intents = list(self.operations.unfinished(
                 OperationType.VERIFICATION_COMMAND, project_id=project_id))
-            # An unexecuted commit intent is evidence ONLY when the current
-            # dirty diff still hashes to the intent's recorded diff_sha256.
-            # A stale intent (its reset already completed, then the process
-            # died before closing it) must not explain — and destroy — NEW
-            # user edits made while the harness was stopped.
-            pending_side_effects += sum(
-                1 for op in unexecuted_commit_intents
-                if self._commit_intent_matches_worktree(op)
-            )
             for op in self.operations.unfinished(
                     OperationType.AGENT_DISPATCH, project_id=project_id):
                 payload = json.loads(op["payload"] or "{}")
                 if op["attempt_id"] is not None and payload.get("role") in MUTATING_ROLES:
-                    pending_side_effects += 1
+                    side_effect_intents.append(op)
+            # Staleness rules: a commit intent is evidence only when the
+            # current diff hashes to its recorded diff_sha256. A dispatch/
+            # verification intent that already went through a settlement pass
+            # (annotated below with the diff it settled) is evidence only
+            # when the diff is still that one — otherwise the tree holds NEW
+            # user edits made while the harness was stopped, which must be
+            # preserved, not archived and reset.
+            pending_side_effects = sum(
+                1 for op in side_effect_intents
+                if self._intent_is_dirty_evidence(op, current_diff_hash)
+            ) + sum(
+                1 for op in unexecuted_commit_intents
+                if self._commit_intent_matches(op, current_diff_hash)
+            )
 
         # 5. Workspace dirty-state recovery.
         running = self.tasks.running_attempts(project_id)
-        dirty = self.git.is_repo() and self.git.is_dirty()
 
         if running:
             logger.warning(
                 "recovery: %d running attempt(s), working tree dirty=%s", len(running), dirty
             )
+            # Durable BEFORE the reset: a crash after the reset but before
+            # the intents are closed leaves them annotated with the settled
+            # diff, so the next startup can tell them apart from new work.
+            self._annotate_settlement(side_effect_intents, current_diff_hash)
             self._archive_dirty_diff(project_id)
             for attempt in running:
                 self.tasks.finish_attempt(attempt["id"], AttemptState.INTERRUPTED)
@@ -182,6 +196,7 @@ class RecoveryManager:
                 "recovery: dirty tree explained by %d in-flight side-effect "
                 "operation(s); archiving and resetting", pending_side_effects,
             )
+            self._annotate_settlement(side_effect_intents, current_diff_hash)
             self._archive_dirty_diff(project_id)
             self.checkpoint.discard_working_tree()
             acted = True
@@ -232,22 +247,54 @@ class RecoveryManager:
 
     # ------------------------------------------------------------------
 
-    def _commit_intent_matches_worktree(self, op: sqlite3.Row) -> bool:
+    def _current_diff_hash(self) -> str | None:
+        try:
+            diff = self.git.dirty_diff_readonly()
+        except Exception as exc:
+            logger.warning("recovery: could not hash dirty diff: %s", exc)
+            return None
+        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _commit_intent_matches(op: sqlite3.Row, current_diff_hash: str | None) -> bool:
         """True when the current dirty diff is exactly what the commit intent
         was journaled for (payload diff_sha256). Unverifiable intents are
         never accepted as grounds to reset a tree."""
         payload = json.loads(op["payload"] or "{}")
         expected = payload.get("diff_sha256")
-        if not expected:
-            return False
-        if not (self.git.is_repo() and self.git.is_dirty()):
-            return False
-        try:
-            diff = self.git.full_dirty_diff()
-        except Exception as exc:
-            logger.warning("recovery: could not hash dirty diff: %s", exc)
-            return False
-        return hashlib.sha256(diff.encode("utf-8")).hexdigest() == expected
+        return bool(expected) and expected == current_diff_hash
+
+    @staticmethod
+    def _intent_is_dirty_evidence(op: sqlite3.Row, current_diff_hash: str | None) -> bool:
+        """A dispatch/verification intent explains the dirty tree unless a
+        previous settlement pass already reset the diff it stood for.
+
+        Un-annotated intents are genuinely in flight at crash time — the
+        settlement annotation is written durably BEFORE any reset, so an
+        intent can only be un-annotated if no reset happened for it yet.
+        """
+        payload = json.loads(op["payload"] or "{}")
+        annotated = payload.get("settle_diff_sha256")
+        if annotated is None:
+            return True
+        return annotated == current_diff_hash
+
+    def _annotate_settlement(
+        self, ops: list[sqlite3.Row], current_diff_hash: str | None
+    ) -> None:
+        """Durably mark which dirty diff these in-flight intents are being
+        settled against, before the tree is reset."""
+        if current_diff_hash is None:
+            return
+        for op in ops:
+            payload = json.loads(op["payload"] or "{}")
+            if payload.get("settle_diff_sha256") == current_diff_hash:
+                continue
+            payload["settle_diff_sha256"] = current_diff_hash
+            self.operations.db.execute(
+                "UPDATE operations SET payload = ? WHERE operation_id = ?",
+                (json.dumps(payload, ensure_ascii=False), op["operation_id"]),
+            )
 
     def _close_interrupted_operations(self, project_id: int) -> bool:
         """Close in-flight dispatch/verification intents AFTER the worktree

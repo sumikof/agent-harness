@@ -321,6 +321,65 @@ def test_stale_commit_intent_does_not_reset_new_user_edits(world):
     assert (world.git.path / "hello.txt").read_text() == "brand new user edit\n"
 
 
+def test_stale_settled_intent_does_not_reset_new_user_edits(world):
+    """A dispatch/verification intent that a previous recovery already
+    settled (annotated + reset) must not explain NEW user edits made while
+    the process was down before the intent got closed."""
+    from harness.orchestrator.recovery import UnexplainedDirtyWorktree
+
+    tid = world.tasks.create(world.pid, "T001", "task")
+    aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    op_id = world.operations.record_intent(
+        OperationType.AGENT_DISPATCH, {"role": "developer"},
+        project_id=world.pid, task_id=tid, attempt_id=aid,
+    )
+    world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND, {"commands": ["make"], "label": "final"},
+        project_id=world.pid,
+    )
+    (world.git.path / "hello.txt").write_text("agent half-done work\n")
+
+    # first recovery pass: annotates + archives + resets, then "crashes"
+    # before closing the intents
+    original_close = world.recovery._close_interrupted_operations
+
+    def crashing_close(pid):
+        raise RuntimeError("dies before closing intents")
+
+    world.recovery._close_interrupted_operations = crashing_close
+    with pytest.raises(RuntimeError):
+        world.recovery.recover(world.projects.get(world.pid))
+    world.recovery._close_interrupted_operations = original_close
+    assert not world.git.is_dirty()  # first pass did reset the agent diff
+    assert world.operations.get(op_id)["status"] == "PENDING"  # but never closed
+
+    # user edits while the harness is stopped
+    (world.git.path / "hello.txt").write_text("brand new user edit\n")
+
+    with pytest.raises(UnexplainedDirtyWorktree):
+        world.recovery.recover(world.projects.get(world.pid))
+    assert (world.git.path / "hello.txt").read_text() == "brand new user edit\n"
+
+
+def test_evidence_hashing_leaves_user_index_untouched(world):
+    """Deciding that a tree is user work must not leave intent-to-add
+    entries behind for the user's untracked files."""
+    from harness.orchestrator.recovery import UnexplainedDirtyWorktree
+
+    world.operations.record_intent(
+        OperationType.GIT_COMMIT,
+        {"task_key": "T001", "diff_sha256": "0" * 64},  # stale, never matches
+        project_id=world.pid,
+    )
+    (world.git.path / "user-notes.txt").write_text("untracked user file\n")
+
+    with pytest.raises(UnexplainedDirtyWorktree):
+        world.recovery.recover(world.projects.get(world.pid))
+
+    status = world.git._run("status", "--porcelain").stdout
+    assert "?? user-notes.txt" in status  # still untracked, not intent-to-add
+
+
 def test_readonly_dispatch_does_not_explain_user_dirty_tree(world):
     """A pending Planner dispatch (read-only, no attempt) cannot have dirtied
     the tree — user edits made while the harness was stopped must be
