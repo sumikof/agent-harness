@@ -1,0 +1,46 @@
+# Copy to config.yaml and edit.
+
+project:
+  name: sample-project
+  # Path to the repository the agents will work on (relative to workspace_dir or absolute).
+  repository: repository
+  base_branch: main
+  goal: >
+    Describe the overall goal the harness should accomplish.
+
+# Root directory holding harness.db / repository/ / artifacts/ / logs/.
+# The whole directory is portable: copy it to move or back up a project.
+workspace_dir: workspace
+
+provider:
+  # Agent execution engine. "claude" uses the Claude Agent SDK adapter.
+  type: claude
+  model: claude-sonnet-5
+  # Optional per-role overrides (provider type and/or model per role).
+  roles:
+    planner:
+      model: claude-opus-5
+    reviewer:
+      model: claude-opus-5
+
+verification:
+  # Preset command sets: java | python | node | none
+  language: python
+  # Explicit commands override the preset. Success == every exit code 0.
+  commands: []
+  #  - "pytest -q"
+  timeout_seconds: 900
+
+budget:
+  project_usd: 100.0
+  task_usd: 10.0
+  agent_run_usd: 3.0
+
+limits:
+  max_attempts: 3          # failures per task before Diagnostician
+  max_turns: 60            # per agent session
+  max_agent_runs_per_task: 25
+  max_execution_seconds: 172800   # whole-project wall clock (2 days)
+
+logging:
+  level: INFO
