@@ -194,6 +194,26 @@ def test_reconciliation_is_atomic(world, monkeypatch):
     assert world.operations.get(op_id)["status"] == "RECONCILED"
 
 
+def test_dirty_tree_from_interrupted_verification_is_recovered(world):
+    """A verification in flight (e.g. the final verification, which runs
+    outside any attempt) explains a dirty tree: recovery archives and
+    resets instead of refusing to start."""
+    op_id = world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND,
+        {"commands": ["make test"], "label": "final"},
+        project_id=world.pid,
+    )
+    (world.git.path / "hello.txt").write_text("mutated by verification command\n")
+
+    acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
+
+    assert acted
+    assert not world.git.is_dirty()
+    assert world.operations.get(op_id)["status"] == "INTERRUPTED"
+    diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(diffs) == 1 and "mutated by verification" in diffs[0].read_text()
+
+
 def test_recovery_never_settles_another_projects_journal(world):
     """A workspace can hold several projects; recovering project A must not
     destroy project B's pending crash evidence."""
