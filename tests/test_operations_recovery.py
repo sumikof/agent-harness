@@ -475,6 +475,25 @@ def test_archived_diff_preserves_binary_content(world):
     assert (world.git.path / "asset.bin").read_bytes() == binary_content
 
 
+def test_snapshot_ignores_textconv_and_external_diff(world):
+    """Repository-configured diff filters produce presentation-only output;
+    the recovery snapshot must bypass them to stay re-applicable."""
+    (world.git.path / ".gitattributes").write_text("*.bin diff=hexy\n")
+    world.git._run("config", "diff.hexy.textconv", "cat")
+    world.git.add_all()
+    world.git.commit("configure textconv")
+    binary_content = bytes(range(256))
+    (world.git.path / "asset.bin").write_bytes(binary_content)
+
+    patch = world.git.snapshot_dirty()
+
+    assert "GIT binary patch" in patch  # not a textconv-rendered text hunk
+    world.checkpoint.discard_working_tree()
+    assert not (world.git.path / "asset.bin").exists()
+    world.git.apply_patch(patch)
+    assert (world.git.path / "asset.bin").read_bytes() == binary_content
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

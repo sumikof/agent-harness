@@ -131,12 +131,16 @@ class GitRepository:
         """Binary-safe patch of everything uncommitted (incl. untracked).
 
         Round-trippable via apply_patch(): reset_hard() + apply_patch()
-        restores the worktree to exactly this state.
+        restores the worktree to exactly this state. Repository-configured
+        diff transformations (textconv drivers, external diff) are disabled
+        — their output is presentation-only and NOT re-applicable, which
+        would silently corrupt the archive.
         """
         self._run("add", "-A", "-N", check=False)  # intent-to-add so untracked shows
+        args = ["diff", "--binary", "--no-color", "--no-textconv", "--no-ext-diff"]
         if self.head_commit():
-            return self._run("diff", "--binary", "--no-color", "HEAD").stdout
-        return self._run("diff", "--binary", "--no-color").stdout
+            args.append("HEAD")
+        return self._run(*args).stdout
 
     def apply_patch(self, patch: str) -> None:
         self._run("apply", "--whitespace=nowarn", input_text=patch)
