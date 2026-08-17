@@ -116,6 +116,11 @@ class TaskRunner:
                     project_id, task_id, task_key, attempt_id, project_ctx, task_ctx, feedback
                 )
             except BudgetExceeded as exc:
+                # A pause must leave the repo at the last good commit —
+                # otherwise the next startup finds a dirty tree with no
+                # RUNNING attempt and refuses to start. The diff is archived
+                # first so nothing is lost.
+                self._archive_and_discard(task_key, "budget-paused")
                 self._finish_running_attempts(task_id)
                 if exc.scope == "task":
                     self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
@@ -291,6 +296,11 @@ class TaskRunner:
             return TaskOutcome.BLOCKED
 
         attempt_no = self.tasks.get(task_id)["attempt_count"]
+        # The failed attempt's diff is already captured in the Attempt Context
+        # (and archived here), so the working tree is reset BEFORE diagnosis:
+        # a crash mid-diagnosis then leaves a clean tree that startup recovery
+        # can handle, instead of a dirty tree with no RUNNING attempt.
+        self._archive_and_discard(task_key, f"attempt{attempt_no}")
         try:
             # attempt_id ties the diagnostician's runs to the task so they
             # count toward max_agent_runs_per_task like every other run.
@@ -305,7 +315,6 @@ class TaskRunner:
                 artifact_path=self.artifacts.diagnostics_path(task_key, attempt_no),
             )
         except (AgentRunFailed, BudgetExceeded) as exc:
-            self.checkpoint.discard_working_tree()
             self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
             self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
                              payload={"reason": f"diagnosis failed: {exc}"})
@@ -316,7 +325,6 @@ class TaskRunner:
         verdict = DiagnosisVerdict(diagnosis.recommendation)
         self.events.emit("DIAGNOSIS_COMPLETED", project_id=project_id, task_id=task_id,
                          payload={"recommendation": verdict.value})
-        self.checkpoint.discard_working_tree()  # always restart from the last good commit
 
         if verdict == DiagnosisVerdict.RETRY:
             self.tasks.set_status(task_id, TaskState.READY, force=True)
@@ -371,6 +379,15 @@ class TaskRunner:
                 planned.dependencies,
                 sequence=seq,
             )
+
+    def _archive_and_discard(self, task_key: str, label: str) -> None:
+        """Save the current dirty diff as an artifact, then reset the tree."""
+        diff = self._safe_diff()
+        if diff.strip():
+            self.artifacts.save_text(
+                self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff", diff
+            )
+        self.checkpoint.discard_working_tree()
 
     def _finish_running_attempts(
         self, task_id: int, status: AttemptState = AttemptState.INTERRUPTED

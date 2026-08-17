@@ -132,4 +132,4 @@ python -m pytest -q     # LLM不要。FakeRunnerでオーケストレーショ�
 - `harness/verification/` — Deterministic Verification(java / python / node プリセット)
 - `harness/git/` — Git操作とCheckpoint
 - `harness/security/` — 禁止コマンド・Tool Permission・PreToolUse Hook
-- `prompts/` — 各ロールのシステムプロンプト
+- `harness/prompts/` — 各ロールのシステムプロンプト(config.yamlと同じディレクトリに `prompts/` を置くと上書き可能)

@@ -227,6 +227,29 @@ async def test_agent_run_budget_cap_enforced(config, monkeypatch):
     assert state != ProjectState.COMPLETED
 
 
+async def test_budget_pause_leaves_clean_tree(config, monkeypatch):
+    """PAUSED must leave the repo at the last good commit so the next startup
+    can recover; the dirty diff is archived first (Codex P1)."""
+    config.budget.project_usd = 0.025  # exhausted right after the Developer run
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    assert state == ProjectState.PAUSED
+    assert not orchestrator.git.is_dirty()  # developer's half-done work was reset...
+    archived = list((orchestrator.artifacts.root / "diagnostics").glob("T001-budget-paused.diff"))
+    assert len(archived) == 1               # ...but archived, not lost
+    assert "feature" in archived[0].read_text()
+    # a rerun with a raised budget starts cleanly instead of being refused
+    config.budget.project_usd = 100.0
+    orchestrator2 = ProjectOrchestrator(config)
+    fake2 = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    install_fake(monkeypatch, fake2)
+    assert await orchestrator2.run() == ProjectState.COMPLETED
+
+
 async def test_replan_updates_and_drops_existing_tasks(config, monkeypatch):
     """A revised plan must replace unfinished task definitions, not be discarded (Codex P1)."""
     orchestrator = ProjectOrchestrator(config)

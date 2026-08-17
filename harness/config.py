@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 from pathlib import Path
 from typing import Optional
 
@@ -94,8 +95,14 @@ class HarnessConfig(BaseModel):
 
     @property
     def prompts_path(self) -> Path:
+        """A `prompts/` directory next to the config overrides the packaged
+        role prompts; otherwise the ones shipped inside the package are used,
+        so installed wheels work without a source checkout."""
         base = self.config_path.parent if self.config_path else Path.cwd()
-        return base / "prompts"
+        local = base / "prompts"
+        if local.is_dir():
+            return local
+        return Path(str(importlib.resources.files("harness").joinpath("prompts")))
 
 
 def load_config(path: str | Path) -> HarnessConfig:

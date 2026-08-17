@@ -56,6 +56,18 @@ class TestCommandPolicy:
         assert not check_command("git branch -C main copy").allowed
         assert not check_command("git branch --copy main copy").allowed
 
+    def test_branch_clustered_flags_forbidden(self):
+        # mutation letters hidden inside short-option clusters
+        for cmd in [
+            "git branch -fc old copied",
+            "git branch -df copied",
+            "git branch -vd feature",
+        ]:
+            assert not check_command(cmd).allowed, cmd
+        # harmless listing options stay allowed
+        for cmd in ["git branch -v", "git branch -a", "git branch -r", "git branch --merged"]:
+            assert check_command(cmd).allowed, cmd
+
     def test_shell_escaping_does_not_bypass(self):
         # the shell resolves these to plain `git commit` etc. before executing
         for cmd in [

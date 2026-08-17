@@ -26,7 +26,9 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
         "git lifecycle commands are reserved for the harness",
     ),
     (
-        r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[dDfmMcC]\b|--delete|--force|--move|--copy)",
+        # Mutation letters are caught anywhere inside a short-option cluster
+        # (`-fc`, `-df`, ...), not only as standalone flags.
+        r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-[a-zA-Z]*[dDfmMcC]|--delete|--force|--move|--copy)",
         "branch mutation is forbidden",
     ),
     # Destructive / privileged operations
