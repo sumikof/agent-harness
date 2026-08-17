@@ -21,7 +21,9 @@ class PlannedTask(BaseModel):
 
 class ProjectPlan(BaseModel):
     summary: str = ""
-    tasks: list[PlannedTask]
+    # An empty plan would let the project complete without doing anything;
+    # a planner that finds no work must say so in a task, not an empty list.
+    tasks: list[PlannedTask] = Field(min_length=1)
     notes: list[str] = Field(default_factory=list)
 
 

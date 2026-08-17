@@ -95,9 +95,10 @@ def install_fake(monkeypatch, fake: FakeRunner) -> None:
     monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider: fake)
 
 
-def test_ensure_project_rejects_changed_repository(config, tmp_path):
-    """Reusing a workspace/project name with a different repository must fail
-    loudly instead of applying stale state to the wrong checkout (Codex P1)."""
+def test_ensure_project_identity_rules(config, tmp_path):
+    """Identity may be corrected while nothing has run; once work exists a
+    changed repository must fail loudly instead of reusing stale state
+    (Codex P1 + P2)."""
     ProjectOrchestrator(config).ensure_project()
 
     other_repo = GitRepository(tmp_path / "other-repo")
@@ -109,15 +110,111 @@ def test_ensure_project_rejects_changed_repository(config, tmp_path):
     changed = config.model_copy(deep=True)
     changed.config_path = config.config_path
     changed.project.repository = str(other_repo.path)  # same name, new repo
+
+    # untouched project (CREATED, no tasks): treated as fixing a typo
+    orchestrator = ProjectOrchestrator(changed)
+    row = orchestrator.ensure_project()
+    assert row["repository"] == str(other_repo.path)
+
+    # once work exists, identity is frozen
+    orchestrator.tasks.create(row["id"], "T001", "some work")
+    back_to_original = config.model_copy(deep=True)
+    back_to_original.config_path = config.config_path
     with pytest.raises(RuntimeError, match="stale state"):
-        ProjectOrchestrator(changed).ensure_project()
+        ProjectOrchestrator(back_to_original).ensure_project()
 
     # a goal change alone is content, not identity — accepted and persisted
-    changed_goal = config.model_copy(deep=True)
+    changed_goal = changed.model_copy(deep=True)
     changed_goal.config_path = config.config_path
     changed_goal.project.goal = "refined goal"
     row = ProjectOrchestrator(changed_goal).ensure_project()
     assert row["goal"] == "refined goal"
+
+
+def test_ensure_project_rejects_wrong_branch(config):
+    """Harness checkpoints go to the checked-out branch, so it must match
+    base_branch at startup (Codex P1)."""
+    repo = GitRepository(config.repository_path)
+    repo._run("checkout", "-b", "feature")
+    with pytest.raises(RuntimeError, match="base_branch"):
+        ProjectOrchestrator(config).ensure_project()
+
+
+async def test_empty_plan_fails_project_instead_of_completing(config, monkeypatch):
+    """A planner returning {\"tasks\": []} must not let the project complete
+    with zero work (Codex P1)."""
+    monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=[])
+    original_payload = fake._payload
+
+    def empty_plan(role):
+        if role == Role.PLANNER:
+            return {"summary": "nothing to do", "tasks": []}
+        return original_payload(role)
+
+    fake._payload = empty_plan
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    assert state == ProjectState.FAILED  # loud failure, not a silent COMPLETED
+
+
+async def test_changed_goal_triggers_replan(config, monkeypatch):
+    """Resuming with a new goal must revise the stored plan before executing
+    it (Codex P1)."""
+    orchestrator = ProjectOrchestrator(config)
+    row = orchestrator.ensure_project()
+    pid = row["id"]
+    orchestrator.tasks.create(pid, "T001", "task for the old goal")
+    orchestrator.projects.set_status(pid, ProjectState.PAUSED, force=True)
+
+    changed = config.model_copy(deep=True)
+    changed.config_path = config.config_path
+    changed.project.goal = "brand new goal"
+    orchestrator2 = ProjectOrchestrator(changed)
+    fake = FakeRunner(changed.repository_path, review_verdicts=["PASS"])
+    original_payload = fake._payload
+
+    def revised_plan(role):
+        if role == Role.PLANNER:
+            return {
+                "summary": "revised for the new goal",
+                "tasks": [
+                    {
+                        "task_key": "T001",
+                        "title": "revised for new goal",
+                        "goal": "aligned with the new goal",
+                        "acceptance_criteria": ["feature.txt exists"],
+                        "dependencies": [],
+                    }
+                ],
+            }
+        return original_payload(role)
+
+    fake._payload = revised_plan
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator2.run()
+
+    assert state == ProjectState.COMPLETED
+    assert Role.PLANNER in fake.calls  # replan actually happened
+    task = orchestrator2.tasks.get_by_key(pid, "T001")
+    assert task["title"] == "revised for new goal"
+
+
+async def test_goal_change_on_finished_project_rejected(config, monkeypatch):
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    install_fake(monkeypatch, fake)
+    assert await orchestrator.run() == ProjectState.COMPLETED
+
+    changed = config.model_copy(deep=True)
+    changed.config_path = config.config_path
+    changed.project.goal = "a different goal"
+    with pytest.raises(RuntimeError, match="COMPLETED"):
+        ProjectOrchestrator(changed).ensure_project()
 
 
 def test_ensure_project_creates_baseline_commit(tmp_path):

@@ -47,6 +47,13 @@ class ProjectRepository:
             (status.value, utcnow(), project_id),
         )
 
+    def update_identity(self, project_id: int, repository: str, base_branch: str) -> None:
+        """Correct a misconfigured project before any work has begun."""
+        self.db.execute(
+            "UPDATE projects SET repository = ?, base_branch = ?, updated_at = ? WHERE id = ?",
+            (repository, base_branch, utcnow(), project_id),
+        )
+
     def update_goal(self, project_id: int, goal: str) -> None:
         self.db.execute(
             "UPDATE projects SET goal = ?, updated_at = ? WHERE id = ?",

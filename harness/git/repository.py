@@ -55,7 +55,12 @@ class GitRepository:
         return result.stdout.strip()
 
     def current_branch(self) -> str:
-        return self._run("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        # symbolic-ref works on unborn branches too; a detached HEAD has no
+        # symbolic ref and is reported as such.
+        result = self._run("symbolic-ref", "--short", "HEAD", check=False)
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return "DETACHED"
 
     def is_dirty(self) -> bool:
         result = self._run("status", "--porcelain")

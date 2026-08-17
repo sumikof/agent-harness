@@ -64,10 +64,28 @@ class ProjectOrchestrator:
         self.recovery = RecoveryManager(
             self.tasks, self.events, self.artifacts, self.git, self.checkpoint
         )
+        self._replan_for_new_goal = False
 
     # ------------------------------------------------------------------
 
     def ensure_project(self) -> sqlite3.Row:
+        # Validate the working copy BEFORE touching persistent state, so a
+        # mistyped path never binds a project row to an invalid identity.
+        if not self.git.is_repo():
+            raise RuntimeError(
+                f"{self.config.repository_path} is not the root of a git repository. "
+                "Place or clone the target repository there first (a subdirectory of "
+                "another checkout is not accepted)."
+            )
+        branch = self.git.current_branch()
+        if branch != self.config.project.base_branch:
+            raise RuntimeError(
+                f"repository is on branch '{branch}' but base_branch is "
+                f"'{self.config.project.base_branch}'. Check out the base branch first — "
+                "harness checkpoints are committed to the currently checked-out branch."
+            )
+
+        self._replan_for_new_goal = False
         row = self.projects.get_by_name(self.config.project.name)
         if row is None:
             project_id = self.projects.create(
@@ -81,31 +99,7 @@ class ProjectOrchestrator:
                              payload={"name": self.config.project.name})
             row = self.projects.get(project_id)
         else:
-            # Resuming an existing project: its persisted identity must match
-            # the current configuration, or the stored plan/tasks/commits
-            # would be applied to a different checkout.
-            stored_repo = Path(row["repository"]).resolve()
-            configured_repo = self.config.repository_path.resolve()
-            if stored_repo != configured_repo or row["base_branch"] != self.config.project.base_branch:
-                raise RuntimeError(
-                    f"project '{self.config.project.name}' in this workspace was created for "
-                    f"repository={row['repository']} (base_branch={row['base_branch']}), but the "
-                    f"config now points at {configured_repo} (base_branch="
-                    f"{self.config.project.base_branch}). Use a new project name or a fresh "
-                    "workspace instead of reusing stale state."
-                )
-            if row["goal"] != self.config.project.goal:
-                # Goal text is content, not identity — adopt the new wording.
-                self.projects.update_goal(row["id"], self.config.project.goal)
-                self.events.emit("PROJECT_GOAL_UPDATED", project_id=row["id"],
-                                 payload={"goal": self.config.project.goal})
-                row = self.projects.get(row["id"])
-        if not self.git.is_repo():
-            raise RuntimeError(
-                f"{self.config.repository_path} is not the root of a git repository. "
-                "Place or clone the target repository there first (a subdirectory of "
-                "another checkout is not accepted)."
-            )
+            row = self._validate_resumed_project(row)
         if self.git.head_commit() is None:
             # Checkpoint/recovery semantics need a HEAD to reset to. Commit
             # whatever the repository starts with as the baseline; ignored
@@ -116,6 +110,49 @@ class ProjectOrchestrator:
                              payload={"commit": baseline})
             logger.info("created baseline commit %s in commitless repository", baseline[:8])
         return row
+
+    def _validate_resumed_project(self, row: sqlite3.Row) -> sqlite3.Row:
+        """Check persisted project identity against the current configuration."""
+        project_id = row["id"]
+        stored_repo = Path(row["repository"]).resolve()
+        configured_repo = self.config.repository_path.resolve()
+        identity_changed = (
+            stored_repo != configured_repo
+            or row["base_branch"] != self.config.project.base_branch
+        )
+        if identity_changed:
+            untouched = (
+                row["status"] == ProjectState.CREATED.value
+                and not self.tasks.list_for_project(project_id)
+            )
+            if not untouched:
+                raise RuntimeError(
+                    f"project '{self.config.project.name}' in this workspace was created for "
+                    f"repository={row['repository']} (base_branch={row['base_branch']}), but the "
+                    f"config now points at {configured_repo} (base_branch="
+                    f"{self.config.project.base_branch}). Use a new project name or a fresh "
+                    "workspace instead of reusing stale state."
+                )
+            # Nothing has run yet — treat this as correcting a misconfiguration.
+            self.projects.update_identity(
+                project_id, str(self.config.repository_path), self.config.project.base_branch
+            )
+            self.events.emit("PROJECT_IDENTITY_CORRECTED", project_id=project_id,
+                             payload={"repository": str(self.config.repository_path),
+                                      "base_branch": self.config.project.base_branch})
+        if row["goal"] != self.config.project.goal:
+            if row["status"] in (ProjectState.COMPLETED.value, ProjectState.FAILED.value):
+                raise RuntimeError(
+                    f"project '{self.config.project.name}' is already {row['status']}; "
+                    "a new goal needs a new project name or a fresh workspace."
+                )
+            # Goal text is content, not identity — adopt it, but the existing
+            # plan was made for the old goal, so unfinished work is replanned.
+            self.projects.update_goal(project_id, self.config.project.goal)
+            self.events.emit("PROJECT_GOAL_UPDATED", project_id=project_id,
+                             payload={"goal": self.config.project.goal})
+            self._replan_for_new_goal = True
+        return self.projects.get(project_id)
 
     def project_context(self) -> ProjectContext:
         return ProjectContext(
@@ -149,6 +186,13 @@ class ProjectOrchestrator:
                 await self._plan(project_id, project_ctx, replan=False)
                 self.projects.set_status(project_id, ProjectState.READY)
                 state = ProjectState.READY
+
+            elif self._replan_for_new_goal and self.tasks.list_for_project(project_id):
+                # The stored plan was produced for the previous goal — revise
+                # it before resuming execution.
+                self.projects.set_status(project_id, ProjectState.REPLANNING, force=True)
+                await self._plan(project_id, project_ctx, replan=True)
+                state = ProjectState.REPLANNING
 
             if state in (ProjectState.READY, ProjectState.PAUSED, ProjectState.BLOCKED,
                          ProjectState.PLANNING, ProjectState.REPLANNING):
