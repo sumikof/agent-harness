@@ -14,19 +14,16 @@ from dataclasses import dataclass
 # after whitespace normalization). Kept deliberately broad: false positives
 # only cost an agent a denied tool call; false negatives cost repo state.
 FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
-    # Git lifecycle belongs to the harness
-    (r"\bgit\s+push\b", "git push is reserved for the harness"),
-    (r"\bgit\s+commit\b", "git commit is reserved for the harness"),
-    (r"\bgit\s+merge\b", "git merge is reserved for the harness"),
-    (r"\bgit\s+rebase\b", "git rebase is reserved for the harness"),
-    (r"\bgit\s+reset\b", "git reset is reserved for the harness"),
-    (r"\bgit\s+checkout\s+", "git checkout is reserved for the harness"),
-    (r"\bgit\s+switch\b", "git switch is reserved for the harness"),
-    (r"\bgit\s+branch\s+(-d|-D|--delete)\b", "branch deletion is forbidden"),
-    (r"\bgit\s+remote\b", "modifying remotes is forbidden"),
-    (r"\bgit\s+stash\b", "git stash is reserved for the harness"),
-    (r"\bgit\s+clean\b", "git clean is reserved for the harness"),
-    (r"\bgit\s+tag\b", "git tag is reserved for the harness"),
+    # Git lifecycle belongs to the harness. `[^|;&]*?` skips global options
+    # such as `-C <path>` / `-c <k>=<v>` / `--git-dir=...` that git accepts
+    # before the subcommand, so they cannot be used to smuggle a lifecycle
+    # command past the hook. False positives (a keyword appearing later in
+    # the same segment) are accepted by design.
+    (
+        r"\bgit\b[^|;&]*?\b(push|commit|merge|rebase|reset|checkout|switch|stash|clean|tag|remote)\b",
+        "git lifecycle commands are reserved for the harness",
+    ),
+    (r"\bgit\b[^|;&]*?\bbranch\b[^|;&]*?(\s-d\b|\s-D\b|--delete)", "branch deletion is forbidden"),
     # Destructive / privileged operations
     (r"\bsudo\b", "sudo is forbidden"),
     (r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+(/|~|\$HOME)(\s|$)", "recursive delete of root/home is forbidden"),
@@ -64,3 +61,34 @@ def check_command(command: str) -> CommandDecision:
         if regex.search(normalized):
             return CommandDecision(False, reason)
     return CommandDecision(True)
+
+
+# Heuristics that flag a shell command as capable of writing files. Used to
+# keep read-only roles (and the Tester, who must edit via the path-checked
+# Edit/Write tools) from mutating the repository through Bash. This is
+# defense-in-depth, not a sandbox: false positives only force the agent to
+# use the dedicated file tools, which are properly permission-checked.
+_WRITE_HINTS: list[tuple[re.Pattern, str]] = [
+    # Redirections that create/overwrite files. `2>` (fd redirect) and
+    # redirects to /dev/null are allowed; `>&`-style fd duplication too.
+    (re.compile(r"(?:^|[^&\d])>>?(?!&)\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
+    (re.compile(r"&>\s*(?!/dev/null\b)\S"), "shell redirection writes a file"),
+    (re.compile(r"\btee\b"), "tee writes files"),
+    (re.compile(r"\bsed\b[^|;&]*\s-i\b"), "sed -i edits files in place"),
+    (re.compile(r"\b(perl|python[0-9.]*|ruby)\b[^|;&]*\s-i\b"), "in-place edit flag"),
+    (
+        re.compile(
+            r"\b(mv|cp|rm|touch|mkdir|rmdir|truncate|ln|install|rsync|patch|chmod|chown|dd)\b"
+        ),
+        "file mutation command",
+    ),
+]
+
+
+def find_write_hint(command: str) -> str | None:
+    """Return a reason string if the command looks write-capable, else None."""
+    normalized = " ".join(command.split())
+    for regex, reason in _WRITE_HINTS:
+        if regex.search(normalized):
+            return reason
+    return None

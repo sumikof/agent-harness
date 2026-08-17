@@ -102,6 +102,16 @@ class AgentInvoker:
             if result.status != "COMPLETED":
                 raise AgentRunFailed(spec.role.value, result.error or "agent session failed")
 
+            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
+            # cap is enforced right after the run. An over-budget run fails
+            # the attempt, which feeds the normal retry/diagnosis path.
+            cap = self.config.budget.agent_run_usd
+            if result.cost_usd > cap:
+                raise AgentRunFailed(
+                    spec.role.value,
+                    f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
+                )
+
             model_obj, validation_error = validate_output(result, spec.output_model)
             if model_obj is not None:
                 if artifact_path is not None:

@@ -159,16 +159,21 @@ class ProjectOrchestrator:
             # COMPLETED / SPLIT / BLOCKED: just take the next runnable task
 
     async def _finalize(self, project_id: int, project_ctx: ProjectContext) -> ProjectState:
-        blocked = [
+        # Any non-terminal task blocks completion: BLOCKED tasks, but also
+        # PENDING/READY tasks that next_runnable() could not schedule (missing
+        # dependency or dependency cycle). Finishing "successfully" while work
+        # remains would silently drop it.
+        terminal = {TaskState.COMPLETED.value, TaskState.SKIPPED.value}
+        unfinished = [
             t["task_key"]
             for t in self.tasks.list_for_project(project_id)
-            if t["status"] == TaskState.BLOCKED.value
+            if t["status"] not in terminal
         ]
-        if blocked:
+        if unfinished:
             self.projects.set_status(project_id, ProjectState.BLOCKED, force=True)
             self.events.emit("PROJECT_BLOCKED", project_id=project_id,
-                             payload={"blocked_tasks": blocked})
-            logger.warning("project blocked; blocked tasks: %s", ", ".join(blocked))
+                             payload={"unfinished_tasks": unfinished})
+            logger.warning("project blocked; unfinished tasks: %s", ", ".join(unfinished))
             return ProjectState.BLOCKED
 
         self.projects.set_status(project_id, ProjectState.FINAL_VERIFICATION, force=True)

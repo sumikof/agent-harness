@@ -89,6 +89,13 @@ class TaskRunner:
 
         while True:
             try:
+                # The attempt is opened BEFORE analysis so that an Analyst
+                # failure is recorded as a failed attempt and counts toward
+                # the retry limit — otherwise a failing analysis would loop
+                # outside every budget except wall clock.
+                attempt_id = self.tasks.start_attempt(task_id, self.git.head_commit())
+                feedback.attempt_no = self.tasks.get(task_id)["attempt_count"]
+
                 if need_analysis:
                     self.tasks.set_status(task_id, TaskState.ANALYZING, force=True)
                     brief = await self.invoker.invoke(
@@ -98,14 +105,12 @@ class TaskRunner:
                         task_ctx=task_ctx,
                         attempt_ctx=feedback,
                         task_id=task_id,
+                        attempt_id=attempt_id,
                         artifact_path=self.artifacts.task_artifact_path(task_key, "task-brief.json"),
                     )
                     task_ctx.task_brief = brief.model_dump()
                     task_ctx.relevant_files = list(brief.files)
                     need_analysis = False
-
-                attempt_id = self.tasks.start_attempt(task_id, self.git.head_commit())
-                feedback.attempt_no = self.tasks.get(task_id)["attempt_count"]
 
                 kind, payload = await self._run_attempt(
                     project_id, task_id, task_key, attempt_id, project_ctx, task_ctx, feedback
@@ -120,13 +125,14 @@ class TaskRunner:
                 raise  # project-scope budget: the Project Loop pauses the project
             except AgentRunFailed as exc:
                 logger.error("agent run failed on %s: %s", task_key, exc)
+                # The attempt opened above is closed as FAILED, so this
+                # failure counts toward consecutive_failures().
                 self._finish_running_attempts(task_id, AttemptState.FAILED)
                 self.tasks.set_status(task_id, TaskState.FAILED, force=True)
                 feedback = AttemptContext(
                     previous_attempt_summary=f"Previous attempt aborted: {exc.detail}"
                 )
                 kind, payload = ("AGENT_FAILURE", None)
-                attempt_id = None
 
             # ---- deterministic routing --------------------------------------
             if kind == "PASS":

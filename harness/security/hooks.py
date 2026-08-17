@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..orchestrator.state_machine import Role
-from .commands import check_command
+from .commands import check_command, find_write_hint
 from .permissions import WRITE_TOOLS, check_write_path
 
 
@@ -26,6 +26,16 @@ def decide_tool_use(
         decision = check_command(command)
         if not decision.allowed:
             return False, f"Forbidden command: {decision.reason}"
+        # Only the Developer may run write-capable shell commands. Everyone
+        # else (including the Tester, whose writes must go through the
+        # path-checked Edit/Write tools) gets read-only Bash.
+        if role != Role.DEVELOPER:
+            hint = find_write_hint(command)
+            if hint:
+                return False, (
+                    f"{role.value} has read-only Bash ({hint}); "
+                    "use the Edit/Write tools if your role permits file changes"
+                )
         return True, ""
 
     if tool_name in WRITE_TOOLS:

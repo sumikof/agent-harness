@@ -1,5 +1,5 @@
 from harness.orchestrator.state_machine import Role
-from harness.security.commands import check_command
+from harness.security.commands import check_command, find_write_hint
 from harness.security.hooks import decide_tool_use
 from harness.security.permissions import allowed_tools_for, check_write_path, is_test_path
 
@@ -14,6 +14,19 @@ class TestCommandPolicy:
             "git reset --hard HEAD",
             "git branch -D feature",
             "git remote add origin x",
+        ]:
+            assert not check_command(cmd).allowed, cmd
+
+    def test_git_global_options_do_not_bypass(self):
+        # git accepts [-C <path>] [-c <k>=<v>] [--git-dir=...] before the
+        # subcommand; the hook must still catch the lifecycle command.
+        for cmd in [
+            "git -C . commit -m x",
+            "git -c user.name=x commit -m x",
+            "git -c user.email=a@b push origin main",
+            "git --git-dir=.git reset --hard HEAD",
+            "git -C /repo -c core.autocrlf=false rebase main",
+            "git -C sub branch -D feature",
         ]:
             assert not check_command(cmd).allowed, cmd
 
@@ -41,6 +54,37 @@ class TestCommandPolicy:
             "rm build/output.txt",
         ]:
             assert check_command(cmd).allowed, cmd
+
+
+class TestWriteHints:
+    def test_write_commands_detected(self):
+        for cmd in [
+            "echo x > src/app.py",
+            "cat a.txt >> notes.md",
+            "printf 'x' > file",
+            "grep foo src | tee out.txt",
+            "sed -i 's/a/b/' src/x.py",
+            "perl -i -pe 's/a/b/' src/x.py",
+            "mv a.py b.py",
+            "cp src/a.py src/b.py",
+            "rm src/a.py",
+            "touch marker",
+            "mkdir newdir",
+            "pip install requests",
+        ]:
+            assert find_write_hint(cmd) is not None, cmd
+
+    def test_read_only_commands_not_flagged(self):
+        for cmd in [
+            "cat src/app.py",
+            "grep -r 'TODO' src",
+            "python -m pytest -q 2>/dev/null",
+            "ls -la > /dev/null",
+            "./mvnw test 2>&1 | tail -20",
+            "git status",
+            "sed -n '1,10p' src/x.py",
+        ]:
+            assert find_write_hint(cmd) is None, cmd
 
 
 class TestPermissions:
@@ -80,6 +124,26 @@ class TestToolUseDecision:
 
     def test_bash_normal_allowed(self, tmp_path):
         allowed, _ = decide_tool_use(Role.DEVELOPER, "Bash", {"command": "pytest -q"}, tmp_path)
+        assert allowed
+
+    def test_read_only_role_bash_write_denied(self, tmp_path):
+        for role in (Role.PLANNER, Role.ANALYST, Role.REVIEWER, Role.DIAGNOSTICIAN, Role.TESTER):
+            allowed, reason = decide_tool_use(
+                role, "Bash", {"command": "echo x > src/app.py"}, tmp_path
+            )
+            assert not allowed and "read-only" in reason, role
+
+    def test_read_only_role_bash_read_allowed(self, tmp_path):
+        for role in (Role.PLANNER, Role.ANALYST, Role.REVIEWER, Role.DIAGNOSTICIAN, Role.TESTER):
+            allowed, _ = decide_tool_use(
+                role, "Bash", {"command": "python -m pytest -q"}, tmp_path
+            )
+            assert allowed, role
+
+    def test_developer_bash_write_allowed(self, tmp_path):
+        allowed, _ = decide_tool_use(
+            Role.DEVELOPER, "Bash", {"command": "echo x > src/app.py"}, tmp_path
+        )
         assert allowed
 
     def test_write_outside_repo_denied(self, tmp_path):

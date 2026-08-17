@@ -150,6 +150,77 @@ async def test_repeated_repair_escalates_to_diagnostician(config, monkeypatch):
     assert not orchestrator.git.is_dirty()      # failed work was discarded
 
 
+async def test_analyst_failure_counts_toward_retry_limit(config, monkeypatch):
+    """A failing Analyst must burn attempts, not loop forever (Codex P1)."""
+    config.limits.max_attempts = 2
+    monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    original_run = fake.run
+
+    async def run_failing_analyst(request):
+        if request.role in (Role.ANALYST, Role.DIAGNOSTICIAN):
+            fake.calls.append(request.role)
+            return AgentResult(status="FAILED", error="provider down")
+        return await original_run(request)
+
+    fake.run = run_failing_analyst
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    task = orchestrator.tasks.get_by_key(1, "T001")
+    assert task["status"] == "BLOCKED"          # diagnosis also failed -> BLOCKED
+    assert task["attempt_count"] >= config.limits.max_attempts  # failures were recorded
+    assert state == ProjectState.BLOCKED
+
+
+async def test_deadlocked_plan_blocks_project(config, monkeypatch):
+    """A plan whose dependencies can never be satisfied must not complete (Codex P1)."""
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=[])
+    original_payload = fake._payload
+
+    def payload_with_bad_dependency(role):
+        if role == Role.PLANNER:
+            return {
+                "summary": "broken plan",
+                "tasks": [
+                    {
+                        "task_key": "T001",
+                        "title": "unreachable task",
+                        "goal": "depends on a task that does not exist",
+                        "dependencies": ["T999"],
+                    }
+                ],
+            }
+        return original_payload(role)
+
+    fake._payload = payload_with_bad_dependency
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    assert state == ProjectState.BLOCKED        # never COMPLETED with pending work
+    task = orchestrator.tasks.get_by_key(1, "T001")
+    assert task["status"] == "PENDING"
+
+
+async def test_agent_run_budget_cap_enforced(config, monkeypatch):
+    """A single run exceeding agent_run_usd fails the attempt (Codex P2)."""
+    config.budget.agent_run_usd = 0.005  # below FakeRunner's 0.01 per run
+    config.limits.max_attempts = 1
+    monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
+    orchestrator = ProjectOrchestrator(config)
+    fake = FakeRunner(config.repository_path, review_verdicts=["PASS"])
+    install_fake(monkeypatch, fake)
+
+    state = await orchestrator.run()
+
+    # planner run itself blows the cap -> project fails fast, never COMPLETED
+    assert state != ProjectState.COMPLETED
+
+
 async def test_verification_failure_triggers_fresh_developer(config, monkeypatch):
     config.verification.commands = ["test -f marker.txt"]  # fails until 2nd attempt
     orchestrator = ProjectOrchestrator(config)
