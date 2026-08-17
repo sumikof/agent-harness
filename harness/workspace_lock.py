@@ -19,6 +19,7 @@ e.g. resume flows and tests).
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 try:
@@ -39,6 +40,10 @@ _HELD: dict[str, int] = {}
 # legitimate), but two CONCURRENT run loops are not — the second one's
 # startup recovery would reclaim the first one's live agent run.
 _ACTIVE_RUNS: set[str] = set()
+
+# Serializes every registry mutation (check-and-add included), so two
+# threads racing into begin_run() cannot both claim the workspace.
+_REGISTRY_LOCK = threading.Lock()
 
 
 def _clear_fork_state() -> None:
@@ -91,31 +96,33 @@ class WorkspaceLock:
 
     def acquire(self) -> None:
         key = str(self.path.resolve())
-        if key in _HELD:
-            return  # reentrant within this process
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            _lock_fd(fd, self.path)
-        except UnsupportedPlatform:
-            os.close(fd)
-            raise
-        except OSError:
-            os.close(fd)
-            raise WorkspaceLocked(
-                f"another harness process holds {self.path}. Only one process may "
-                "run per workspace; stop it (or wait for it to exit) and rerun."
-            )
-        # Written AFTER the byte-0 lock region is held; only informational.
-        os.write(fd, f" {os.getpid()}".encode("ascii"))
-        _HELD[key] = fd
+        with _REGISTRY_LOCK:
+            if key in _HELD:
+                return  # reentrant within this process
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                _lock_fd(fd, self.path)
+            except UnsupportedPlatform:
+                os.close(fd)
+                raise
+            except OSError:
+                os.close(fd)
+                raise WorkspaceLocked(
+                    f"another harness process holds {self.path}. Only one process may "
+                    "run per workspace; stop it (or wait for it to exit) and rerun."
+                )
+            # Written AFTER the byte-0 lock region is held; only informational.
+            os.write(fd, f" {os.getpid()}".encode("ascii"))
+            _HELD[key] = fd
 
     def release(self) -> None:
         key = str(self.path.resolve())
-        fd = _HELD.pop(key, None)
-        if fd is not None:
-            _unlock_fd(fd)
-            os.close(fd)
+        with _REGISTRY_LOCK:
+            fd = _HELD.pop(key, None)
+            if fd is not None:
+                _unlock_fd(fd)
+                os.close(fd)
 
     # -- in-process run exclusivity ------------------------------------
 
@@ -128,12 +135,14 @@ class WorkspaceLock:
         remain allowed.
         """
         key = str(self.path.resolve())
-        if key in _ACTIVE_RUNS:
-            raise WorkspaceLocked(
-                f"another project loop is already running on {self.path} in this "
-                "process; wait for it to finish before starting another."
-            )
-        _ACTIVE_RUNS.add(key)
+        with _REGISTRY_LOCK:
+            if key in _ACTIVE_RUNS:
+                raise WorkspaceLocked(
+                    f"another project loop is already running on {self.path} in this "
+                    "process; wait for it to finish before starting another."
+                )
+            _ACTIVE_RUNS.add(key)
 
     def end_run(self) -> None:
-        _ACTIVE_RUNS.discard(str(self.path.resolve()))
+        with _REGISTRY_LOCK:
+            _ACTIVE_RUNS.discard(str(self.path.resolve()))

@@ -215,9 +215,14 @@ class GitRepository:
                 else:
                     # A special node (FIFO, socket, device) at the path is a
                     # different state than a deletion — never hash alike, or
-                    # stale evidence could get a user's node reset away.
+                    # stale evidence could get a user's node reset away. The
+                    # fingerprint covers type, permissions, and node identity
+                    # (inode/device/mtime), so replacing or chmod-ing the
+                    # node changes the hash.
                     digest.update(b"N")
-                    digest.update(stat.S_IFMT(node.st_mode).to_bytes(4, "little"))
+                    for value in (node.st_mode, node.st_ino, node.st_dev,
+                                  node.st_mtime_ns):
+                        digest.update(int(value).to_bytes(16, "little", signed=False))
             digest.update(b"\0")
         return digest.hexdigest()
 
@@ -232,8 +237,22 @@ class GitRepository:
                 full = self.path / rel
                 if full.is_symlink() or full.is_file():
                     tar.add(full, arcname=rel, recursive=False)
-                else:
+                    continue
+                try:
+                    node = os.lstat(full)
+                except (FileNotFoundError, NotADirectoryError):
                     deleted.append(rel)
+                    continue
+                if stat.S_ISFIFO(node.st_mode):
+                    tar.add(full, arcname=rel, recursive=False)  # tar supports FIFOs
+                else:
+                    # Sockets/devices cannot be captured faithfully — fail
+                    # loudly instead of recording them as deletions and
+                    # silently dropping them on restore.
+                    raise GitError(
+                        f"cannot snapshot special node at {rel}; "
+                        "unsupported worktree state"
+                    )
         return WorktreeSnapshot(
             tar_bytes=buffer.getvalue(), deleted=deleted,
             state_hash=self.dirty_state_hash(),
@@ -249,7 +268,9 @@ class GitRepository:
                 for member in tar.getmembers():
                     self._clear_conflicting_paths(member.name)
                 try:
-                    tar.extractall(self.path, filter="data")
+                    # 'tar' (not 'data'): the members are self-authored
+                    # relative paths, and 'data' refuses FIFO members.
+                    tar.extractall(self.path, filter="tar")
                 except TypeError:  # Python without the filter parameter
                     tar.extractall(self.path)
         for rel in snapshot.deleted:
@@ -268,6 +289,10 @@ class GitRepository:
         target = self.path / rel
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target)
+        elif target.is_symlink() or target.exists():
+            # A plain file blocking a FIFO member (etc.) — clear it so the
+            # extraction can recreate the node type from the snapshot.
+            target.unlink()
 
     def snapshot_dirty(self) -> str:
         """Binary-safe patch of everything uncommitted (incl. untracked).

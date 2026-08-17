@@ -655,6 +655,77 @@ def test_state_hash_distinguishes_special_nodes_from_deletion(world):
     os.mkfifo(target)
     hash_fifo = world.git.dirty_state_hash()
     assert hash_deleted != hash_fifo
+    # replacing the node or changing its permissions is also a new state
+    os.chmod(target, 0o600)
+    assert world.git.dirty_state_hash() not in (hash_deleted, hash_fifo)
+
+
+def test_snapshot_preserves_fifo_nodes(world):
+    """A FIFO at session start must survive a snapshot/restore round trip,
+    not be recorded as a deletion."""
+    import os
+    import stat as stat_module
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo not available on this platform")
+    target = world.git.path / "hello.txt"
+    target.unlink()
+    os.mkfifo(target)
+
+    snap = world.git.snapshot_worktree_state()
+    world.git.reset_hard("HEAD")
+    assert target.is_file()  # HEAD restored the plain file
+
+    world.git.restore_worktree_state(snap)
+    assert stat_module.S_ISFIFO(os.lstat(target).st_mode)
+
+
+def test_snapshot_refuses_unsupported_special_nodes(world):
+    """Sockets cannot be captured faithfully: snapshot creation fails loudly
+    instead of silently recording a deletion."""
+    import socket
+
+    from harness.git.repository import GitError
+
+    # replace a tracked file with a socket: git reports the file deleted,
+    # but the path actually holds a node we cannot capture
+    sock_path = world.git.path / "hello.txt"
+    sock_path.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        with pytest.raises(GitError, match="special node"):
+            world.git.snapshot_worktree_state()
+    finally:
+        server.close()
+        sock_path.unlink(missing_ok=True)
+
+
+def test_begin_run_claim_is_atomic_across_threads(tmp_path):
+    """Two threads racing into begin_run must resolve to exactly one owner."""
+    import threading
+
+    from harness.workspace_lock import WorkspaceLock, WorkspaceLocked
+
+    lock = WorkspaceLock(tmp_path / "harness.lock")
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def worker():
+        barrier.wait()
+        try:
+            lock.begin_run()
+            results.append("ok")
+        except WorkspaceLocked:
+            results.append("locked")
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    lock.end_run()
+    assert sorted(results) == ["locked", "ok"]
 
 
 def test_readonly_diff_restores_index_for_awkward_paths(world):
