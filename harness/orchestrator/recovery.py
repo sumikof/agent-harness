@@ -403,8 +403,14 @@ class RecoveryManager:
             self.artifacts.save_bytes(path, diff)
         # Ground truth REGARDLESS of the patch: a clean filter can normalize
         # the diff to empty while the on-disk bytes still differ, and the
-        # reset below would destroy them.
-        self.artifacts.archive_worktree_files(
-            path.with_suffix(".files.tar"), self.git.path, self.git.changed_paths()
-        )
+        # reset below would destroy them. A tree that cannot be archived
+        # faithfully (sockets, devices) must not be reset at all.
+        try:
+            self.artifacts.archive_worktree_files(
+                path.with_suffix(".files.tar"), self.git.path, self.git.changed_paths()
+            )
+        except Exception as exc:
+            raise RecoveryIntegrityError(
+                f"could not archive the dirty worktree before reset: {exc}"
+            )
         logger.info("recovery: archived interrupted worktree to %s(.files.tar)", path)

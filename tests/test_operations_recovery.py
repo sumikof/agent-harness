@@ -701,6 +701,31 @@ def test_snapshot_refuses_unsupported_special_nodes(world):
         sock_path.unlink(missing_ok=True)
 
 
+def test_recovery_refuses_reset_when_archive_cannot_capture_socket(world):
+    """A tree holding a socket cannot be archived faithfully; recovery must
+    stop before the reset instead of silently dropping the node."""
+    import socket
+    import stat as stat_module
+
+    from harness.orchestrator.recovery import RecoveryIntegrityError
+
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    world.tasks.start_attempt(tid, world.git.head_commit())
+    sock_path = world.git.path / "hello.txt"
+    sock_path.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        with pytest.raises(RecoveryIntegrityError, match="archive"):
+            world.recovery.recover(world.projects.get(world.pid))
+        # nothing was reset: the socket survives for the operator to inspect
+        assert stat_module.S_ISSOCK((sock_path).lstat().st_mode)
+    finally:
+        server.close()
+        sock_path.unlink(missing_ok=True)
+
+
 def test_begin_run_claim_is_atomic_across_threads(tmp_path):
     """Two threads racing into begin_run must resolve to exactly one owner."""
     import threading

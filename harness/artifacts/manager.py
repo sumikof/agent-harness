@@ -168,16 +168,47 @@ class ArtifactManager:
         redaction filters, ...), so it may not reproduce the working-tree
         bytes. The tar is the ground-truth copy alongside the patch.
         Returns the tar path, or None when nothing existed to archive.
+
+        Nodes that cannot be captured faithfully (sockets, devices) raise
+        instead of being silently omitted — the caller must NOT reset a
+        tree it could not fully archive.
         """
+        import os
+        import stat
         import tarfile
 
-        existing = [rel for rel in paths if (repo_root / rel).exists()]
-        if not existing:
+        def entries(rel: str):
+            full = repo_root / rel
+            if full.is_dir() and not full.is_symlink():
+                for walk_root, _dirs, names in os.walk(full):
+                    for name in names:
+                        yield str((Path(walk_root) / name).relative_to(repo_root))
+            else:
+                yield rel
+
+        flat: list[str] = []
+        for rel in paths:
+            if not (repo_root / rel).exists() and not (repo_root / rel).is_symlink():
+                continue
+            for entry in entries(rel):
+                full = repo_root / entry
+                try:
+                    node = os.lstat(full)
+                except FileNotFoundError:
+                    continue
+                mode = node.st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode) or stat.S_ISFIFO(mode)):
+                    raise ValueError(
+                        f"cannot archive special node at {entry} (socket/device); "
+                        "refusing to proceed without a faithful copy"
+                    )
+                flat.append(entry)
+        if not flat:
             return None
         tar_path.parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(tar_path, "w") as tar:
-            for rel in existing:
-                tar.add(repo_root / rel, arcname=rel)
+            for entry in sorted(set(flat)):
+                tar.add(repo_root / entry, arcname=entry, recursive=False)
         return tar_path
 
     def relpath(self, path: Path) -> str:
