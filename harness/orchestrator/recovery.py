@@ -97,12 +97,17 @@ class RecoveryManager:
                 "cannot be trusted; inspect the workspace before rerunning."
             )
 
-        # 3-4. Unfinished operations: settle every journaled side effect
-        # against reality BEFORE touching the working tree.
-        interrupted_verifications = 0
+        # 3-4. Unfinished operations. Git commits are reconciled BEFORE any
+        # tree reset; in-flight dispatch/verification intents are only READ
+        # here — they stay open until the tree is settled below, so a crash
+        # inside recovery itself keeps the evidence for the next startup.
+        pending_verifications = 0
         if self.operations is not None:
-            settled, interrupted_verifications = self._settle_unfinished_operations(project_id)
-            acted |= settled
+            for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
+                self._reconcile_git_commit(project_id, op)
+                acted = True
+            pending_verifications = len(self.operations.unfinished(
+                OperationType.VERIFICATION_COMMAND, project_id=project_id))
 
         # 5. Workspace dirty-state recovery.
         running = self.tasks.running_attempts(project_id)
@@ -125,14 +130,14 @@ class RecoveryManager:
             if dirty:
                 self.checkpoint.discard_working_tree()
             acted = True
-        elif dirty and interrupted_verifications:
+        elif dirty and pending_verifications:
             # No RUNNING attempt, but a verification command (e.g. the final
             # verification, which runs outside any attempt) was journaled as
             # in flight — its side effects explain the diff. Archive it and
             # return to the last good commit so the run can be repeated.
             logger.warning(
-                "recovery: dirty tree explained by %d interrupted verification "
-                "operation(s); archiving and resetting", interrupted_verifications,
+                "recovery: dirty tree explained by %d in-flight verification "
+                "operation(s); archiving and resetting", pending_verifications,
             )
             self._archive_dirty_diff(project_id)
             self.checkpoint.discard_working_tree()
@@ -144,6 +149,12 @@ class RecoveryManager:
                 f"repository {self.git.path} has uncommitted changes but no interrupted "
                 "attempt is recorded. Commit, stash, or clean it manually, then rerun."
             )
+
+        # Now that the tree is settled, the in-flight operations can be
+        # closed. Crash-before-this-point keeps them PENDING, so the next
+        # startup still sees the evidence and repeats the steps above.
+        if self.operations is not None:
+            acted |= self._close_interrupted_operations(project_id)
 
         # 6. Project / task state reconciliation.
         if self.runs is not None:
@@ -169,24 +180,15 @@ class RecoveryManager:
 
     # ------------------------------------------------------------------
 
-    def _settle_unfinished_operations(self, project_id: int) -> tuple[bool, int]:
-        """Returns (acted, interrupted verification count).
-
-        The verification count feeds the dirty-state step: a verification
-        that was in flight (possibly outside any attempt, like the final
-        verification) is a legitimate explanation for a dirty tree.
-        """
-        # Scoped to THIS project: other projects in the same workspace keep
-        # their pending journals for their own startup to settle.
+    def _close_interrupted_operations(self, project_id: int) -> bool:
+        """Close in-flight dispatch/verification intents AFTER the worktree
+        has been settled. Scoped to THIS project: other projects in the same
+        workspace keep their pending journals for their own startup."""
         acted = False
-        interrupted_verifications = 0
-        for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
-            self._reconcile_git_commit(project_id, op)
-            acted = True
         for op_type in (OperationType.AGENT_DISPATCH, OperationType.VERIFICATION_COMMAND):
             for op in self.operations.unfinished(op_type, project_id=project_id):
                 # The side effect (an agent session / a verification process)
-                # died with the harness; its worktree effects are handled by
+                # died with the harness; its worktree effects were handled by
                 # the dirty-state step, so the operation is closed as
                 # interrupted rather than guessed at.
                 self.operations.record_result(
@@ -194,10 +196,8 @@ class RecoveryManager:
                     OperationStatus.INTERRUPTED,
                     {"reason": "harness crashed while operation was in flight"},
                 )
-                if op_type == OperationType.VERIFICATION_COMMAND:
-                    interrupted_verifications += 1
                 acted = True
-        return acted, interrupted_verifications
+        return acted
 
     def _reconcile_git_commit(self, project_id: int, op: sqlite3.Row) -> None:
         """A GIT_COMMIT intent has no result: did the commit happen?

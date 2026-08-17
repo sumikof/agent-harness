@@ -214,6 +214,36 @@ def test_dirty_tree_from_interrupted_verification_is_recovered(world):
     assert len(diffs) == 1 and "mutated by verification" in diffs[0].read_text()
 
 
+def test_recovery_crash_before_reset_keeps_verification_evidence(world, monkeypatch):
+    """If recovery itself dies after touching the DB but before the tree
+    reset, the in-flight verification intent must still be PENDING at the
+    next startup — otherwise the dirty tree becomes 'unexplained'."""
+    world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND,
+        {"commands": ["make test"], "label": "final"},
+        project_id=world.pid,
+    )
+    (world.git.path / "hello.txt").write_text("mutated by verification command\n")
+
+    original_discard = world.checkpoint.discard_working_tree
+
+    def crashing_discard():
+        raise RuntimeError("recovery dies mid-reset")
+
+    monkeypatch.setattr(world.checkpoint, "discard_working_tree", crashing_discard)
+    with pytest.raises(RuntimeError):
+        world.recovery.recover(world.projects.get(world.pid))
+
+    # evidence survived the crashed recovery
+    assert len(world.operations.unfinished(OperationType.VERIFICATION_COMMAND)) == 1
+    assert world.git.is_dirty()
+
+    monkeypatch.setattr(world.checkpoint, "discard_working_tree", original_discard)
+    world.recovery.recover(world.projects.get(world.pid))  # next startup succeeds
+    assert not world.git.is_dirty()
+    assert world.operations.unfinished() == []
+
+
 def test_recovery_never_settles_another_projects_journal(world):
     """A workspace can hold several projects; recovering project A must not
     destroy project B's pending crash evidence."""
