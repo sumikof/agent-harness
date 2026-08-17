@@ -134,6 +134,23 @@ class OperationRepository:
                     payload={"status": status.value, **(result or {})},
                 )
 
+    def annotate(self, operation_id: str, fields: dict) -> None:
+        """Durably merge fields into a pending intent's payload.
+
+        Used for recovery bookkeeping (e.g. updating the diff hash a
+        side-effecting operation is known to have produced so far), so the
+        evidence rules can verify tree states across crashes.
+        """
+        row = self.get(operation_id)
+        if row is None:
+            raise ValueError(f"unknown operation_id {operation_id}")
+        payload = json.loads(row["payload"] or "{}")
+        payload.update(fields)
+        self.db.execute(
+            "UPDATE operations SET payload = ? WHERE operation_id = ?",
+            (json.dumps(payload, ensure_ascii=False), operation_id),
+        )
+
     def get(self, operation_id: str) -> sqlite3.Row | None:
         return self.db.query_one(
             "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)

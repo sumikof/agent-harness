@@ -407,6 +407,53 @@ def test_evidence_hashing_leaves_user_index_untouched(world):
     assert "?? user-notes.txt" in status  # still untracked, not intent-to-add
 
 
+def test_verification_side_effects_stay_recoverable_per_step(world, tmp_path):
+    """Verification commands that mutate the tree refresh the intent's
+    recorded diff hash after every command, so a crash between commands
+    (or after the last one, before the result) is still settled by
+    recovery instead of refused."""
+    from harness.config import VerificationConfig
+    from harness.verification.runner import VerificationRunner
+
+    verifier = VerificationRunner(
+        VerificationConfig(language="none",
+                           commands=["sh -c 'echo generated > generated.txt'"]),
+        world.git.path, tmp_path / "logs",
+    )
+    op_id = world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND,
+        {"commands": verifier.commands(), "label": "final",
+         "base_diff_sha256": diff_hash(world)},
+        project_id=world.pid,
+    )
+    verifier.run(label="final", on_step=lambda: world.operations.annotate(
+        op_id, {"base_diff_sha256": diff_hash(world)}))
+    # crash here: command ran (tree mutated), result never recorded
+
+    acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
+
+    assert acted
+    assert not world.git.is_dirty()
+    assert not (world.git.path / "generated.txt").exists()
+    assert world.operations.get(op_id)["status"] == "INTERRUPTED"
+
+
+def test_unborn_repo_readonly_diff_handles_untracked_directories(tmp_path):
+    """An unborn repository with an untracked directory must survive the
+    read-only diff round trip: no exception, index restored."""
+    from harness.git.repository import GitRepository
+
+    git = GitRepository(tmp_path / "unborn")
+    git.init()
+    (git.path / "pkg").mkdir()
+    (git.path / "pkg" / "mod.py").write_text("x = 1\n")
+
+    diff = git.dirty_diff_readonly()  # must not raise
+
+    assert "mod.py" in diff
+    assert set(git.untracked_paths()) == {"pkg/"}  # back to untracked
+
+
 def test_readonly_diff_restores_index_for_awkward_paths(world):
     """Untracked names with spaces or non-ASCII characters (quoted in
     porcelain v1 output) must survive the read-only diff round trip as

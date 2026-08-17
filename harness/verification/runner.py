@@ -38,12 +38,21 @@ class VerificationRunner:
             return node.default_commands(self.repo_path)
         return []
 
-    def run(self, label: str = "verify") -> VerificationResult:
+    def run(self, label: str = "verify", on_step=None) -> VerificationResult:
+        """Run the configured commands; success == every exit code 0.
+
+        `on_step` (if given) is called after each completed command — the
+        orchestrator uses it to durably record the worktree state the
+        commands have produced so far, keeping mid-verification crashes
+        recoverable at command granularity.
+        """
         steps: list[VerificationStep] = []
         passed = True
         for index, command in enumerate(self.commands()):
             step = self._run_command(command, f"{label}-{index}")
             steps.append(step)
+            if on_step is not None:
+                on_step()
             if step.exit_code != 0:
                 passed = False
                 break  # fail fast; later steps depend on earlier ones

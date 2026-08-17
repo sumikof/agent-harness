@@ -259,7 +259,15 @@ class TaskRunner:
                  "base_diff_sha256": self._diff_hash()},
                 project_id=project_id, task_id=task_id, attempt_id=attempt_id,
             )
-        verification = self.verifier.run(label=f"{task_key}-a{attempt_id}")
+        verification = self.verifier.run(
+            label=f"{task_key}-a{attempt_id}",
+            # After each command the intent's known tree state is refreshed,
+            # so a crash mid-verification stays recoverable at command
+            # granularity even when commands mutate the tree.
+            on_step=(lambda: self.operations.annotate(
+                verify_op_id, {"base_diff_sha256": self._diff_hash()}))
+            if verify_op_id else None,
+        )
         if self.operations and verify_op_id:
             self.operations.record_result(
                 verify_op_id, OperationStatus.COMPLETED,

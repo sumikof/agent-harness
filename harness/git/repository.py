@@ -120,8 +120,11 @@ class GitRepository:
         if newly_untracked:
             if self.head_commit():
                 self._run("reset", "-q", "--", *newly_untracked)
-            else:  # unborn HEAD: drop the ita index entries directly
-                self._run("rm", "--cached", "-q", "--", *newly_untracked)
+            else:
+                # Unborn HEAD: drop the ita index entries directly. Porcelain
+                # may report whole directories ('?? dir/'), so removal must
+                # be recursive.
+                self._run("rm", "--cached", "-r", "-q", "--", *newly_untracked)
         return diff
 
     def snapshot_dirty(self) -> str:

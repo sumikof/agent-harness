@@ -319,7 +319,13 @@ class ProjectOrchestrator:
              "base_diff_sha256": self.task_runner._diff_hash()},
             project_id=project_id,
         )
-        result = self.verifier.run(label="final")
+        result = self.verifier.run(
+            label="final",
+            # Command-granular recovery: the intent always knows the latest
+            # tree state the final verification has produced.
+            on_step=lambda: self.operations.annotate(
+                verify_op_id, {"base_diff_sha256": self.task_runner._diff_hash()}),
+        )
         # Artifact first (an idempotent filesystem write), then result AND
         # final project state/events in ONE transaction: either the run is
         # fully judged — operation settled and project COMPLETED/FAILED — or

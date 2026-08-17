@@ -300,10 +300,8 @@ class RecoveryManager:
             payload = json.loads(op["payload"] or "{}")
             if payload.get("settle_diff_sha256") == current_diff_hash:
                 continue
-            payload["settle_diff_sha256"] = current_diff_hash
-            self.operations.db.execute(
-                "UPDATE operations SET payload = ? WHERE operation_id = ?",
-                (json.dumps(payload, ensure_ascii=False), op["operation_id"]),
+            self.operations.annotate(
+                op["operation_id"], {"settle_diff_sha256": current_diff_hash}
             )
 
     def _close_interrupted_operations(self, project_id: int) -> bool:
