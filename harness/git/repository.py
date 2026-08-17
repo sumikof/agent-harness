@@ -6,24 +6,45 @@ lifecycle commands by the security hooks.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import os
+import shutil
+import stat
 import subprocess
-from pathlib import Path
+import tarfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 
 
 class GitError(Exception):
     pass
 
 
+@dataclass
+class WorktreeSnapshot:
+    """Byte-exact capture of every uncommitted change: the actual on-disk
+    files (tarred, untouched by git clean filters) plus the deletions.
+    Restorable via GitRepository.restore_worktree_state()."""
+
+    tar_bytes: bytes
+    deleted: list[str] = field(default_factory=list)
+    state_hash: str = ""
+
+
 class GitRepository:
     def __init__(self, path: str | Path):
         self.path = Path(path)
 
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(
+        self, *args: str, check: bool = True, input_text: str | None = None
+    ) -> subprocess.CompletedProcess:
         result = subprocess.run(
             ["git", *args],
             cwd=str(self.path),
             capture_output=True,
             text=True,
+            input=input_text,
         )
         if check and result.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
@@ -82,6 +103,252 @@ class GitRepository:
             return self._run("diff", "--no-color", "HEAD").stdout
         return self._run("diff", "--no-color").stdout
 
+    def untracked_paths(self) -> list[str]:
+        """Untracked paths, parsed from NUL-separated porcelain output so
+        names with spaces, quotes, or non-ASCII characters survive intact."""
+        out = self._run("status", "--porcelain", "-z").stdout
+        fields = out.split("\0")
+        untracked: list[str] = []
+        index = 0
+        while index < len(fields):
+            entry = fields[index]
+            if not entry:
+                index += 1
+                continue
+            status = entry[:2]
+            if status == "??":
+                untracked.append(entry[3:])
+            # Rename/copy entries carry the source path as an extra field.
+            if "R" in status or "C" in status:
+                index += 2
+            else:
+                index += 1
+        return untracked
+
+    def dirty_diff_readonly(self) -> str:
+        return self.dirty_diff_readonly_bytes().decode("utf-8", errors="replace")
+
+    def dirty_diff_readonly_bytes(self) -> bytes:
+        """snapshot_dirty_bytes() that leaves the index as it found it.
+
+        Read-only inspection (e.g. recovery deciding whether a tree may be
+        reset) must not convert the user's untracked files into
+        intent-to-add entries; the ita entries created for the diff are
+        removed again afterwards. Raw bytes, filter-free — the SAME basis
+        as the archived snapshot, so evidence hashes always compare like
+        with like regardless of file encodings.
+        """
+        newly_untracked = self.untracked_paths()
+        diff = self.snapshot_dirty_bytes()
+        if newly_untracked:
+            if self.head_commit():
+                self._run("reset", "-q", "--", *newly_untracked)
+            else:
+                # Unborn HEAD: drop the ita index entries directly. Porcelain
+                # may report whole directories ('?? dir/'), so removal must
+                # be recursive.
+                self._run("rm", "--cached", "-r", "-q", "--", *newly_untracked)
+        return diff
+
+    def changed_paths(self) -> list[str]:
+        """Every path with uncommitted changes (untracked included), parsed
+        NUL-safely. Directories may appear as 'dir/' entries; rename/copy
+        entries contribute both sides."""
+        out = self._run("status", "--porcelain", "-z").stdout
+        fields = out.split("\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(fields):
+            entry = fields[index]
+            if not entry:
+                index += 1
+                continue
+            status = entry[:2]
+            paths.append(entry[3:])
+            if "R" in status or "C" in status:
+                index += 1
+                if index < len(fields) and fields[index]:
+                    paths.append(fields[index])  # rename/copy source
+            index += 1
+        return paths
+
+    def expanded_changed_files(self) -> list[str]:
+        """changed_paths() with untracked directories expanded to files.
+
+        Symlinks to directories inside an untracked tree appear in
+        os.walk()'s dirs list (never descended, followlinks=False) — they
+        are entries in their own right and must not be dropped.
+        """
+        files: set[str] = set()
+        for rel in self.changed_paths():
+            full = self.path / rel
+            if full.is_dir() and not full.is_symlink():
+                for root, dirs, names in os.walk(full):
+                    for name in names:
+                        files.add(str((Path(root) / name).relative_to(self.path)))
+                    for name in dirs:
+                        candidate = Path(root) / name
+                        if candidate.is_symlink():
+                            files.add(str(candidate.relative_to(self.path)))
+            else:
+                files.add(rel.rstrip("/"))
+        return sorted(files)
+
+    def dirty_state_hash(self) -> str:
+        """Fingerprint of the ACTUAL uncommitted worktree state.
+
+        Computed from the real on-disk bytes of every changed path (plus
+        deletion markers), never from git diff output — clean filters,
+        textconv, and encodings cannot distort it. This is the single basis
+        for all recovery evidence hashes.
+        """
+        digest = hashlib.sha256()
+        for rel in self.expanded_changed_files():
+            full = self.path / rel
+            digest.update(rel.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            if full.is_symlink():
+                digest.update(b"L")
+                digest.update(os.readlink(full).encode("utf-8", "surrogateescape"))
+            elif full.is_file():
+                # Git tracks the executable bit — a mode-only change is a
+                # real state difference and must not hash alike.
+                executable = bool(full.stat().st_mode & 0o100)
+                digest.update(b"X" if executable else b"F")
+                digest.update(full.read_bytes())
+            else:
+                try:
+                    node = os.lstat(full)
+                except (FileNotFoundError, NotADirectoryError):
+                    digest.update(b"D")  # genuinely deleted / missing
+                else:
+                    # A special node (FIFO, socket, device) at the path is a
+                    # different state than a deletion — never hash alike, or
+                    # stale evidence could get a user's node reset away. The
+                    # fingerprint covers type, permissions, and node identity
+                    # (inode/device/mtime), so replacing or chmod-ing the
+                    # node changes the hash.
+                    digest.update(b"N")
+                    for value in (node.st_mode, node.st_ino, node.st_dev,
+                                  node.st_mtime_ns):
+                        digest.update(int(value).to_bytes(16, "little", signed=False))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def snapshot_worktree_state(self) -> WorktreeSnapshot:
+        """Byte-exact snapshot of all uncommitted changes (files + deletions),
+        taken from the filesystem directly — no git filters involved."""
+        files = self.expanded_changed_files()
+        deleted: list[str] = []
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            for rel in files:
+                full = self.path / rel
+                if full.is_symlink() or full.is_file():
+                    tar.add(full, arcname=rel, recursive=False)
+                    continue
+                try:
+                    node = os.lstat(full)
+                except (FileNotFoundError, NotADirectoryError):
+                    deleted.append(rel)
+                    continue
+                if stat.S_ISFIFO(node.st_mode):
+                    tar.add(full, arcname=rel, recursive=False)  # tar supports FIFOs
+                else:
+                    # Sockets/devices cannot be captured faithfully — fail
+                    # loudly instead of recording them as deletions and
+                    # silently dropping them on restore.
+                    raise GitError(
+                        f"cannot snapshot special node at {rel}; "
+                        "unsupported worktree state"
+                    )
+        return WorktreeSnapshot(
+            tar_bytes=buffer.getvalue(), deleted=deleted,
+            state_hash=self.dirty_state_hash(),
+        )
+
+    def restore_worktree_state(self, snapshot: WorktreeSnapshot) -> None:
+        """reset to HEAD, then re-apply a snapshot byte-exactly."""
+        self.reset_hard("HEAD")
+        if snapshot.tar_bytes:
+            with tarfile.open(fileobj=io.BytesIO(snapshot.tar_bytes)) as tar:
+                # The snapshot may replace a HEAD file with a directory (or
+                # vice versa); clear conflicting HEAD paths before extracting.
+                for member in tar.getmembers():
+                    self._clear_conflicting_paths(member.name)
+                try:
+                    # 'tar' (not 'data'): the members are self-authored
+                    # relative paths, and 'data' refuses FIFO members.
+                    tar.extractall(self.path, filter="tar")
+                except TypeError:  # Python without the filter parameter
+                    tar.extractall(self.path)
+        for rel in snapshot.deleted:
+            full = self.path / rel
+            if full.is_file() or full.is_symlink():
+                full.unlink()
+
+    def _clear_conflicting_paths(self, rel: str) -> None:
+        """Remove HEAD paths that block extracting `rel` as a file: an
+        ancestor that exists as a file, or the target existing as a dir."""
+        parts = PurePosixPath(rel).parts
+        for depth in range(1, len(parts)):
+            ancestor = self.path.joinpath(*parts[:depth])
+            if ancestor.is_symlink() or ancestor.is_file():
+                ancestor.unlink()
+        target = self.path / rel
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.is_symlink() or target.exists():
+            # A plain file blocking a FIFO member (etc.) — clear it so the
+            # extraction can recreate the node type from the snapshot.
+            target.unlink()
+
+    def snapshot_dirty(self) -> str:
+        """Binary-safe patch of everything uncommitted (incl. untracked).
+
+        Round-trippable via apply_patch(): reset_hard() + apply_patch()
+        restores the worktree to exactly this state. Repository-configured
+        diff transformations (textconv drivers, external diff) are disabled
+        — their output is presentation-only and NOT re-applicable, which
+        would silently corrupt the archive.
+        """
+        return self.snapshot_dirty_bytes().decode("utf-8", errors="replace")
+
+    def snapshot_dirty_bytes(self) -> bytes:
+        """snapshot_dirty() as raw bytes.
+
+        Diff content is arbitrary bytes (files need not be UTF-8); the
+        recovery archive must preserve them exactly, so patches are
+        captured, stored, and re-applied without any text decoding.
+        """
+        self._run("add", "-A", "-N", check=False)  # intent-to-add so untracked shows
+        args = ["diff", "--binary", "--no-color", "--no-textconv", "--no-ext-diff"]
+        if self.head_commit():
+            args.append("HEAD")
+        result = subprocess.run(
+            ["git", *args], cwd=str(self.path), capture_output=True
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git {' '.join(args)} failed: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        return result.stdout
+
+    def apply_patch(self, patch: str) -> None:
+        self.apply_patch_bytes(patch.encode("utf-8"))
+
+    def apply_patch_bytes(self, patch: bytes) -> None:
+        result = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn"],
+            cwd=str(self.path), capture_output=True, input=patch,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                "git apply failed: "
+                f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+            )
+
     def changed_files(self) -> list[str]:
         out = self._run("status", "--porcelain").stdout
         files = []
@@ -93,7 +360,12 @@ class GitRepository:
     def add_all(self) -> None:
         self._run("add", "-A")
 
-    def commit(self, message: str, allow_empty: bool = False) -> str:
+    def commit(
+        self, message: str, allow_empty: bool = False, trailers: dict[str, str] | None = None
+    ) -> str:
+        if trailers:
+            trailer_block = "\n".join(f"{key}: {value}" for key, value in trailers.items())
+            message = f"{message}\n\n{trailer_block}"
         args = [
             "-c", "user.name=agent-harness",
             "-c", "user.email=agent-harness@localhost",
@@ -103,6 +375,29 @@ class GitRepository:
             args.append("--allow-empty")
         self._run(*args)
         return self.head_commit() or ""
+
+    def find_commit_by_trailer(self, key: str, value: str, limit: int = 500) -> str | None:
+        """Find a recent commit whose message carries `key: value`.
+
+        Used by crash recovery to decide whether a journaled GIT_COMMIT
+        intent was already executed before the process died.
+        """
+        result = self._run(
+            "log", f"-{limit}", "--fixed-strings", f"--grep={key}: {value}",
+            "--format=%H", check=False,
+        )
+        if result.returncode != 0:
+            return None
+        commits = result.stdout.split()
+        return commits[0] if commits else None
+
+    def commit_message(self, ref: str) -> str:
+        result = self._run("log", "-1", "--format=%B", ref, check=False)
+        return result.stdout if result.returncode == 0 else ""
+
+    def commit_exists(self, ref: str) -> bool:
+        result = self._run("cat-file", "-e", f"{ref}^{{commit}}", check=False)
+        return result.returncode == 0
 
     def reset_hard(self, ref: str = "HEAD") -> None:
         # `clean -fd` deliberately leaves ignored files alone: build caches

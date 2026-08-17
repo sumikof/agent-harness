@@ -41,6 +41,18 @@ limits:
   max_turns: 60            # per agent session
   max_agent_runs_per_task: 25
   max_execution_seconds: 172800   # whole-project wall clock (2 days)
+  agent_run_timeout_seconds: 3600 # one agent session (cooperative cancellation)
+  # Outputs larger than this are spilled to an artifact file; agent context
+  # receives a bounded head/tail preview plus the artifact locator.
+  max_inline_output_chars: 30000
+
+# Loop detection for identical repeated tool calls (only enforced on
+# providers that support a pre-tool hook).
+repeat_guard:
+  enabled: true
+  warn_after: 3            # consecutive identical calls -> warning event
+  abort_after: 5           # consecutive identical calls -> deny + LOOP_DETECTED
+  exempt_tools: []         # tools whose repetition is legitimate (e.g. polling)
 
 logging:
   level: INFO

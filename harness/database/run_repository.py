@@ -7,6 +7,11 @@ import sqlite3
 
 from .connection import Database, utcnow
 
+# evaluations.verdict values recorded by the harness itself (deterministic
+# verification evidence), alongside the Reviewer's PASS/REPAIR/REPLAN.
+VERIFY_PASS = "VERIFY_PASS"
+VERIFY_FAIL = "VERIFY_FAIL"
+
 
 class RunRepository:
     def __init__(self, db: Database):
@@ -18,13 +23,39 @@ class RunRepository:
         role: str,
         attempt_id: int | None = None,
         input_artifact: str | None = None,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        profile_hash: str | None = None,
+        profile_version: str | None = None,
+        context_manifest_path: str | None = None,
+        context_manifest_hash: str | None = None,
+        resolved_spec: dict | None = None,
+        dispatch_operation_id: str | None = None,
     ) -> int:
         cur = self.db.execute(
             """
-            INSERT INTO agent_runs (attempt_id, project_id, role, status, input_artifact, started_at)
-            VALUES (?, ?, ?, 'RUNNING', ?, ?)
+            INSERT INTO agent_runs (attempt_id, project_id, role, status, input_artifact,
+                                    started_at, provider, model, profile_hash, profile_version,
+                                    context_manifest_path, context_manifest_hash,
+                                    resolved_spec, dispatch_operation_id)
+            VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (attempt_id, project_id, role, input_artifact, utcnow()),
+            (
+                attempt_id,
+                project_id,
+                role,
+                input_artifact,
+                utcnow(),
+                provider,
+                model,
+                profile_hash,
+                profile_version,
+                context_manifest_path,
+                context_manifest_hash,
+                json.dumps(resolved_spec, ensure_ascii=False) if resolved_spec else None,
+                dispatch_operation_id,
+            ),
         )
         return cur.lastrowid
 
@@ -57,6 +88,30 @@ class RunRepository:
             ),
         )
 
+    def get(self, run_id: int) -> sqlite3.Row | None:
+        return self.db.query_one("SELECT * FROM agent_runs WHERE id = ?", (run_id,))
+
+    def running_runs(self, project_id: int | None = None) -> list[sqlite3.Row]:
+        if project_id is None:
+            return self.db.query_all("SELECT * FROM agent_runs WHERE status = 'RUNNING'")
+        return self.db.query_all(
+            "SELECT * FROM agent_runs WHERE status = 'RUNNING' AND project_id = ?",
+            (project_id,),
+        )
+
+    def interrupt_running(self, project_id: int | None = None) -> list[int]:
+        """Close RUNNING run rows left behind by a crash. Returns their ids.
+
+        Recovery passes None: the workspace lock guarantees no other live
+        process, so ANY remaining RUNNING row — regardless of project — is a
+        crash leftover, and leaving it would block the workspace-wide
+        max-1-agent slot for every project sharing the DB.
+        """
+        rows = self.running_runs(project_id)
+        for row in rows:
+            self.finish_run(row["id"], "INTERRUPTED", error="interrupted (recovered at startup)")
+        return [row["id"] for row in rows]
+
     def count_runs_for_task(self, task_id: int) -> int:
         row = self.db.query_one(
             """
@@ -79,6 +134,13 @@ class RunRepository:
             (attempt_id, verdict, score, json.dumps(result, ensure_ascii=False), utcnow()),
         )
         return cur.lastrowid
+
+    def has_evaluation(self, attempt_id: int, verdict: str) -> bool:
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM evaluations WHERE attempt_id = ? AND verdict = ?",
+            (attempt_id, verdict),
+        )
+        return row["n"] > 0
 
     def list_runs_for_attempt(self, attempt_id: int) -> list[sqlite3.Row]:
         return self.db.query_all(

@@ -7,6 +7,7 @@ import sqlite3
 
 from ..orchestrator.state_machine import AttemptState, TaskState, assert_task_transition
 from .connection import Database, utcnow
+from .event_repository import EventRepository, EventType
 
 # Sequence numbers are spaced so tasks can be inserted between existing ones
 # (10, 20, 30 ... then 25 for an inserted T00XA).
@@ -14,8 +15,12 @@ SEQUENCE_STEP = 10
 
 
 class TaskRepository:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, events: EventRepository | None = None):
         self.db = db
+        # When wired (the orchestrator always does), every state change is
+        # appended to the event ledger inside the same transaction as the
+        # UPDATE, so state and history can never diverge on a crash.
+        self.events = events
 
     # -- tasks -------------------------------------------------------------
 
@@ -108,10 +113,18 @@ class TaskRepository:
             raise ValueError(f"unknown task id {task_id}")
         if not force:
             assert_task_transition(TaskState(row["status"]), status)
-        self.db.execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (status.value, utcnow(), task_id),
-        )
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, utcnow(), task_id),
+            )
+            if self.events:
+                self.events.emit(
+                    EventType.TASK_STATE_CHANGED,
+                    project_id=row["project_id"],
+                    task_id=task_id,
+                    payload={"from": row["status"], "to": status.value, "forced": force},
+                )
 
     def update_definition(
         self,
@@ -154,28 +167,50 @@ class TaskRepository:
     # -- attempts ----------------------------------------------------------
 
     def start_attempt(self, task_id: int, base_commit: str | None) -> int:
+        task_row = self.get(task_id)
         row = self.db.query_one(
             "SELECT MAX(attempt_no) AS max_no FROM task_attempts WHERE task_id = ?", (task_id,)
         )
         attempt_no = (row["max_no"] or 0) + 1
-        cur = self.db.execute(
-            """
-            INSERT INTO task_attempts (task_id, attempt_no, status, base_commit, started_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (task_id, attempt_no, AttemptState.RUNNING.value, base_commit, utcnow()),
-        )
-        self.db.execute(
-            "UPDATE tasks SET attempt_count = ?, updated_at = ? WHERE id = ?",
-            (attempt_no, utcnow(), task_id),
-        )
-        return cur.lastrowid
+        with self.db.transaction():
+            cur = self.db.execute(
+                """
+                INSERT INTO task_attempts (task_id, attempt_no, status, base_commit, started_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (task_id, attempt_no, AttemptState.RUNNING.value, base_commit, utcnow()),
+            )
+            attempt_id = cur.lastrowid
+            self.db.execute(
+                "UPDATE tasks SET attempt_count = ?, updated_at = ? WHERE id = ?",
+                (attempt_no, utcnow(), task_id),
+            )
+            if self.events:
+                self.events.emit(
+                    EventType.ATTEMPT_STARTED,
+                    project_id=task_row["project_id"] if task_row else None,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    payload={"attempt_no": attempt_no, "base_commit": base_commit},
+                )
+        return attempt_id
 
     def finish_attempt(self, attempt_id: int, status: AttemptState) -> None:
-        self.db.execute(
-            "UPDATE task_attempts SET status = ?, finished_at = ? WHERE id = ?",
-            (status.value, utcnow(), attempt_id),
-        )
+        attempt = self.get_attempt(attempt_id)
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE task_attempts SET status = ?, finished_at = ? WHERE id = ?",
+                (status.value, utcnow(), attempt_id),
+            )
+            if self.events and attempt is not None:
+                task_row = self.get(attempt["task_id"])
+                self.events.emit(
+                    EventType.ATTEMPT_FINISHED,
+                    project_id=task_row["project_id"] if task_row else None,
+                    task_id=attempt["task_id"],
+                    attempt_id=attempt_id,
+                    payload={"status": status.value},
+                )
 
     def get_attempt(self, attempt_id: int) -> sqlite3.Row | None:
         return self.db.query_one("SELECT * FROM task_attempts WHERE id = ?", (attempt_id,))

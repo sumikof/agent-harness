@@ -17,16 +17,23 @@ from ..config import HarnessConfig
 from ..context.builder import ContextBuilder, render_plan_for_replan
 from ..context.project_context import DEFAULT_FORBIDDEN_OPERATIONS, ProjectContext
 from ..database.connection import Database
-from ..database.event_repository import EventRepository
+from ..database.event_repository import EventRepository, EventType
+from ..database.operation_repository import (
+    OperationRepository,
+    OperationStatus,
+    OperationType,
+)
 from ..database.project_repository import ProjectRepository
 from ..database.run_repository import RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.repository import GitRepository
 from ..verification.runner import VerificationRunner
-from .agent_invoker import AgentInvoker, AgentRunFailed
+from ..workspace_lock import WorkspaceLock
+from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded, BudgetManager
-from .recovery import RecoveryManager
+from .invariants import InvariantChecker, Severity
+from .recovery import RecoveryIntegrityError, RecoveryManager
 from .state_machine import ProjectState, TaskState
 from .task_runner import TaskOutcome, TaskRunner
 
@@ -41,29 +48,42 @@ class ProjectOrchestrator:
         config.workspace_path.mkdir(parents=True, exist_ok=True)
         config.logs_path.mkdir(parents=True, exist_ok=True)
 
+        # One process per workspace: without this, a second process's
+        # startup recovery would treat the first process's LIVE RUNNING run
+        # as a crash leftover — interrupting it, freeing the max-1-agent
+        # slot, and resetting a tree an agent is still working in.
+        self.lock = WorkspaceLock(config.workspace_path / "harness.lock")
+        self.lock.acquire()
+
         self.db = Database(config.db_path)
-        self.projects = ProjectRepository(self.db)
-        self.tasks = TaskRepository(self.db)
-        self.runs = RunRepository(self.db)
         self.events = EventRepository(self.db)
+        # Repositories share the EventRepository so every state change and
+        # its ledger event are written in one transaction.
+        self.projects = ProjectRepository(self.db, self.events)
+        self.tasks = TaskRepository(self.db, self.events)
+        self.runs = RunRepository(self.db)
+        self.operations = OperationRepository(self.db, self.events)
         self.artifacts = ArtifactManager(config.artifacts_path)
         self.git = GitRepository(config.repository_path)
-        self.checkpoint = CheckpointManager(self.git)
+        self.checkpoint = CheckpointManager(self.git, self.operations)
         self.verifier = VerificationRunner(
             config.verification, config.repository_path, config.logs_path / "verification"
         )
         self.context_builder = ContextBuilder(config.prompts_path)
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(
-            config, self.context_builder, self.artifacts, self.runs, self.events, self.budget
+            config, self.context_builder, self.artifacts, self.runs, self.events,
+            self.budget, self.operations, self.git,
         )
         self.task_runner = TaskRunner(
             config, self.invoker, self.tasks, self.runs, self.events,
-            self.artifacts, self.git, self.checkpoint, self.verifier,
+            self.artifacts, self.git, self.checkpoint, self.verifier, self.operations,
         )
         self.recovery = RecoveryManager(
-            self.tasks, self.events, self.artifacts, self.git, self.checkpoint
+            self.tasks, self.events, self.artifacts, self.git, self.checkpoint,
+            operations=self.operations, runs=self.runs,
         )
+        self.invariants = InvariantChecker(self.db, self.git, config.artifacts_path)
         self._replan_for_new_goal = False
 
     # ------------------------------------------------------------------
@@ -166,9 +186,48 @@ class ProjectOrchestrator:
     # ------------------------------------------------------------------
 
     async def run(self) -> ProjectState:
+        # One ACTIVE project loop per workspace, in-process included: a
+        # concurrent second loop's recovery would reclaim this loop's live
+        # agent run. Raises WorkspaceLocked instead.
+        self.lock.begin_run()
+        try:
+            return await self._run_locked()
+        finally:
+            self.lock.end_run()
+
+    async def _run_locked(self) -> ProjectState:
         project = self.ensure_project()
         project_id = project["id"]
-        self.recovery.recover(project)
+        try:
+            self.recovery.recover(project)
+        except RecoveryIntegrityError as exc:
+            # The state plane itself cannot be trusted; never run on top of it.
+            logger.error("recovery integrity failure: %s", exc)
+            self.projects.set_status(project_id, ProjectState.BLOCKED, force=True)
+            self.events.emit(EventType.PROJECT_BLOCKED, project_id=project_id,
+                             payload={"reason": str(exc)})
+            return ProjectState.BLOCKED
+
+        # Invariant validation after recovery: ERROR-severity violations
+        # block loudly instead of being silently repaired; warnings are
+        # recorded to the ledger.
+        violations = self.invariants.check_all(project_id)
+        errors = [v for v in violations if v.severity == Severity.ERROR]
+        for violation in violations:
+            self.events.emit(
+                EventType.INVARIANT_VIOLATION if violation.severity == Severity.ERROR
+                else EventType.INVARIANT_WARNING,
+                project_id=project_id,
+                payload={"code": violation.code, "message": violation.message},
+            )
+            logger.log(
+                logging.ERROR if violation.severity == Severity.ERROR else logging.WARNING,
+                "invariant %s: %s", violation.code, violation.message,
+            )
+        if errors:
+            self.projects.set_status(project_id, ProjectState.BLOCKED, force=True)
+            return ProjectState.BLOCKED
+
         project = self.projects.get(project_id)
         state = ProjectState(project["status"])
         project_ctx = self.project_context()
@@ -204,6 +263,14 @@ class ProjectOrchestrator:
             self.projects.set_status(project_id, ProjectState.PAUSED, force=True)
             self.events.emit("PROJECT_PAUSED", project_id=project_id, payload={"reason": str(exc)})
             return ProjectState.PAUSED
+        except AgentConfigurationError as exc:
+            # Misconfiguration (missing capability, bad provider) is not
+            # retryable at any layer — fail the project explicitly.
+            logger.error("project failed (configuration): %s", exc)
+            self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+            self.events.emit("PROJECT_FAILED", project_id=project_id,
+                             payload={"reason": f"configuration error: {exc.detail}"})
+            return ProjectState.FAILED
         except AgentRunFailed as exc:
             logger.error("project failed: %s", exc)
             self.projects.set_status(project_id, ProjectState.FAILED, force=True)
@@ -253,16 +320,44 @@ class ProjectOrchestrator:
 
         self.projects.set_status(project_id, ProjectState.FINAL_VERIFICATION, force=True)
         self.events.emit("FINAL_VERIFICATION_STARTED", project_id=project_id)
-        result = self.verifier.run(label="final")
+        # Journaled like every verification: a crash mid-run is visible as an
+        # unfinished VERIFICATION_COMMAND intent at the next startup instead
+        # of a silent re-execution of possibly side-effecting commands.
+        verify_op_id = self.operations.record_intent(
+            OperationType.VERIFICATION_COMMAND,
+            {"commands": self.verifier.commands(), "label": "final",
+             "base_diff_sha256": self.task_runner._diff_hash()},
+            project_id=project_id,
+        )
+        result = self.verifier.run(
+            label="final",
+            # Command-granular recovery: the intent always knows the latest
+            # tree state the final verification has produced.
+            on_step=lambda: self.operations.annotate(
+                verify_op_id, {"base_diff_sha256": self.task_runner._diff_hash()}),
+        )
+        # Artifact first (an idempotent filesystem write), then result AND
+        # final project state/events in ONE transaction: either the run is
+        # fully judged — operation settled and project COMPLETED/FAILED — or
+        # the intent stays PENDING and the restart re-verifies. There is no
+        # window where the operation looks settled but the project still
+        # sits in FINAL_VERIFICATION and re-runs the commands.
         self.artifacts.save_model(self.artifacts.root / "final-verification.json", result)
+        with self.db.transaction():
+            self.operations.record_result(
+                verify_op_id, OperationStatus.COMPLETED,
+                {"passed": result.passed, "exit_codes": [s.exit_code for s in result.steps]},
+            )
+            if result.passed:
+                self.projects.set_status(project_id, ProjectState.COMPLETED)
+                self.events.emit("PROJECT_COMPLETED", project_id=project_id)
+            else:
+                self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+                self.events.emit("PROJECT_FAILED", project_id=project_id,
+                                 payload={"reason": "final verification failed"})
         if result.passed:
-            self.projects.set_status(project_id, ProjectState.COMPLETED)
-            self.events.emit("PROJECT_COMPLETED", project_id=project_id)
             logger.info("project completed")
             return ProjectState.COMPLETED
-        self.projects.set_status(project_id, ProjectState.FAILED, force=True)
-        self.events.emit("PROJECT_FAILED", project_id=project_id,
-                         payload={"reason": "final verification failed"})
         return ProjectState.FAILED
 
     # ------------------------------------------------------------------

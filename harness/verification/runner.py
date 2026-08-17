@@ -7,6 +7,7 @@ checks process exit codes itself. Success == every exit code 0.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import time
 from pathlib import Path
@@ -37,12 +38,21 @@ class VerificationRunner:
             return node.default_commands(self.repo_path)
         return []
 
-    def run(self, label: str = "verify") -> VerificationResult:
+    def run(self, label: str = "verify", on_step=None) -> VerificationResult:
+        """Run the configured commands; success == every exit code 0.
+
+        `on_step` (if given) is called after each completed command — the
+        orchestrator uses it to durably record the worktree state the
+        commands have produced so far, keeping mid-verification crashes
+        recoverable at command granularity.
+        """
         steps: list[VerificationStep] = []
         passed = True
         for index, command in enumerate(self.commands()):
             step = self._run_command(command, f"{label}-{index}")
             steps.append(step)
+            if on_step is not None:
+                on_step()
             if step.exit_code != 0:
                 passed = False
                 break  # fail fast; later steps depend on earlier ones
@@ -66,6 +76,8 @@ class VerificationRunner:
             exit_code = -1
             output = f"TIMEOUT after {self.config.timeout_seconds}s\n{exc.stdout or ''}\n{exc.stderr or ''}"
         duration = time.monotonic() - started
+        # Full output is always retained on disk; only a bounded tail (plus
+        # hash + size for integrity/locating) travels into agent context.
         log_file.write_text(f"$ {command}\nexit: {exit_code}\n\n{output}", encoding="utf-8")
         return VerificationStep(
             command=command,
@@ -73,4 +85,6 @@ class VerificationRunner:
             duration_seconds=round(duration, 2),
             log_file=str(log_file),
             tail=output[-TAIL_CHARS:],
+            output_sha256=hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            output_bytes=len(output.encode("utf-8")),
         )

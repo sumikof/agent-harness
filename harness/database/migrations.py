@@ -87,22 +87,98 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
     """,
+    # 2: durable event ledger (streams + contiguous seq), operation
+    #    intent/result journal, and agent-run provenance columns.
+    #    All new columns are nullable so a v1 workspace keeps working.
+    """
+    ALTER TABLE events ADD COLUMN agent_run_id INTEGER REFERENCES agent_runs(id);
+    ALTER TABLE events ADD COLUMN stream_type TEXT;
+    ALTER TABLE events ADD COLUMN stream_id INTEGER;
+    ALTER TABLE events ADD COLUMN seq INTEGER;
+    ALTER TABLE events ADD COLUMN operation_id TEXT;
+    ALTER TABLE events ADD COLUMN correlation_id TEXT;
+    ALTER TABLE events ADD COLUMN causation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_events_stream_seq
+        ON events(stream_type, stream_id, seq) WHERE seq IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_id TEXT NOT NULL UNIQUE,
+        operation_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        project_id INTEGER REFERENCES projects(id),
+        task_id INTEGER REFERENCES tasks(id),
+        attempt_id INTEGER REFERENCES task_attempts(id),
+        agent_run_id INTEGER REFERENCES agent_runs(id),
+        payload TEXT NOT NULL DEFAULT '{}',
+        result TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_operations_pending
+        ON operations(status, operation_type);
+
+    ALTER TABLE agent_runs ADD COLUMN provider TEXT;
+    ALTER TABLE agent_runs ADD COLUMN model TEXT;
+    ALTER TABLE agent_runs ADD COLUMN profile_hash TEXT;
+    ALTER TABLE agent_runs ADD COLUMN profile_version TEXT;
+    ALTER TABLE agent_runs ADD COLUMN context_manifest_path TEXT;
+    ALTER TABLE agent_runs ADD COLUMN context_manifest_hash TEXT;
+    ALTER TABLE agent_runs ADD COLUMN resolved_spec TEXT;
+    ALTER TABLE agent_runs ADD COLUMN dispatch_operation_id TEXT;
+    """,
+    # 3: enforce the max-1-RUNNING-agent invariant at the DB level, so two
+    #    concurrent harness processes cannot both create a RUNNING row.
+    #    Stale RUNNING rows (crash leftovers) are closed first — the index
+    #    could not be created over more than one of them.
+    """
+    UPDATE agent_runs
+        SET status = 'INTERRUPTED',
+            error = COALESCE(error, 'closed by migration v3 (stale RUNNING row)')
+        WHERE status = 'RUNNING';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_single_running
+        ON agent_runs(status) WHERE status = 'RUNNING'
+    """,
 ]
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-    )
-    applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+    """Apply pending migrations, each one atomically.
+
+    A migration's statements and its schema_migrations record are committed
+    in ONE explicit transaction, so a crash mid-migration leaves the file at
+    the previous version instead of half-ALTERed (which would make a
+    non-idempotent ADD COLUMN fail forever on the next start).
+
+    Migration scripts are split on ';' — they must not contain literal
+    semicolons inside string values.
+    """
     from .connection import utcnow
 
-    for version, sql in enumerate(MIGRATIONS, start=1):
-        if version in applied:
-            continue
-        conn.executescript(sql)
+    # Python's sqlite3 legacy transaction handling autocommits DDL, which
+    # would break atomicity — take explicit control for the whole pass.
+    old_isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-            (version, utcnow()),
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-    conn.commit()
+        applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+        for version, sql in enumerate(MIGRATIONS, start=1):
+            if version in applied:
+                continue
+            statements = [part.strip() for part in sql.split(";") if part.strip()]
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                    (version, utcnow()),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+    finally:
+        conn.isolation_level = old_isolation

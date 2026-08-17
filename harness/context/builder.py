@@ -7,6 +7,7 @@ selecting only what the role needs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,39 @@ class ContextBuilder:
         path = self.prompts_dir / prompt_file
         return path.read_text(encoding="utf-8")
 
+    def prompt_template_hash(self, prompt_file: str) -> str:
+        return hashlib.sha256(self.system_prompt(prompt_file).encode("utf-8")).hexdigest()
+
+    def build_sections(
+        self,
+        role: Role,
+        project: ProjectContext,
+        task: Optional[TaskContext] = None,
+        attempt: Optional[AttemptContext] = None,
+        extra: str = "",
+    ) -> list[tuple[str, str]]:
+        """The named context sections one session receives, in prompt order.
+
+        Named so each section can be persisted individually in the
+        ContextManifest; build_prompt() joins exactly these texts.
+        """
+        sections: list[tuple[str, str]] = [("project_context", project.render())]
+
+        if task is not None:
+            # The Analyst produces the brief, so it doesn't receive one;
+            # the Reviewer judges the diff on its own terms but needs all artifacts.
+            include_brief = role != Role.ANALYST
+            sections.append(("task_context", task.render(include_brief=include_brief)))
+
+        if attempt is not None and attempt.has_content():
+            sections.append(("attempt_context", attempt.render()))
+
+        if extra:
+            sections.append(("extra_context", extra))
+
+        sections.append(("assignment", self._task_instruction(role)))
+        return sections
+
     def build_prompt(
         self,
         role: Role,
@@ -34,22 +68,9 @@ class ContextBuilder:
         extra: str = "",
     ) -> str:
         """Assemble Project + Task + (needed) Attempt context for one session."""
-        sections = [project.render()]
-
-        if task is not None:
-            # The Analyst produces the brief, so it doesn't receive one;
-            # the Reviewer judges the diff on its own terms but needs all artifacts.
-            include_brief = role != Role.ANALYST
-            sections.append(task.render(include_brief=include_brief))
-
-        if attempt is not None and attempt.has_content():
-            sections.append(attempt.render())
-
-        if extra:
-            sections.append(extra)
-
-        sections.append(self._task_instruction(role))
-        return "\n\n".join(sections)
+        return "\n\n".join(
+            text for _, text in self.build_sections(role, project, task, attempt, extra)
+        )
 
     def _task_instruction(self, role: Role) -> str:
         instructions = {

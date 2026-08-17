@@ -52,6 +52,24 @@ class LimitsConfig(BaseModel):
     max_turns: int = 60
     max_agent_runs_per_task: int = 25
     max_execution_seconds: int = 172800
+    # One agent session (distinct from provider request / verification /
+    # tool-call timeouts, which are configured where they apply).
+    agent_run_timeout_seconds: int = 3600
+    # Outputs larger than this are spilled to an artifact file and only a
+    # bounded preview enters agent context.
+    max_inline_output_chars: int = 30000
+
+
+class RepeatGuardSettings(BaseModel):
+    """Repeat Action Guard (loop detection); enforced only on providers
+    that support a pre-tool hook."""
+
+    enabled: bool = True
+    warn_after: int = 3
+    abort_after: int = 5
+    # Tools whose legitimate repetition (e.g. read-only polling) should not
+    # trip the guard.
+    exempt_tools: list[str] = Field(default_factory=list)
 
 
 class LoggingConfig(BaseModel):
@@ -65,6 +83,7 @@ class HarnessConfig(BaseModel):
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    repeat_guard: RepeatGuardSettings = Field(default_factory=RepeatGuardSettings)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # Resolved at load time; not part of the YAML schema.

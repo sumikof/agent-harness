@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 import harness.orchestrator.agent_invoker as agent_invoker_module
-from harness.agents.base import AgentRequest, AgentResult
+from harness.agents.base import AgentResult, BaseAgentRunner
+from harness.agents.profile import ResolvedAgentRunSpec
 from harness.config import HarnessConfig, ProjectConfig, VerificationConfig
 from harness.git.repository import GitRepository
 from harness.orchestrator.project import ProjectOrchestrator
@@ -20,15 +21,21 @@ from harness.orchestrator.state_machine import ProjectState, Role, TaskState
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-class FakeRunner:
-    """Returns scripted JSON per role; the Developer really edits the repo."""
+class FakeRunner(BaseAgentRunner):
+    """Returns scripted JSON per role; the Developer really edits the repo.
+
+    Inherits capabilities()/resolve() from BaseAgentRunner, so run()
+    receives the ResolvedAgentRunSpec the invoker persisted beforehand.
+    """
+
+    provider_name = "fake"
 
     def __init__(self, repo_path: Path, review_verdicts: list[str]):
         self.repo_path = repo_path
         self.review_verdicts = review_verdicts
         self.calls: list[Role] = []
 
-    async def run(self, request: AgentRequest) -> AgentResult:
+    async def run(self, request: ResolvedAgentRunSpec) -> AgentResult:
         self.calls.append(request.role)
         payload = self._payload(request.role)
         return AgentResult(
@@ -263,7 +270,10 @@ async def test_happy_path_completes_project(config, monkeypatch):
     brief = orchestrator.artifacts.load_json(
         orchestrator.artifacts.task_artifact_path("T001", "task-brief.json")
     )
-    assert brief["task"] == "T001"
+    # Artifacts now carry a provenance envelope around the domain payload.
+    assert brief["artifact_type"] == "TaskBrief"
+    assert brief["producer"]["role"] == "analyst"
+    assert brief["payload"]["task"] == "T001"
     project = orchestrator.projects.get(1)
     assert project["spent_usd"] > 0
 
@@ -498,7 +508,7 @@ async def test_failed_run_cost_still_hits_run_cap(config, monkeypatch):
     orchestrator = ProjectOrchestrator(config)
     calls = []
 
-    class ExpensiveFailingRunner:
+    class ExpensiveFailingRunner(BaseAgentRunner):
         async def run(self, request):
             calls.append(request.role)
             return AgentResult(status="FAILED", error="boom", cost_usd=5.0)
