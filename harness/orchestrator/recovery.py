@@ -101,13 +101,19 @@ class RecoveryManager:
         # tree reset; in-flight dispatch/verification intents are only READ
         # here — they stay open until the tree is settled below, so a crash
         # inside recovery itself keeps the evidence for the next startup.
-        pending_verifications = 0
+        pending_side_effects = 0
         if self.operations is not None:
             for op in self.operations.unfinished(OperationType.GIT_COMMIT, project_id=project_id):
                 self._reconcile_git_commit(project_id, op)
                 acted = True
-            pending_verifications = len(self.operations.unfinished(
-                OperationType.VERIFICATION_COMMAND, project_id=project_id))
+            # Both kinds of in-flight side effects can dirty the tree: a
+            # verification command, or an agent session whose attempt was
+            # already closed by a previous recovery pass that crashed
+            # mid-reset.
+            pending_side_effects = len(self.operations.unfinished(
+                OperationType.VERIFICATION_COMMAND, project_id=project_id)
+            ) + len(self.operations.unfinished(
+                OperationType.AGENT_DISPATCH, project_id=project_id))
 
         # 5. Workspace dirty-state recovery.
         running = self.tasks.running_attempts(project_id)
@@ -130,14 +136,15 @@ class RecoveryManager:
             if dirty:
                 self.checkpoint.discard_working_tree()
             acted = True
-        elif dirty and pending_verifications:
-            # No RUNNING attempt, but a verification command (e.g. the final
-            # verification, which runs outside any attempt) was journaled as
-            # in flight — its side effects explain the diff. Archive it and
-            # return to the last good commit so the run can be repeated.
+        elif dirty and pending_side_effects:
+            # No RUNNING attempt, but a journaled side effect was in flight —
+            # a verification command (e.g. the final verification, which runs
+            # outside any attempt) or an agent dispatch whose attempt a
+            # crashed earlier recovery already closed. Either explains the
+            # diff: archive it and return to the last good commit.
             logger.warning(
-                "recovery: dirty tree explained by %d in-flight verification "
-                "operation(s); archiving and resetting", pending_verifications,
+                "recovery: dirty tree explained by %d in-flight side-effect "
+                "operation(s); archiving and resetting", pending_side_effects,
             )
             self._archive_dirty_diff(project_id)
             self.checkpoint.discard_working_tree()

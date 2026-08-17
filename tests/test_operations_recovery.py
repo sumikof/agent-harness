@@ -244,6 +244,29 @@ def test_recovery_crash_before_reset_keeps_verification_evidence(world, monkeypa
     assert world.operations.unfinished() == []
 
 
+def test_dirty_tree_from_interrupted_dispatch_after_partial_recovery(world):
+    """Double-crash: a Developer dispatch dirtied the tree, a first recovery
+    closed the attempt but died mid-reset. The still-pending dispatch intent
+    must explain the dirty tree on the next startup."""
+    tid = world.tasks.create(world.pid, "T001", "task")
+    aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    op_id = world.operations.record_intent(
+        OperationType.AGENT_DISPATCH, {"role": "developer"},
+        project_id=world.pid, task_id=tid, attempt_id=aid,
+    )
+    (world.git.path / "hello.txt").write_text("half-done developer edit\n")
+    # first recovery pass got as far as closing the attempt, then crashed
+    world.tasks.finish_attempt(aid, AttemptState.INTERRUPTED)
+
+    acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
+
+    assert acted
+    assert not world.git.is_dirty()
+    assert world.operations.get(op_id)["status"] == "INTERRUPTED"
+    diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
+    assert len(diffs) == 1 and "half-done developer edit" in diffs[0].read_text()
+
+
 def test_recovery_never_settles_another_projects_journal(world):
     """A workspace can hold several projects; recovering project A must not
     destroy project B's pending crash evidence."""
