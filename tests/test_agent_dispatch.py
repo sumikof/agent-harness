@@ -566,6 +566,41 @@ async def test_final_verification_is_journaled(config, monkeypatch):
     assert orchestrator.operations.unfinished() == []
 
 
+async def test_final_result_and_project_completion_are_atomic(config, monkeypatch):
+    """If judging the final verification fails mid-way, the operation must
+    stay PENDING and the project in FINAL_VERIFICATION — never a settled
+    operation with an unfinished project that re-runs the commands."""
+    from harness.orchestrator.state_machine import ProjectState
+
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    ctx = orchestrator.project_context()
+
+    original_set_status = orchestrator.projects.set_status
+
+    def crashing_set_status(project_id_, status, **kwargs):
+        if status == ProjectState.COMPLETED:
+            raise RuntimeError("dies before project completion is durable")
+        return original_set_status(project_id_, status, **kwargs)
+
+    monkeypatch.setattr(orchestrator.projects, "set_status", crashing_set_status)
+    with pytest.raises(RuntimeError):
+        await orchestrator._finalize(pid, ctx)
+
+    # rolled back together: the intent is still open for recovery
+    assert len(orchestrator.operations.unfinished()) == 1
+    assert orchestrator.projects.get(pid)["status"] == ProjectState.FINAL_VERIFICATION.value
+
+    # restart path: recovery settles the interrupted operation, then the
+    # re-run finalize completes cleanly
+    monkeypatch.setattr(orchestrator.projects, "set_status", original_set_status)
+    orchestrator.recovery.recover(orchestrator.projects.get(pid))
+    state = await orchestrator._finalize(pid, ctx)
+    assert state == ProjectState.COMPLETED
+    assert orchestrator.operations.unfinished() == []
+
+
 async def test_repair_produces_fresh_agent_run_without_resume(config, monkeypatch):
     """Review REPAIR must start a brand-new Developer AgentRun (fresh
     session, own manifest) — never resume the previous session."""

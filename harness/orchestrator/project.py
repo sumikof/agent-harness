@@ -319,19 +319,28 @@ class ProjectOrchestrator:
             project_id=project_id,
         )
         result = self.verifier.run(label="final")
-        self.operations.record_result(
-            verify_op_id, OperationStatus.COMPLETED,
-            {"passed": result.passed, "exit_codes": [s.exit_code for s in result.steps]},
-        )
+        # Artifact first (an idempotent filesystem write), then result AND
+        # final project state/events in ONE transaction: either the run is
+        # fully judged — operation settled and project COMPLETED/FAILED — or
+        # the intent stays PENDING and the restart re-verifies. There is no
+        # window where the operation looks settled but the project still
+        # sits in FINAL_VERIFICATION and re-runs the commands.
         self.artifacts.save_model(self.artifacts.root / "final-verification.json", result)
+        with self.db.transaction():
+            self.operations.record_result(
+                verify_op_id, OperationStatus.COMPLETED,
+                {"passed": result.passed, "exit_codes": [s.exit_code for s in result.steps]},
+            )
+            if result.passed:
+                self.projects.set_status(project_id, ProjectState.COMPLETED)
+                self.events.emit("PROJECT_COMPLETED", project_id=project_id)
+            else:
+                self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+                self.events.emit("PROJECT_FAILED", project_id=project_id,
+                                 payload={"reason": "final verification failed"})
         if result.passed:
-            self.projects.set_status(project_id, ProjectState.COMPLETED)
-            self.events.emit("PROJECT_COMPLETED", project_id=project_id)
             logger.info("project completed")
             return ProjectState.COMPLETED
-        self.projects.set_status(project_id, ProjectState.FAILED, force=True)
-        self.events.emit("PROJECT_FAILED", project_id=project_id,
-                         payload={"reason": "final verification failed"})
         return ProjectState.FAILED
 
     # ------------------------------------------------------------------
