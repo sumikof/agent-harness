@@ -157,6 +157,43 @@ def test_interrupted_agent_dispatch_operation_is_closed(world):
     assert world.operations.unfinished() == []
 
 
+def test_reconciliation_is_atomic(world, monkeypatch):
+    """If any part of the commit reconciliation fails, ALL of it rolls back:
+    the operation stays PENDING and the next startup retries from scratch,
+    instead of a permanent state/ledger mismatch."""
+    tid = world.tasks.create(world.pid, "T001", "task")
+    world.tasks.set_status(tid, TaskState.READY)
+    aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    world.tasks.set_status(tid, TaskState.REVIEWING, force=True)
+    (world.git.path / "feature.txt").write_text("x\n")
+    op_id = world.operations.record_intent(
+        OperationType.GIT_COMMIT,
+        {"task_key": "T001", "task_id": tid, "attempt_id": aid},
+        project_id=world.pid, task_id=tid, attempt_id=aid,
+    )
+    world.git.add_all()
+    world.git.commit("agent(T001): task", trailers={OPERATION_TRAILER: op_id})
+
+    def failing_record_result(*args, **kwargs):
+        raise RuntimeError("dies mid-reconciliation")
+
+    monkeypatch.setattr(world.operations, "record_result", failing_record_result)
+    op_row = world.operations.get(op_id)
+    with pytest.raises(RuntimeError):
+        world.recovery._reconcile_git_commit(world.pid, op_row)
+
+    # everything rolled back together — nothing half-applied
+    assert world.tasks.get(tid)["status"] == "REVIEWING"
+    assert world.tasks.get(tid)["current_commit"] is None
+    assert world.tasks.get_attempt(aid)["status"] == "RUNNING"
+    assert world.operations.get(op_id)["status"] == "PENDING"
+
+    monkeypatch.undo()
+    world.recovery.recover(world.projects.get(world.pid))  # next startup succeeds
+    assert world.tasks.get(tid)["status"] == "COMPLETED"
+    assert world.operations.get(op_id)["status"] == "RECONCILED"
+
+
 def test_recovery_never_settles_another_projects_journal(world):
     """A workspace can hold several projects; recovering project A must not
     destroy project B's pending crash evidence."""

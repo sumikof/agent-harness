@@ -202,33 +202,40 @@ class RecoveryManager:
             "recovery: git commit intent %s already executed as %s; reconciling DB",
             operation_id, commit_hash,
         )
-        if task_id is not None:
-            attempt = self.tasks.get_attempt(attempt_id) if attempt_id else None
-            if attempt is not None and attempt["status"] == AttemptState.RUNNING.value:
-                self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
-            self.tasks.set_commit(task_id, commit_hash)
-            task = self.tasks.get(task_id)
-            if task is not None and task["status"] != TaskState.COMPLETED.value:
-                self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
-                self.events.emit(
-                    EventType.TASK_COMPLETED,
-                    project_id=project_id,
-                    task_id=task_id,
-                    attempt_id=attempt_id,
-                    operation_id=operation_id,
-                    payload={"commit": commit_hash, "reconciled": True},
-                )
-        self.operations.record_result(
-            operation_id, OperationStatus.RECONCILED, {"commit": commit_hash}
-        )
-        self.events.emit(
-            EventType.GIT_COMMIT_RECONCILED,
-            project_id=project_id,
-            task_id=task_id,
-            attempt_id=attempt_id,
-            operation_id=operation_id,
-            payload={"commit": commit_hash},
-        )
+        # The whole catch-up — attempt, current_commit, task state, the
+        # operation result and every event — lands in ONE transaction,
+        # mirroring the normal completion path. A crash mid-reconciliation
+        # then leaves the operation PENDING and the next startup repeats
+        # the reconciliation from scratch, instead of a permanent
+        # state/ledger mismatch.
+        with self.tasks.db.transaction():
+            if task_id is not None:
+                attempt = self.tasks.get_attempt(attempt_id) if attempt_id else None
+                if attempt is not None and attempt["status"] == AttemptState.RUNNING.value:
+                    self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
+                self.tasks.set_commit(task_id, commit_hash)
+                task = self.tasks.get(task_id)
+                if task is not None and task["status"] != TaskState.COMPLETED.value:
+                    self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+                    self.events.emit(
+                        EventType.TASK_COMPLETED,
+                        project_id=project_id,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        operation_id=operation_id,
+                        payload={"commit": commit_hash, "reconciled": True},
+                    )
+            self.operations.record_result(
+                operation_id, OperationStatus.RECONCILED, {"commit": commit_hash}
+            )
+            self.events.emit(
+                EventType.GIT_COMMIT_RECONCILED,
+                project_id=project_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                payload={"commit": commit_hash},
+            )
 
     def _archive_dirty_diff(self, project_id: int) -> None:
         if not (self.git.is_repo() and self.git.is_dirty()):

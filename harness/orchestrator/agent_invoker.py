@@ -294,14 +294,26 @@ class AgentInvoker:
             attempt_no = row["attempt_no"] if row else None
         result: AgentResult = AgentResult(status="FAILED", error="not run")
         run_id: Optional[int] = None
+        # For mutating roles, freeze the worktree state at session start
+        # (e.g. the Tester starts on top of the Developer's uncommitted
+        # work) so a transient retry restores THIS state — never bare HEAD,
+        # which would erase the previous role's finished changes.
+        pre_dispatch_snapshot: Optional[str] = None
+        if spec.mutates_repo and self.git is not None and self.git.head_commit() is not None:
+            try:
+                pre_dispatch_snapshot = self.git.snapshot_dirty()
+            except Exception as exc:
+                logger.warning("could not snapshot worktree before dispatch: %s", exc)
         for attempt in range(TECHNICAL_RETRIES + 1):
             # Every physical provider call spends money — failed runs and
             # schema retries included — so limits are re-checked before each.
             self.budget.check_project(project_id)
             if task_id is not None:
                 self.budget.check_task(task_id)
-            # Only one agent may ever be in flight (deterministic invariant).
-            stale = self.runs.running_runs(project_id)
+            # Only one agent may ever be in flight — across the WHOLE
+            # workspace, not just this project: every project in this DB
+            # shares the max-1-agent guarantee.
+            stale = self.runs.running_runs()
             if stale:
                 raise ConcurrentRunError(
                     f"agent run(s) {[r['id'] for r in stale]} still RUNNING; "
@@ -480,8 +492,8 @@ class AgentInvoker:
                 # A mutating role may have half-edited the tree before the
                 # transient failure; redispatching on top of that would run
                 # the same assignment against an unknown base. Archive the
-                # partial diff and restore the attempt's base state first.
-                self._restore_worktree_for_retry(spec, run_id)
+                # partial diff and restore the session-start state first.
+                self._restore_worktree_for_retry(spec, run_id, pre_dispatch_snapshot)
                 logger.warning(
                     "%s failed technically (%s); retrying in %.0fs", spec.role, result.error, delay
                 )
@@ -489,22 +501,31 @@ class AgentInvoker:
                 delay *= 2
         return result, run_id
 
-    def _restore_worktree_for_retry(self, spec: RoleSpec, run_id: Optional[int]) -> None:
+    def _restore_worktree_for_retry(
+        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[str]
+    ) -> None:
+        """Bring the worktree back to its session-start state (snapshot),
+        which may legitimately be dirty — e.g. the Tester runs on top of the
+        Developer's uncommitted implementation."""
         if not spec.mutates_repo or self.git is None:
             return
         try:
-            if self.git.head_commit() is None or not self.git.is_dirty():
+            if self.git.head_commit() is None:
                 return
+            if snapshot is None:
+                raise RuntimeError("no pre-dispatch worktree snapshot available")
             diff = self.git.full_dirty_diff()
-            if diff.strip():
+            if diff.strip() and diff != snapshot:
                 self.artifacts.save_text(
                     self.artifacts.root / "diagnostics"
                     / f"{spec.role.value}-run{run_id}-transient-retry.diff",
                     diff,
                 )
             self.git.reset_hard("HEAD")
+            if snapshot.strip():
+                self.git.apply_patch(snapshot)
         except Exception as exc:
-            # Without a known-clean base a blind redispatch is worse than
+            # Without a known base state a blind redispatch is worse than
             # failing the attempt — surface instead of retrying.
             raise AgentRunFailed(
                 spec.role.value, f"could not restore worktree before provider retry: {exc}"

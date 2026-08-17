@@ -196,6 +196,21 @@ async def test_second_concurrent_running_agent_is_refused(config, monkeypatch):
     assert runner.specs == []
 
 
+async def test_running_agent_in_another_project_also_blocks_dispatch(config, monkeypatch):
+    """The max-1-agent guarantee is workspace-wide: a RUNNING run belonging
+    to ANOTHER project in the same DB must also refuse the dispatch."""
+    orchestrator = ProjectOrchestrator(config)
+    orchestrator.ensure_project()
+    other_pid = orchestrator.projects.create("other-project", "/elsewhere", "main", "g", 10.0)
+    orchestrator.runs.start_run(other_pid, "developer")
+    runner = ScriptedRunner([ok_result()])
+    install(monkeypatch, runner)
+
+    with pytest.raises(ConcurrentRunError):
+        await invoke_planner(orchestrator)
+    assert runner.specs == []
+
+
 def test_classify_provider_error():
     assert classify_provider_error("429 rate limit exceeded") == FailureKind.TRANSIENT
     assert classify_provider_error("Connection reset by peer") == FailureKind.TRANSIENT
@@ -327,6 +342,45 @@ async def test_transient_retry_restores_worktree_for_mutating_roles(config, monk
     archived = list((orchestrator.artifacts.root / "diagnostics").glob(
         "developer-run*-transient-retry.diff"))
     assert len(archived) == 1 and "junk.py" in archived[0].read_text()
+
+
+async def test_tester_retry_restores_developers_uncommitted_work(config, monkeypatch):
+    """The Tester runs on top of the Developer's uncommitted implementation;
+    a transient Tester failure must restore THAT state — resetting to bare
+    HEAD would erase the finished Developer work."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    tid = orchestrator.tasks.create(pid, "T001", "task")
+    aid = orchestrator.tasks.start_attempt(tid, orchestrator.git.head_commit())
+    repo_path = config.repository_path
+    # the Developer's finished, uncommitted implementation
+    (repo_path / "impl.py").write_text("developer work\n")
+    impl_seen_by_retry = []
+
+    class FlakyTester(ScriptedRunner):
+        async def run(self, spec):
+            if len(self.specs) == 0:
+                self.specs.append(spec)
+                (repo_path / "tests").mkdir(exist_ok=True)
+                (repo_path / "tests" / "half.py").write_text("partial test\n")
+                return AgentResult(status="FAILED", error="connection timeout",
+                                   failure_kind=FailureKind.TRANSIENT)
+            self.specs.append(spec)
+            impl_seen_by_retry.append((repo_path / "impl.py").exists())
+            return ok_result({"task": "T001", "summary": "s"})
+
+    runner = FlakyTester([])
+    install(monkeypatch, runner)
+
+    from harness.agents import tester
+    await orchestrator.invoker.invoke(
+        tester.SPEC, pid, orchestrator.project_context(), task_id=tid, attempt_id=aid,
+    )
+
+    assert impl_seen_by_retry == [True]                      # developer work survived
+    assert (repo_path / "impl.py").read_text() == "developer work\n"
+    assert not (repo_path / "tests" / "half.py").exists()    # tester's partial edit undone
 
 
 async def test_repair_produces_fresh_agent_run_without_resume(config, monkeypatch):

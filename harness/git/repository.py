@@ -18,12 +18,15 @@ class GitRepository:
     def __init__(self, path: str | Path):
         self.path = Path(path)
 
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(
+        self, *args: str, check: bool = True, input_text: str | None = None
+    ) -> subprocess.CompletedProcess:
         result = subprocess.run(
             ["git", *args],
             cwd=str(self.path),
             capture_output=True,
             text=True,
+            input=input_text,
         )
         if check and result.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
@@ -81,6 +84,20 @@ class GitRepository:
         if self.head_commit():
             return self._run("diff", "--no-color", "HEAD").stdout
         return self._run("diff", "--no-color").stdout
+
+    def snapshot_dirty(self) -> str:
+        """Binary-safe patch of everything uncommitted (incl. untracked).
+
+        Round-trippable via apply_patch(): reset_hard() + apply_patch()
+        restores the worktree to exactly this state.
+        """
+        self._run("add", "-A", "-N", check=False)  # intent-to-add so untracked shows
+        if self.head_commit():
+            return self._run("diff", "--binary", "--no-color", "HEAD").stdout
+        return self._run("diff", "--binary", "--no-color").stdout
+
+    def apply_patch(self, patch: str) -> None:
+        self._run("apply", "--whitespace=nowarn", input_text=patch)
 
     def changed_files(self) -> list[str]:
         out = self._run("status", "--porcelain").stdout
