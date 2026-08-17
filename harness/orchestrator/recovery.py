@@ -21,6 +21,7 @@ to destroy: recovery refuses to start instead of resetting it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -122,11 +123,9 @@ class RecoveryManager:
                     self._reconcile_executed_commit(project_id, op, commit_hash)
                     acted = True
                 else:
-                    # Intent journaled but never executed. A commit intent is
-                    # only ever written over a dirty tree, so it stays
-                    # PENDING as dirty-tree evidence until the reset below
-                    # has completed (double-crash safety), and is closed
-                    # FAILED afterwards.
+                    # Intent journaled but never executed. It stays PENDING
+                    # until the reset below has completed (double-crash
+                    # safety), and is closed FAILED afterwards.
                     unexecuted_commit_intents.append(op)
             # In-flight side effects that can explain a dirty tree: a
             # verification command, an unexecuted checkpoint commit, or a
@@ -137,7 +136,15 @@ class RecoveryManager:
             # edits made while stopped be destroyed.
             pending_side_effects = len(self.operations.unfinished(
                 OperationType.VERIFICATION_COMMAND, project_id=project_id))
-            pending_side_effects += len(unexecuted_commit_intents)
+            # An unexecuted commit intent is evidence ONLY when the current
+            # dirty diff still hashes to the intent's recorded diff_sha256.
+            # A stale intent (its reset already completed, then the process
+            # died before closing it) must not explain — and destroy — NEW
+            # user edits made while the harness was stopped.
+            pending_side_effects += sum(
+                1 for op in unexecuted_commit_intents
+                if self._commit_intent_matches_worktree(op)
+            )
             for op in self.operations.unfinished(
                     OperationType.AGENT_DISPATCH, project_id=project_id):
                 payload = json.loads(op["payload"] or "{}")
@@ -224,6 +231,23 @@ class RecoveryManager:
         return acted
 
     # ------------------------------------------------------------------
+
+    def _commit_intent_matches_worktree(self, op: sqlite3.Row) -> bool:
+        """True when the current dirty diff is exactly what the commit intent
+        was journaled for (payload diff_sha256). Unverifiable intents are
+        never accepted as grounds to reset a tree."""
+        payload = json.loads(op["payload"] or "{}")
+        expected = payload.get("diff_sha256")
+        if not expected:
+            return False
+        if not (self.git.is_repo() and self.git.is_dirty()):
+            return False
+        try:
+            diff = self.git.full_dirty_diff()
+        except Exception as exc:
+            logger.warning("recovery: could not hash dirty diff: %s", exc)
+            return False
+        return hashlib.sha256(diff.encode("utf-8")).hexdigest() == expected
 
     def _close_interrupted_operations(self, project_id: int) -> bool:
         """Close in-flight dispatch/verification intents AFTER the worktree

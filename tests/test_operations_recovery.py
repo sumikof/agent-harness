@@ -272,13 +272,17 @@ def test_unexecuted_commit_intent_survives_crashed_recovery(world):
     """Double-crash: commit intent journaled but never executed, a first
     recovery closed the attempt then died mid-reset. The still-PENDING
     intent must explain the dirty tree on the next startup."""
+    import hashlib
+
     tid = world.tasks.create(world.pid, "T001", "task")
     aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    (world.git.path / "feature.txt").write_text("passed but uncommitted work\n")
+    diff_hash = hashlib.sha256(world.git.full_dirty_diff().encode("utf-8")).hexdigest()
     op_id = world.operations.record_intent(
-        OperationType.GIT_COMMIT, {"task_key": "T001", "task_id": tid, "attempt_id": aid},
+        OperationType.GIT_COMMIT,
+        {"task_key": "T001", "task_id": tid, "attempt_id": aid, "diff_sha256": diff_hash},
         project_id=world.pid, task_id=tid, attempt_id=aid,
     )
-    (world.git.path / "feature.txt").write_text("passed but uncommitted work\n")
     # first recovery pass closed the attempt, then crashed before the reset
     world.tasks.finish_attempt(aid, AttemptState.INTERRUPTED)
 
@@ -289,6 +293,32 @@ def test_unexecuted_commit_intent_survives_crashed_recovery(world):
     assert world.operations.get(op_id)["status"] == "FAILED"  # closed after the reset
     diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
     assert len(diffs) == 1 and "passed but uncommitted" in diffs[0].read_text()
+
+
+def test_stale_commit_intent_does_not_reset_new_user_edits(world):
+    """Triple-crash tail: the intent's reset already completed, the process
+    died before closing it, and the user edited the tree while stopped. The
+    stale intent's diff hash no longer matches, so the user's work is
+    preserved, not archived and reset."""
+    from harness.orchestrator.recovery import UnexplainedDirtyWorktree
+
+    tid = world.tasks.create(world.pid, "T001", "task")
+    aid = world.tasks.start_attempt(tid, world.git.head_commit())
+    world.operations.record_intent(
+        OperationType.GIT_COMMIT,
+        {"task_key": "T001", "task_id": tid, "attempt_id": aid,
+         "diff_sha256": "0" * 64},  # hash of the ORIGINAL (already reset) diff
+        project_id=world.pid, task_id=tid, attempt_id=aid,
+    )
+    world.tasks.finish_attempt(aid, AttemptState.INTERRUPTED)  # settled earlier
+    # tree is clean (reset completed) — then the user edits while stopped
+    (world.git.path / "hello.txt").write_text("brand new user edit\n")
+
+    with pytest.raises(UnexplainedDirtyWorktree):
+        world.recovery.recover(world.projects.get(world.pid))
+
+    assert world.git.is_dirty()  # untouched
+    assert (world.git.path / "hello.txt").read_text() == "brand new user edit\n"
 
 
 def test_readonly_dispatch_does_not_explain_user_dirty_tree(world):
