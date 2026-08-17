@@ -315,7 +315,8 @@ class ProjectOrchestrator:
         # of a silent re-execution of possibly side-effecting commands.
         verify_op_id = self.operations.record_intent(
             OperationType.VERIFICATION_COMMAND,
-            {"commands": self.verifier.commands(), "label": "final"},
+            {"commands": self.verifier.commands(), "label": "final",
+             "base_diff_sha256": self.task_runner._diff_hash()},
             project_id=project_id,
         )
         result = self.verifier.run(label="final")

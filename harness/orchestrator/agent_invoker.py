@@ -384,6 +384,12 @@ class AgentInvoker:
                     )
                 dispatch_op_id = None
                 if self.operations:
+                    base_diff_hash = None
+                    if spec.mutates_repo and self.git is not None:
+                        try:
+                            base_diff_hash = sha256_text(self.git.dirty_diff_readonly())
+                        except Exception as exc:
+                            logger.warning("could not hash pre-dispatch diff: %s", exc)
                     dispatch_op_id = self.operations.record_intent(
                         OperationType.AGENT_DISPATCH,
                         {
@@ -392,6 +398,9 @@ class AgentInvoker:
                             "model": resolved.model,
                             "technical_attempt": attempt,
                             "run_id": run_id,
+                            # Recovery may only reset a diff whose hash it
+                            # has durably recorded.
+                            "base_diff_sha256": base_diff_hash,
                         },
                         project_id=project_id,
                         task_id=task_id,

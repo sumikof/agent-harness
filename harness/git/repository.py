@@ -85,6 +85,28 @@ class GitRepository:
             return self._run("diff", "--no-color", "HEAD").stdout
         return self._run("diff", "--no-color").stdout
 
+    def untracked_paths(self) -> list[str]:
+        """Untracked paths, parsed from NUL-separated porcelain output so
+        names with spaces, quotes, or non-ASCII characters survive intact."""
+        out = self._run("status", "--porcelain", "-z").stdout
+        fields = out.split("\0")
+        untracked: list[str] = []
+        index = 0
+        while index < len(fields):
+            entry = fields[index]
+            if not entry:
+                index += 1
+                continue
+            status = entry[:2]
+            if status == "??":
+                untracked.append(entry[3:])
+            # Rename/copy entries carry the source path as an extra field.
+            if "R" in status or "C" in status:
+                index += 2
+            else:
+                index += 1
+        return untracked
+
     def dirty_diff_readonly(self) -> str:
         """full_dirty_diff() that leaves the index as it found it.
 
@@ -93,15 +115,13 @@ class GitRepository:
         intent-to-add entries; the ita entries created for the diff are
         removed again afterwards.
         """
-        before = self._run("status", "--porcelain").stdout
-        newly_untracked = [
-            line[3:].split(" -> ")[-1].strip()
-            for line in before.splitlines()
-            if line.startswith("??")
-        ]
+        newly_untracked = self.untracked_paths()
         diff = self.full_dirty_diff()
         if newly_untracked:
-            self._run("reset", "-q", "--", *newly_untracked, check=False)
+            if self.head_commit():
+                self._run("reset", "-q", "--", *newly_untracked)
+            else:  # unborn HEAD: drop the ita index entries directly
+                self._run("rm", "--cached", "-q", "--", *newly_untracked)
         return diff
 
     def snapshot_dirty(self) -> str:

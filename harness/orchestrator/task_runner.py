@@ -253,7 +253,10 @@ class TaskRunner:
         if self.operations:
             verify_op_id = self.operations.record_intent(
                 OperationType.VERIFICATION_COMMAND,
-                {"commands": self.verifier.commands(), "label": f"{task_key}-a{attempt_id}"},
+                {"commands": self.verifier.commands(), "label": f"{task_key}-a{attempt_id}",
+                 # Tree state before the commands run: recovery may only
+                 # reset a diff whose hash it has durably recorded.
+                 "base_diff_sha256": self._diff_hash()},
                 project_id=project_id, task_id=task_id, attempt_id=attempt_id,
             )
         verification = self.verifier.run(label=f"{task_key}-a{attempt_id}")
@@ -485,6 +488,16 @@ class TaskRunner:
         except Exception as exc:
             logger.warning("could not capture diff: %s", exc)
             return ""
+
+    def _diff_hash(self) -> str:
+        import hashlib
+
+        try:
+            diff = self.git.dirty_diff_readonly()
+        except Exception as exc:
+            logger.warning("could not hash diff: %s", exc)
+            return ""
+        return hashlib.sha256(diff.encode("utf-8")).hexdigest()
 
     def _bounded_diff(self, spill_name: str, limit: int | None = None) -> str:
         """The current dirty diff, spilled to an artifact when oversized.

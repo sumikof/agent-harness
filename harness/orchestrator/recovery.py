@@ -201,11 +201,18 @@ class RecoveryManager:
             self.checkpoint.discard_working_tree()
             acted = True
         elif dirty:
-            # No interrupted attempt explains this diff — it is user work.
+            # No verifiable explanation for this diff — it may be user work.
             # Never destroy it; make the operator decide.
+            hint = ""
+            if side_effect_intents or unexecuted_commit_intents:
+                hint = (
+                    " In-flight operation(s) were interrupted, but the current diff "
+                    "does not match any state the harness recorded for them, so it "
+                    "may include your own edits."
+                )
             raise UnexplainedDirtyWorktree(
                 f"repository {self.git.path} has uncommitted changes but no interrupted "
-                "attempt is recorded. Commit, stash, or clean it manually, then rerun."
+                f"attempt is recorded.{hint} Commit, stash, or clean it manually, then rerun."
             )
 
         # Now that the tree is settled, the in-flight operations can be
@@ -266,18 +273,21 @@ class RecoveryManager:
 
     @staticmethod
     def _intent_is_dirty_evidence(op: sqlite3.Row, current_diff_hash: str | None) -> bool:
-        """A dispatch/verification intent explains the dirty tree unless a
-        previous settlement pass already reset the diff it stood for.
+        """A dispatch/verification intent explains the dirty tree only when
+        the current diff hashes to a state the harness has durably recorded
+        for it: the base diff journaled at intent creation, or the diff a
+        previous settlement pass annotated before resetting.
 
-        Un-annotated intents are genuinely in flight at crash time — the
-        settlement annotation is written durably BEFORE any reset, so an
-        intent can only be un-annotated if no reset happened for it yet.
+        The invariant: recovery only ever resets a tree whose exact content
+        it can prove it has seen. A diff matching neither hash may contain
+        user edits made while the harness was stopped — never reset those.
         """
         payload = json.loads(op["payload"] or "{}")
         annotated = payload.get("settle_diff_sha256")
-        if annotated is None:
-            return True
-        return annotated == current_diff_hash
+        if annotated is not None:
+            return annotated == current_diff_hash
+        base = payload.get("base_diff_sha256")
+        return bool(base) and base == current_diff_hash
 
     def _annotate_settlement(
         self, ops: list[sqlite3.Row], current_diff_hash: str | None

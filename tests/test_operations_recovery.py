@@ -195,16 +195,23 @@ def test_reconciliation_is_atomic(world, monkeypatch):
     assert world.operations.get(op_id)["status"] == "RECONCILED"
 
 
-def test_dirty_tree_from_interrupted_verification_is_recovered(world):
+def diff_hash(world) -> str:
+    import hashlib
+
+    return hashlib.sha256(world.git.dirty_diff_readonly().encode("utf-8")).hexdigest()
+
+
+def test_dirty_tree_matching_verification_intent_is_recovered(world):
     """A verification in flight (e.g. the final verification, which runs
-    outside any attempt) explains a dirty tree: recovery archives and
-    resets instead of refusing to start."""
+    outside any attempt) explains a dirty tree when the diff hashes to a
+    state the harness recorded for it: recovery archives and resets."""
+    (world.git.path / "hello.txt").write_text("uncommitted state before verify\n")
     op_id = world.operations.record_intent(
         OperationType.VERIFICATION_COMMAND,
-        {"commands": ["make test"], "label": "final"},
+        {"commands": ["make test"], "label": "final", "base_diff_sha256": diff_hash(world)},
         project_id=world.pid,
     )
-    (world.git.path / "hello.txt").write_text("mutated by verification command\n")
+    # crash before/while the commands ran; the tree is still the journaled state
 
     acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
 
@@ -212,19 +219,36 @@ def test_dirty_tree_from_interrupted_verification_is_recovered(world):
     assert not world.git.is_dirty()
     assert world.operations.get(op_id)["status"] == "INTERRUPTED"
     diffs = list((world.artifacts.root / "diagnostics").glob("interrupted-worktree*.diff"))
-    assert len(diffs) == 1 and "mutated by verification" in diffs[0].read_text()
+    assert len(diffs) == 1 and "before verify" in diffs[0].read_text()
+
+
+def test_unverifiable_dirty_tree_is_refused_even_with_pending_intent(world):
+    """A diff matching NO recorded hash may contain user edits: recovery
+    fails safe and refuses, even though an intent is pending."""
+    from harness.orchestrator.recovery import UnexplainedDirtyWorktree
+
+    world.operations.record_intent(
+        OperationType.VERIFICATION_COMMAND,
+        {"commands": ["make test"], "label": "final", "base_diff_sha256": "0" * 64},
+        project_id=world.pid,
+    )
+    (world.git.path / "hello.txt").write_text("could be verification, could be user\n")
+
+    with pytest.raises(UnexplainedDirtyWorktree):
+        world.recovery.recover(world.projects.get(world.pid))
+    assert world.git.is_dirty()  # preserved
 
 
 def test_recovery_crash_before_reset_keeps_verification_evidence(world, monkeypatch):
     """If recovery itself dies after touching the DB but before the tree
     reset, the in-flight verification intent must still be PENDING at the
     next startup — otherwise the dirty tree becomes 'unexplained'."""
+    (world.git.path / "hello.txt").write_text("mutated by verification command\n")
     world.operations.record_intent(
         OperationType.VERIFICATION_COMMAND,
-        {"commands": ["make test"], "label": "final"},
+        {"commands": ["make test"], "label": "final", "base_diff_sha256": diff_hash(world)},
         project_id=world.pid,
     )
-    (world.git.path / "hello.txt").write_text("mutated by verification command\n")
 
     original_discard = world.checkpoint.discard_working_tree
 
@@ -256,7 +280,10 @@ def test_dirty_tree_from_interrupted_dispatch_after_partial_recovery(world):
         project_id=world.pid, task_id=tid, attempt_id=aid,
     )
     (world.git.path / "hello.txt").write_text("half-done developer edit\n")
-    # first recovery pass got as far as closing the attempt, then crashed
+    # first recovery pass annotated the intent and closed the attempt,
+    # then crashed during the reset
+    world.recovery._annotate_settlement(
+        [world.operations.get(op_id)], diff_hash(world))
     world.tasks.finish_attempt(aid, AttemptState.INTERRUPTED)
 
     acted = world.recovery.recover(world.projects.get(world.pid))  # must not raise
@@ -378,6 +405,23 @@ def test_evidence_hashing_leaves_user_index_untouched(world):
 
     status = world.git._run("status", "--porcelain").stdout
     assert "?? user-notes.txt" in status  # still untracked, not intent-to-add
+
+
+def test_readonly_diff_restores_index_for_awkward_paths(world):
+    """Untracked names with spaces or non-ASCII characters (quoted in
+    porcelain v1 output) must survive the read-only diff round trip as
+    untracked — no intent-to-add residue."""
+    (world.git.path / "my notes.txt").write_text("user file with spaces\n")
+    (world.git.path / "メモ 帳.txt").write_text("non-ascii user file\n")
+
+    before = set(world.git.untracked_paths())
+    assert before == {"my notes.txt", "メモ 帳.txt"}
+
+    world.git.dirty_diff_readonly()
+
+    assert set(world.git.untracked_paths()) == before  # still '??', not ' A'
+    status = world.git._run("status", "--porcelain").stdout
+    assert not any(line[:2].strip() == "A" for line in status.splitlines())
 
 
 def test_readonly_dispatch_does_not_explain_user_dirty_tree(world):
