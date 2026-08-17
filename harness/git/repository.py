@@ -30,10 +30,19 @@ class GitRepository:
         return result
 
     def is_repo(self) -> bool:
+        """True only when path is the ROOT of a git work tree.
+
+        A nested directory inside another checkout also reports
+        --is-inside-work-tree=true, but add/reset/commit from there would
+        mutate the enclosing repository — never accept that.
+        """
         if not self.path.exists():
             return False
-        result = self._run("rev-parse", "--is-inside-work-tree", check=False)
-        return result.returncode == 0 and result.stdout.strip() == "true"
+        result = self._run("rev-parse", "--show-toplevel", check=False)
+        if result.returncode != 0:
+            return False
+        toplevel = result.stdout.strip()
+        return bool(toplevel) and Path(toplevel).resolve() == self.path.resolve()
 
     def init(self, initial_branch: str = "main") -> None:
         self.path.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from pathlib import Path
 
 from ..agents import planner
 from ..artifacts.manager import ArtifactManager
@@ -79,10 +80,31 @@ class ProjectOrchestrator:
             self.events.emit("PROJECT_CREATED", project_id=project_id,
                              payload={"name": self.config.project.name})
             row = self.projects.get(project_id)
+        else:
+            # Resuming an existing project: its persisted identity must match
+            # the current configuration, or the stored plan/tasks/commits
+            # would be applied to a different checkout.
+            stored_repo = Path(row["repository"]).resolve()
+            configured_repo = self.config.repository_path.resolve()
+            if stored_repo != configured_repo or row["base_branch"] != self.config.project.base_branch:
+                raise RuntimeError(
+                    f"project '{self.config.project.name}' in this workspace was created for "
+                    f"repository={row['repository']} (base_branch={row['base_branch']}), but the "
+                    f"config now points at {configured_repo} (base_branch="
+                    f"{self.config.project.base_branch}). Use a new project name or a fresh "
+                    "workspace instead of reusing stale state."
+                )
+            if row["goal"] != self.config.project.goal:
+                # Goal text is content, not identity — adopt the new wording.
+                self.projects.update_goal(row["id"], self.config.project.goal)
+                self.events.emit("PROJECT_GOAL_UPDATED", project_id=row["id"],
+                                 payload={"goal": self.config.project.goal})
+                row = self.projects.get(row["id"])
         if not self.git.is_repo():
             raise RuntimeError(
-                f"{self.config.repository_path} is not a git repository. "
-                "Place or clone the target repository there first."
+                f"{self.config.repository_path} is not the root of a git repository. "
+                "Place or clone the target repository there first (a subdirectory of "
+                "another checkout is not accepted)."
             )
         if self.git.head_commit() is None:
             # Checkpoint/recovery semantics need a HEAD to reset to. Commit

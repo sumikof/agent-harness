@@ -21,6 +21,15 @@ def repo(tmp_path):
     return git
 
 
+def test_is_repo_rejects_nested_directory(repo):
+    """A subdirectory inside another checkout must not be accepted: git
+    operations from there would mutate the enclosing repository (Codex P1)."""
+    nested = repo.path / "nested" / "dir"
+    nested.mkdir(parents=True)
+    assert repo.is_repo()
+    assert not GitRepository(nested).is_repo()
+
+
 def test_checkpoint_commit(repo):
     checkpoint = CheckpointManager(repo)
     (repo.path / "feature.txt").write_text("new\n")

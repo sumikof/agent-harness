@@ -95,6 +95,31 @@ def install_fake(monkeypatch, fake: FakeRunner) -> None:
     monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider: fake)
 
 
+def test_ensure_project_rejects_changed_repository(config, tmp_path):
+    """Reusing a workspace/project name with a different repository must fail
+    loudly instead of applying stale state to the wrong checkout (Codex P1)."""
+    ProjectOrchestrator(config).ensure_project()
+
+    other_repo = GitRepository(tmp_path / "other-repo")
+    other_repo.init()
+    (other_repo.path / "x.txt").write_text("x\n")
+    other_repo.add_all()
+    other_repo.commit("init")
+
+    changed = config.model_copy(deep=True)
+    changed.config_path = config.config_path
+    changed.project.repository = str(other_repo.path)  # same name, new repo
+    with pytest.raises(RuntimeError, match="stale state"):
+        ProjectOrchestrator(changed).ensure_project()
+
+    # a goal change alone is content, not identity — accepted and persisted
+    changed_goal = config.model_copy(deep=True)
+    changed_goal.config_path = config.config_path
+    changed_goal.project.goal = "refined goal"
+    row = ProjectOrchestrator(changed_goal).ensure_project()
+    assert row["goal"] == "refined goal"
+
+
 def test_ensure_project_creates_baseline_commit(tmp_path):
     """A commitless repo gets a baseline commit at project start, so every
     later reset/recovery has a HEAD; ignored user data is untouched (Codex P1)."""

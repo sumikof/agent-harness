@@ -47,6 +47,12 @@ class ProjectRepository:
             (status.value, utcnow(), project_id),
         )
 
+    def update_goal(self, project_id: int, goal: str) -> None:
+        self.db.execute(
+            "UPDATE projects SET goal = ?, updated_at = ? WHERE id = ?",
+            (goal, utcnow(), project_id),
+        )
+
     def add_spent(self, project_id: int, cost_usd: float) -> float:
         self.db.execute(
             "UPDATE projects SET spent_usd = spent_usd + ?, updated_at = ? WHERE id = ?",
