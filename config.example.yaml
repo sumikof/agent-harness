@@ -29,7 +29,7 @@ provider:
 # unknown keys in this section are rejected rather than silently ignored.
 inference:
   base_url: http://127.0.0.1:8000/v1
-  model: qwen3.6-27b-fp8
+  # The served model is configured ONCE, in provider.model above.
   # performance (65536, production default) | long (131072) | maximum (262144).
   # Long profiles must also be enabled server-side (deploy/inference/.env).
   # The profile caps the input budget below: an unknown name is rejected.

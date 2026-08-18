@@ -157,7 +157,14 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
         role = Role(spec.role)
         sampling = self.inference.sampling_for_role(role.value)
         spec.base_url = self.inference.base_url
-        spec.model = spec.model or self.inference.model
+        if not spec.model:
+            # The invoker resolves the model via provider.for_role; there is
+            # deliberately no inference-side fallback model to hide a broken
+            # provider configuration behind.
+            raise ValueError(
+                f"no model resolved for role '{spec.role}': set provider.model "
+                "or a provider.roles override"
+            )
         spec.sampling = sampling.model_dump()
         spec.max_output_tokens = self.inference.max_output_tokens
         spec.tool_schema_hash = tool_schema_hash(role)
@@ -425,6 +432,7 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                         if not isinstance(raw_message, dict):
                             raise ValueError(
                                 f"response message is not an object: {body!r}")
+                        _validate_message_shape(raw_message, body)
                         message = dict(raw_message)
                         message["_usage"] = data.get("usage") or {}
             except (httpx.HTTPError, ValueError) as exc:
@@ -447,6 +455,35 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                 await asyncio.sleep(delay)
                 delay *= 2
         raise TransientHTTPError(f"LLM request failed after retries: {last_error}")
+
+
+def _validate_message_shape(message: dict, context: str) -> None:
+    """Reject a structurally invalid assistant message with ValueError so it
+    reaches the in-session retry — the session loop's own field accesses
+    would raise AttributeError/TypeError past it."""
+    content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        raise ValueError(f"message content is not a string: {context!r}")
+    tool_calls = message.get("tool_calls")
+    if tool_calls is None:
+        return
+    if not isinstance(tool_calls, list):
+        raise ValueError(f"message tool_calls is not a list: {context!r}")
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            raise ValueError(f"tool call is not an object: {context!r}")
+        if call.get("id") is not None and not isinstance(call["id"], str):
+            raise ValueError(f"tool call id is not a string: {context!r}")
+        function = call.get("function")
+        if function is None:
+            continue
+        if not isinstance(function, dict):
+            raise ValueError(f"tool call function is not an object: {context!r}")
+        for key in ("name", "arguments"):
+            value = function.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"tool call function.{key} is not a string: {context!r}")
 
 
 async def stream_chat_completion(client, payload: dict, url: str = "/chat/completions"):
@@ -510,8 +547,12 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 delta = choice.get("delta") or {}
                 if not isinstance(delta, dict):
                     raise ValueError(f"SSE delta is not an object: {data[:200]!r}")
-                if delta.get("content"):
-                    content_parts.append(delta["content"])
+                delta_content = delta.get("content")
+                if delta_content is not None and not isinstance(delta_content, str):
+                    raise ValueError(
+                        f"SSE delta content is not a string: {data[:200]!r}")
+                if delta_content:
+                    content_parts.append(delta_content)
                 if delta.get("reasoning_content"):
                     reasoning_seen = True
                 fragments = delta.get("tool_calls") or []
@@ -523,17 +564,29 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                         raise ValueError(
                             f"SSE tool-call fragment is not an object: {data[:200]!r}")
                     index = fragment.get("index", 0)
+                    if not isinstance(index, int) or isinstance(index, bool):
+                        raise ValueError(
+                            f"SSE fragment index is not an integer: {data[:200]!r}")
                     call = tool_calls.setdefault(
                         index,
                         {"id": "", "type": "function",
                          "function": {"name": "", "arguments": ""}},
                     )
-                    if fragment.get("id"):
-                        call["id"] = fragment["id"]
+                    fragment_id = fragment.get("id")
+                    if fragment_id is not None and not isinstance(fragment_id, str):
+                        raise ValueError(
+                            f"SSE fragment id is not a string: {data[:200]!r}")
+                    if fragment_id:
+                        call["id"] = fragment_id
                     function = fragment.get("function") or {}
                     if not isinstance(function, dict):
                         raise ValueError(
                             f"SSE tool-call function is not an object: {data[:200]!r}")
+                    for key in ("name", "arguments"):
+                        value = function.get(key)
+                        if value is not None and not isinstance(value, str):
+                            raise ValueError(
+                                f"SSE function.{key} is not a string: {data[:200]!r}")
                     if function.get("name"):
                         call["function"]["name"] = function["name"]
                     if function.get("arguments"):

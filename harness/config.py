@@ -88,7 +88,9 @@ class InferenceConfig(BaseModel):
 
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key: str = "not-needed"  # vLLM ignores it; the SDK requires a value
-    model: str = "qwen3.6-27b-fp8"
+# NOTE: no `model` field here — the model an agent dispatches is decided
+    # exclusively by provider.model / provider.roles. A duplicate here would
+    # be silently ignored, the exact failure mode this section forbids.
     # Context profile selects max input+output budget. `performance` is the
     # production default; longer profiles are opt-in per task, never global.
     context_profile: str = "performance"

@@ -2198,3 +2198,138 @@ async def test_null_tool_call_fragment_is_retried(tmp_path, monkeypatch):
     assert result.status == "COMPLETED"
     assert len(calls) == 3, (
         f"invalid tool-call fragments were not retried (calls={len(calls)})")
+
+
+# -- round-16 findings -------------------------------------------------------
+
+
+async def test_malformed_json_tool_calls_are_retried(tmp_path, monkeypatch):
+    """The non-streaming twin of the SSE fragment validation: an
+    object-valued message carrying tool_calls:[null] (or a non-object
+    function) must retry in-session, not blow up at call.get(...)."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    bodies = [
+        '{"choices": [{"message": {"role": "assistant", "tool_calls": [null]}}]}',
+        '{"choices": [{"message": {"role": "assistant",'
+        ' "tool_calls": [{"id": "c", "function": "x"}]}}]}',
+        '{"choices": [{"message": {"role": "assistant", "content": 42}}]}',
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) <= len(bodies):
+            return httpx.Response(
+                200, content=bodies[len(calls) - 1].encode(),
+                headers={"content-type": "application/json"})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant",
+            "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}})
+
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url,
+                            transport=httpx.MockTransport(handler)))
+
+    inference = InferenceConfig(transient_retries=4, transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED", (
+        f"malformed nested message aborted the session: {result.error}")
+    assert len(calls) == len(bodies) + 1
+
+
+async def test_wrong_typed_sse_scalars_are_retried(tmp_path, monkeypatch):
+    """index:[], numeric content, numeric function.arguments — object
+    checks pass, the accumulator's own operations would raise TypeError.
+    All must invalidate the stream as ValueError instead."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    bad_chunks = [
+        {"choices": [{"delta": {"tool_calls": [{"index": []}]}}]},
+        {"choices": [{"delta": {"content": 42}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": 7}}]}}]},
+    ]
+    good = {"choices": [{"delta": {
+        "role": "assistant",
+        "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}]}
+    usage = {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) <= len(bad_chunks):
+            bad = bad_chunks[len(calls) - 1]
+            return httpx.Response(200, content=(
+                f"data: {json.dumps(bad)}\n\ndata: [DONE]\n\n").encode())
+        return _sse_response(httpx, [good, usage])
+
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url,
+                            transport=httpx.MockTransport(handler)))
+
+    inference = InferenceConfig(streaming=True, transient_retries=4,
+                                transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert len(calls) == len(bad_chunks) + 1, (
+        f"wrong-typed SSE scalars were not retried (calls={len(calls)})")
+
+
+def test_inference_section_has_no_duplicate_model_setting():
+    """The dispatched model is provider.model / provider.roles ONLY: a
+    second model knob in the inference section would be silently ignored —
+    the failure mode this section explicitly forbids."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from harness.config import HarnessConfig, InferenceConfig
+
+    with _pytest.raises(ValidationError):
+        InferenceConfig(model="something-else")          # unknown key now
+
+    # ...and the runner refuses a spec that resolved without a model,
+    # instead of silently substituting a fallback.
+    from harness.agents.base import AgentRequest
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.orchestrator.resources import PrefixAffinityGate
+    from harness.orchestrator.state_machine import Role as _Role
+
+    runner = LocalOpenAICompatibleAgentRunner(InferenceConfig(), PrefixAffinityGate(2))
+    request = AgentRequest(
+        role=_Role.ANALYST, system_prompt="s", prompt="p",
+        cwd=Path("."), repo_root=Path("."), model="",
+    )
+    with _pytest.raises(ValueError, match="provider.model"):
+        asyncio.run(runner.resolve(request))

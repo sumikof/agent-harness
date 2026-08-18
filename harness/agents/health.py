@@ -161,7 +161,13 @@ async def verify_endpoint(
     report = HealthReport()
     base = inference.base_url.rstrip("/")
     root = base[: -len("/v1")] if base.endswith("/v1") else base
-    required = list(dict.fromkeys(models or [inference.model]))
+    required = list(dict.fromkeys(models or []))
+    if not required:
+        report.errors.append(
+            "no models to verify: pass the effective role models "
+            "(harness.main.local_role_models)"
+        )
+        return report
 
     async with httpx.AsyncClient(
         timeout=60.0, headers=auth_headers(inference.api_key)

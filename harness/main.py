@@ -60,8 +60,8 @@ def local_role_models(config: HarnessConfig) -> list[str]:
     """Every model a LOCAL-provider role will actually dispatch.
 
     The invoker resolves each role through `provider.for_role`, so the
-    health gate has to validate those models — not just
-    `inference.model`, which a role override may never use.
+    health gate validates exactly those models (there is no separate
+    inference-side model setting to drift from them).
     """
     from .orchestrator.state_machine import Role
 
@@ -82,7 +82,7 @@ def cmd_health(config: HarnessConfig) -> int:
     tool calling, structured output, prefix cache) before any task runs."""
     from .agents.health import verify_endpoint
 
-    models = local_role_models(config) or [config.inference.model]
+    models = local_role_models(config) or [config.provider.model]
     report = asyncio.run(verify_endpoint(config.inference, models))
     print(f"endpoint          : {config.inference.base_url}")
     print(f"models available  : {report.models_checked or report.model_available}")
