@@ -693,3 +693,151 @@ async def test_health_probes_capabilities_on_every_role_model(monkeypatch):
     assert not report.ok, "startup passed despite a role model that cannot tool-call"
     assert any("weak" in e for e in report.errors)
     assert "weak" in probed, "the second role model was never probed"
+
+
+# -- configuration knobs must act, or be refused ----------------------------
+
+
+def test_context_profile_governs_the_input_budget():
+    """Selecting a profile has to change behaviour, not just documentation,
+    and a configured budget can never exceed the profile's window."""
+    from harness.config import InferenceConfig
+
+    performance = InferenceConfig()
+    assert performance.effective_input_budget() == performance.input_budget_tokens
+
+    wide = InferenceConfig(context_profile="maximum", input_budget_tokens=200_000)
+    assert wide.max_model_len() == 262144
+    assert wide.effective_input_budget() == 200_000     # the profile allows it
+
+    # the same budget under the production profile is clamped to what fits
+    narrow = InferenceConfig(input_budget_tokens=200_000)
+    assert narrow.effective_input_budget() == (
+        narrow.max_model_len() - narrow.max_output_tokens)
+    assert narrow.effective_input_budget() < 200_000
+
+
+def test_unsupported_settings_are_refused_not_ignored():
+    """Silently ignoring a knob promises behaviour the harness does not
+    deliver; these values are refused at load with an explanation."""
+    import pydantic
+
+    from harness.config import DatabaseConfig, GitStrategyConfig, InferenceConfig
+
+    with pytest.raises(pydantic.ValidationError, match="context_profile"):
+        InferenceConfig(context_profile="does-not-exist")
+    with pytest.raises(pydantic.ValidationError, match="task_worktrees"):
+        GitStrategyConfig(task_worktrees=False)
+    with pytest.raises(pydantic.ValidationError, match="integration_strategy"):
+        GitStrategyConfig(integration_strategy="parallel")
+    with pytest.raises(pydantic.ValidationError, match="single_writer"):
+        DatabaseConfig(single_writer=False)
+
+    # the supported values still load
+    assert GitStrategyConfig().task_worktrees
+    assert DatabaseConfig().single_writer
+    assert InferenceConfig(context_profile="long").max_model_len() == 131072
+
+
+def test_orchestrator_budget_follows_the_profile(config):
+    from harness.orchestrator.project import ProjectOrchestrator
+
+    config.inference.context_profile = "performance"
+    config.inference.input_budget_tokens = 200_000     # cannot fit the window
+    orchestrator = ProjectOrchestrator(config)
+    assert orchestrator.context_builder.input_budget_tokens == (
+        config.inference.effective_input_budget())
+    assert orchestrator.context_builder.input_budget_tokens < 200_000
+
+
+# -- benchmark profile selection -------------------------------------------
+
+
+def _bench_run(label, aggregate, errors=0, spec=None):
+    return {
+        "label": label,
+        "model": "qwen3.6-27b-fp8",
+        "server_profile": {
+            "SPECULATIVE_CONFIG": json.dumps(spec) if spec else "",
+            "MAX_NUM_SEQS": "16",
+        },
+        "summaries": [{
+            "concurrency": 16,
+            "aggregate_output_tokens_per_s": aggregate,
+            "errors": errors,
+            "error_rate": round(errors / 16, 4),
+        }],
+    }
+
+
+def test_tuning_profile_picks_the_best_successful_run(tmp_path):
+    """Sweep points restart the server, so the LAST invocation is not the
+    best one. The frozen profile must be the highest-throughput run that
+    completed without errors — carrying that run's own serving config."""
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import benchmark_inference as bench
+
+    class Args:
+        model = "qwen3.6-27b-fp8"
+        label = "mtp4"          # the most recent point, deliberately not best
+
+    runs = [
+        _bench_run("baseline", 900),
+        _bench_run("mtp2", 2100, spec={"method": "qwen3_next_mtp",
+                                       "num_speculative_tokens": 2}),
+        _bench_run("mtp3", 2450, spec={"method": "qwen3_next_mtp",
+                                       "num_speculative_tokens": 3}),
+        # fastest, but it dropped requests — never "known-good"
+        _bench_run("mtp4", 2600, errors=3, spec={"method": "qwen3_next_mtp",
+                                                 "num_speculative_tokens": 4}),
+    ]
+    bench.write_tuning_profile(tmp_path, Args, runs)
+
+    profile = json.loads((tmp_path / "inference-tuning.json").read_text())
+    assert profile["benchmark_label"] == "mtp3"
+    assert profile["primary_score"]["value"] == 2450
+    assert profile["primary_score"]["error_rate"] == 0.0
+    # the winner's OWN serving configuration, not the current .env
+    assert profile["profile"]["speculative"]["num_speculative_tokens"] == 3
+
+
+def test_tuning_profile_refuses_when_no_clean_run_exists(tmp_path):
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import benchmark_inference as bench
+
+    class Args:
+        model = "qwen3.6-27b-fp8"
+        label = "only"
+
+    bench.write_tuning_profile(tmp_path, Args, [_bench_run("only", 500, errors=2)])
+    assert not (tmp_path / "inference-tuning.json").exists()
+
+
+def test_metric_sum_distinguishes_absent_from_zero(tmp_path):
+    """`healthcheck.sh` treats an empty result as 'metric absent'. An awk
+    accumulator that prints 0 regardless makes that failure unreachable and
+    lets a run be labeled speculative with no speculative metrics."""
+    import subprocess
+
+    script = (REPO_ROOT / "deploy" / "inference" / "healthcheck.sh").read_text()
+    start = script.index("curl -fsS \"${BASE}/metrics\"")
+    awk_program = script[script.index("awk -v pats=", start):]
+    awk_program = awk_program[awk_program.index("'") + 1:]
+    awk_program = awk_program[:awk_program.index("'")]
+
+    present = tmp_path / "present.txt"
+    present.write_text("# HELP x\nvllm:prefix_cache_hits_total 5\n"
+                       "vllm:prefix_cache_queries_total 7\n")
+    absent = tmp_path / "absent.txt"
+    absent.write_text("# HELP x\nvllm:num_requests_running 3\n")
+
+    def run_awk(pattern, path):
+        return subprocess.run(["awk", "-v", f"pats={pattern}", awk_program, str(path)],
+                              capture_output=True, text=True).stdout
+
+    assert run_awk("prefix_cache", present) == "12"
+    assert run_awk("spec_decod", absent) == "", "absent metrics reported as zero"

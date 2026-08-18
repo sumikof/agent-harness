@@ -89,8 +89,11 @@ class ProjectOrchestrator:
         self.verifier = VerificationRunner(
             config.verification, config.repository_path, config.logs_path / "verification"
         )
+        # The budget honours the selected context profile: `long`/`maximum`
+        # widen it, and a configured budget can never exceed the window.
         self.context_builder = ContextBuilder(
-            config.prompts_path, input_budget_tokens=config.inference.input_budget_tokens
+            config.prompts_path,
+            input_budget_tokens=config.inference.effective_input_budget(),
         )
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(

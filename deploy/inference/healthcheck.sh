@@ -27,13 +27,16 @@ chat() {  # chat <json-messages> [extra-json-fields]
 }
 
 metric_sum() {  # metric_sum <substring...> — sum of matching counters
+    # Prints NOTHING when no series matches. An uninitialized accumulator
+    # would print 0, making "metric absent" indistinguishable from "metric
+    # present and zero" — and the absent-metric failures below unreachable.
     curl -fsS "${BASE}/metrics" 2>/dev/null | awk -v pats="$*" '
-        BEGIN { n=split(pats, p, " ") }
+        BEGIN { n=split(pats, p, " "); found=0 }
         /^#/ { next }
         { name=$1; sub(/\{.*/, "", name)
           for (i=1;i<=n;i++) if (index(name, p[i])==0) next
-          s += $NF }
-        END { printf "%.0f", s }'
+          s += $NF; found=1 }
+        END { if (found) printf "%.0f", s }'
 }
 
 step "1. liveness + model availability"
@@ -80,7 +83,7 @@ if [[ -n "${SPECULATIVE_CONFIG:-}" ]]; then
     chat '[{"role":"user","content":"Write a 3-line Python function that adds two numbers."}]' >/dev/null || true
     SPEC_AFTER="$(metric_sum spec_decod)"
     if [[ -z "${SPEC_AFTER}" ]]; then
-        bad "no spec_decode metrics exposed — speculative decoding may not be active"
+        bad "no spec_decode metrics exposed — speculative decoding is configured but not active"
     elif [[ "${SPEC_AFTER}" -gt "${SPEC_BEFORE:-0}" ]]; then
         ok "speculative decode metrics advanced (${SPEC_BEFORE:-0} -> ${SPEC_AFTER})"
     else

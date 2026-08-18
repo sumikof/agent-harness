@@ -373,24 +373,24 @@ def persist(args, summaries: list[dict]) -> None:
         "base_url": args.base_url,
         "model": args.model,
         "stream": args.stream,
+        # The serving configuration THESE numbers were measured against.
+        # Each sweep point restarts the server with a different .env, so a
+        # profile written later must not describe someone else's run.
+        "server_profile": read_env_profile(),
         "summaries": summaries,
     })
     results_path.write_text(json.dumps({"runs": runs}, indent=2))
     print(f"\nresults appended to {results_path} (label={args.label!r})")
 
     if args.mode in ("all", "sweep") and args.write_profile:
-        write_tuning_profile(out_dir, args, summaries)
+        # Selected across ALL accumulated runs, not just this invocation.
+        write_tuning_profile(out_dir, args, runs)
 
     warn_regression(runs, summaries)
 
 
-def write_tuning_profile(out_dir: Path, args, summaries: list[dict]) -> None:
-    """Freeze the measured configuration as the known-good profile.
-
-    Serving-side values are read from deploy/inference/.env at the moment
-    of the benchmark, so the profile records what was actually running.
-    Production then pins this file — no startup auto-tuning.
-    """
+def read_env_profile() -> dict:
+    """The serving configuration currently in deploy/inference/.env."""
     env = {}
     env_path = Path(__file__).resolve().parent.parent / "deploy" / "inference" / ".env"
     if env_path.exists():
@@ -399,7 +399,53 @@ def write_tuning_profile(out_dir: Path, args, summaries: list[dict]) -> None:
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
                 env[key.strip()] = value.strip()
-    target = next((s for s in summaries if s.get("concurrency") == 16), summaries[-1])
+    return env
+
+
+TARGET_CONCURRENCY = 16
+
+
+def score_of(run: dict) -> tuple | None:
+    """Primary score of one run: aggregate tok/s at the target concurrency.
+
+    Returns None for runs that cannot be production candidates — no
+    measurement at the target concurrency, or errors during it. A point
+    that dropped requests is not "known-good" however fast it looked.
+    """
+    for summary in run.get("summaries", []):
+        if summary.get("concurrency") != TARGET_CONCURRENCY:
+            continue
+        if summary.get("errors"):
+            return None
+        value = summary.get("aggregate_output_tokens_per_s")
+        if value is None:
+            return None
+        return (value, summary)
+    return None
+
+
+def write_tuning_profile(out_dir: Path, args, runs: list[dict]) -> None:
+    """Freeze the BEST measured configuration as the known-good profile.
+
+    The documented workflow restarts the server per sweep point, so the
+    most recent invocation is not necessarily the best one — writing it
+    unconditionally would promote whatever happened to run last, including
+    a slower point or one that dropped requests. The winner is chosen
+    across every accumulated labeled run by aggregate throughput at the
+    target concurrency, and its OWN recorded serving configuration is what
+    gets written. Production pins this file — no startup auto-tuning.
+    """
+    scored = [(score_of(run), run) for run in runs]
+    candidates = [(score[0], score[1], run) for score, run in scored if score]
+    if not candidates:
+        print(
+            f"no run measured concurrency {TARGET_CONCURRENCY} without errors; "
+            "tuning profile NOT written — rerun the sweep before production",
+            file=sys.stderr,
+        )
+        return
+    best_value, best_summary, best_run = max(candidates, key=lambda c: c[0])
+    env = best_run.get("server_profile") or {}
     speculative = None
     if env.get("SPECULATIVE_CONFIG"):
         try:
@@ -409,13 +455,15 @@ def write_tuning_profile(out_dir: Path, args, summaries: list[dict]) -> None:
     profile = {
         "hardware": "DGX Spark",
         "model": env.get("MODEL", "Qwen/Qwen3.6-27B-FP8"),
-        "served_model_name": args.model,
+        "served_model_name": best_run.get("model", args.model),
         "vllm_version": env.get("VLLM_MIN_VERSION", ">=0.19 (record the measured version)"),
         "container": env.get("VLLM_IMAGE", "PIN-THE-VERIFIED-TAG"),
-        "benchmark_label": args.label,
+        "benchmark_label": best_run.get("label"),
+        "selected_from": sorted({r.get("label") for _, _, r in candidates}),
         "primary_score": {
-            "metric": "aggregate_output_tokens_per_s @ concurrency 16",
-            "value": target.get("aggregate_output_tokens_per_s"),
+            "metric": f"aggregate_output_tokens_per_s @ concurrency {TARGET_CONCURRENCY}",
+            "value": best_value,
+            "error_rate": best_summary.get("error_rate"),
         },
         "profile": {
             "max_model_len": int(env.get("MAX_MODEL_LEN", 65536)),
@@ -433,7 +481,8 @@ def write_tuning_profile(out_dir: Path, args, summaries: list[dict]) -> None:
     }
     path = out_dir / "inference-tuning.json"
     path.write_text(json.dumps(profile, indent=2))
-    print(f"tuning profile written to {path}")
+    print(f"tuning profile written to {path} "
+          f"(best: label={best_run.get('label')!r}, {best_value} tok/s)")
 
 
 def warn_regression(runs: list[dict], current: list[dict]) -> None:

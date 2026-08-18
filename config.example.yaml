@@ -31,9 +31,11 @@ inference:
   model: qwen3.6-27b-fp8
   # performance (65536, production default) | long (131072) | maximum (262144).
   # Long profiles must also be enabled server-side (deploy/inference/.env).
+  # The profile caps the input budget below: an unknown name is rejected.
   context_profile: performance
   # Input token budget; the remainder of the context window is reserved for
-  # reasoning, tool calls and model output.
+  # reasoning, tool calls and model output. Clamped to what context_profile
+  # can hold after max_output_tokens.
   input_budget_tokens: 50000
   max_output_tokens: 8192
   sampling:                # Qwen3.6 coding-agent defaults; fixed per profile
@@ -70,7 +72,8 @@ parallelism:
 
 git:
   task_worktrees: true     # one isolated worktree + branch per task attempt
-  integration_strategy: serialized
+                           # (false is REFUSED: parallel tasks would share a tree)
+  integration_strategy: serialized   # the only implemented strategy
   worktrees_dir: worktrees
   branch_prefix: harness/task
 
@@ -78,6 +81,7 @@ database:
   journal_mode: WAL
   busy_timeout_ms: 5000
   single_writer: true      # all writes serialized through one writer
+                           # (false is REFUSED under parallel execution)
 
 verification:
   # Preset command sets: java | python | node | none

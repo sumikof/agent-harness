@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ProjectConfig(BaseModel):
@@ -95,8 +95,31 @@ class InferenceConfig(BaseModel):
     transient_retries: int = 4
     transient_retry_base_delay: float = 2.0
 
+    @model_validator(mode="after")
+    def _known_profile(self) -> "InferenceConfig":
+        # Checked on the whole model: `context_profiles` is declared after
+        # `context_profile`, so a field validator would not see it yet.
+        if self.context_profile not in self.context_profiles:
+            raise ValueError(
+                f"unknown context_profile '{self.context_profile}'; "
+                f"available: {sorted(self.context_profiles)}"
+            )
+        return self
+
     def max_model_len(self) -> int:
         return self.context_profiles.get(self.context_profile, 65536)
+
+    def effective_input_budget(self) -> int:
+        """Input token budget that the selected context profile can hold.
+
+        `context_profile` has to change behaviour, not just documentation:
+        the budget can never exceed what is left of the profile's window
+        after the reserved output. A configured `input_budget_tokens` that
+        does not fit is clamped rather than silently overrunning the
+        server's --max-model-len.
+        """
+        headroom = self.max_model_len() - self.max_output_tokens
+        return max(1, min(self.input_budget_tokens, headroom))
 
     def sampling_for_role(self, role: str) -> SamplingConfig:
         """The global profile with the role's EXPLICIT overrides applied.
@@ -147,6 +170,32 @@ class GitStrategyConfig(BaseModel):
     worktrees_dir: str = "worktrees"
     branch_prefix: str = "harness/task"
 
+    # These two describe invariants the parallel design depends on, so the
+    # only supported values are the ones it enforces. Accepting anything
+    # else and ignoring it would promise isolation the harness does not
+    # deliver — better to fail at load with an explanation.
+    @field_validator("task_worktrees")
+    @classmethod
+    def _worktrees_required(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError(
+                "git.task_worktrees cannot be disabled: parallel tasks would "
+                "share one working tree and overwrite each other. Set "
+                "parallelism.max_parallel_tasks: 1 if you want sequential runs."
+            )
+        return value
+
+    @field_validator("integration_strategy")
+    @classmethod
+    def _serialized_only(cls, value: str) -> str:
+        if value != "serialized":
+            raise ValueError(
+                f"unsupported git.integration_strategy '{value}'; only "
+                "'serialized' is implemented (concurrent merges into the "
+                "integration branch are never safe)."
+            )
+        return value
+
 
 class DatabaseConfig(BaseModel):
     journal_mode: str = "WAL"
@@ -154,6 +203,17 @@ class DatabaseConfig(BaseModel):
     # All writes go through one serialized writer (process-wide lock).
     # Parallel agent coroutines/threads never race write transactions.
     single_writer: bool = True
+
+    @field_validator("single_writer")
+    @classmethod
+    def _single_writer_required(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError(
+                "database.single_writer cannot be disabled: parallel agent "
+                "coroutines and worker threads would interleave write "
+                "transactions on one SQLite connection."
+            )
+        return value
 
 
 class VerificationConfig(BaseModel):
