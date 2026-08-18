@@ -240,6 +240,18 @@ class ContextBuilder:
                     total -= len(text) - len(replacement)
                     trimmed[name] = replacement
         if total > budget_chars:
+            # Even the notices don't fit: drop dynamic sections outright —
+            # an absent section is recoverable via artifacts, a rejected
+            # project is not. Only then can a remaining overflow be blamed
+            # on stable content.
+            for name in _TRUNCATABLE:
+                if total <= budget_chars:
+                    break
+                text = trimmed.get(name)
+                if text:
+                    total -= len(text)
+                    trimmed[name] = ""
+        if total > budget_chars:
             # Only stable, untrimmable content is left (system prompt, rules,
             # project context, assignment). The provider never truncates
             # those either, so every request for this project would be

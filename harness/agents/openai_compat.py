@@ -471,11 +471,23 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 raise ValueError(
                     f"malformed SSE data event ({exc}): {data[:200]!r}"
                 )
+            # Valid JSON of the wrong SHAPE (null, [], a string) is the same
+            # trust failure as bad syntax — and letting AttributeError out
+            # here would bypass the in-session retry that ValueError reaches.
+            if not isinstance(chunk, dict):
+                raise ValueError(f"SSE chunk is not an object: {data[:200]!r}")
             saw_chunk = True
             if chunk.get("usage"):
                 usage = chunk["usage"]
-            for choice in chunk.get("choices") or []:
+            choices = chunk.get("choices") or []
+            if not isinstance(choices, list):
+                raise ValueError(f"SSE chunk has non-list choices: {data[:200]!r}")
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise ValueError(f"SSE choice is not an object: {data[:200]!r}")
                 delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    raise ValueError(f"SSE delta is not an object: {data[:200]!r}")
                 if delta.get("content"):
                     content_parts.append(delta["content"])
                 if delta.get("reasoning_content"):

@@ -1939,3 +1939,86 @@ async def test_context_budget_error_fails_the_project_durably(config, monkeypatc
     failed = orchestrator.db.query_all(
         "SELECT * FROM events WHERE event_type = 'PROJECT_FAILED'")
     assert failed and "context budget" in (failed[0]["payload"] or "")
+
+
+# -- round-13 findings -------------------------------------------------------
+
+
+def test_sections_are_dropped_entirely_when_even_the_notice_cannot_fit(tmp_path):
+    """Stable content that exactly fills the budget must not make ANY
+    dynamic extra fatal: when not even the truncation notice fits, the
+    section is dropped outright — its full content lives in artifacts."""
+    from harness.context.builder import CHARS_PER_TOKEN, ContextBuilder
+    from harness.context.project_context import ProjectContext
+    from harness.orchestrator.state_machine import Role
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    budget_tokens = 1000                                     # 4000 chars
+    builder = ContextBuilder(prompts, input_budget_tokens=budget_tokens)
+    project = ProjectContext(
+        name="p", goal="g", repository_path=str(tmp_path), base_branch="main",
+    )
+    # measure the stable-only size, then pad the goal so stable content
+    # sits within ~20 chars of the budget — less than the notice needs
+    base = builder.build_prompt(Role.DEVELOPER, project)
+    pad = budget_tokens * CHARS_PER_TOKEN - len(base) - 20
+    tight = ProjectContext(
+        name="p", goal="g" * pad, repository_path=str(tmp_path),
+        base_branch="main",
+    )
+    assert len(builder.build_prompt(Role.DEVELOPER, tight)) <= 4000
+
+    # a large extra must be droppable, not fatal
+    prompt = builder.build_prompt(Role.DEVELOPER, tight, extra="E" * 50000)
+    assert len(prompt) <= 4000, "prompt exceeds the budget"
+    assert "E" * 100 not in prompt
+
+
+async def test_wrong_shape_sse_chunk_is_retried(tmp_path, monkeypatch):
+    """`data: null` is valid JSON but not a chunk; letting AttributeError
+    escape would bypass the in-session retry and discard the accumulated
+    conversation."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    good = {"choices": [{"delta": {
+        "role": "assistant",
+        "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}]}
+    usage = {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:                    # valid JSON, wrong shape
+            return httpx.Response(
+                200, content=b"data: null\n\ndata: [DONE]\n\n")
+        if len(calls) == 2:                    # non-object choice
+            return httpx.Response(
+                200, content=b'data: {"choices": ["x"]}\n\ndata: [DONE]\n\n')
+        return _sse_response(httpx, [good, usage])
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(streaming=True, transient_retries=3,
+                                transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert len(calls) == 3, (
+        f"wrong-shape SSE chunks were not retried in-session (calls={len(calls)})")
