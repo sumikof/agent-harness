@@ -37,10 +37,12 @@ class InvariantChecker:
         db: Database,
         git: GitRepository | None = None,
         artifacts_root: Path | None = None,
+        max_parallel_agent_runs: int = 16,
     ):
         self.db = db
         self.git = git
         self.artifacts_root = Path(artifacts_root) if artifacts_root else None
+        self.max_parallel_agent_runs = max_parallel_agent_runs
         self.events = EventRepository(db)
 
     def _resolve_artifact(self, stored_path: str) -> Path:
@@ -52,10 +54,11 @@ class InvariantChecker:
     def check_all(self, project_id: int | None = None) -> list[Violation]:
         violations: list[Violation] = []
         violations += self.check_event_streams()
-        violations += self.check_single_running_agent()
+        violations += self.check_agent_run_concurrency()
         violations += self.check_running_runs_have_provenance()
         violations += self.check_operation_links()
         violations += self.check_completed_tasks(project_id)
+        violations += self.check_worktrees(project_id)
         return violations
 
     # -- ledger ------------------------------------------------------------
@@ -73,18 +76,37 @@ class InvariantChecker:
 
     # -- agent runs --------------------------------------------------------
 
-    def check_single_running_agent(self) -> list[Violation]:
+    def check_agent_run_concurrency(self) -> list[Violation]:
+        """RUNNING AgentRun count <= configured max_parallel_agent_runs, and
+        at most ONE RUNNING mutating agent per task attempt (worktree)."""
+        violations: list[Violation] = []
         rows = self.db.query_all("SELECT id FROM agent_runs WHERE status = 'RUNNING'")
-        if len(rows) > 1:
-            return [
+        if len(rows) > self.max_parallel_agent_runs:
+            violations.append(
                 Violation(
                     "CONCURRENT_AGENT_RUNS",
                     Severity.ERROR,
                     f"{len(rows)} agent runs RUNNING simultaneously "
-                    f"(ids {[r['id'] for r in rows]}); the harness runs at most one",
+                    f"(ids {[r['id'] for r in rows]}); configured limit is "
+                    f"{self.max_parallel_agent_runs}",
                 )
-            ]
-        return []
+            )
+        for row in self.db.query_all(
+            """
+            SELECT attempt_id, COUNT(*) AS n FROM agent_runs
+            WHERE status = 'RUNNING' AND mutating = 1 AND attempt_id IS NOT NULL
+            GROUP BY attempt_id HAVING COUNT(*) > 1
+            """
+        ):
+            violations.append(
+                Violation(
+                    "CONCURRENT_MUTATING_RUNS_PER_ATTEMPT",
+                    Severity.ERROR,
+                    f"attempt {row['attempt_id']} has {row['n']} RUNNING mutating "
+                    "agent runs; one worktree admits one writer",
+                )
+            )
+        return violations
 
     def check_running_runs_have_provenance(self) -> list[Violation]:
         violations = []
@@ -181,6 +203,77 @@ class InvariantChecker:
                     "COMPLETED_COMMIT_UNRESOLVABLE", Severity.ERROR,
                     f"task {task['task_key']} records commit {commit} that does not "
                     "exist in the repository",
+                ))
+        return violations
+
+    # -- worktrees ---------------------------------------------------------
+
+    def check_worktrees(self, project_id: int | None = None) -> list[Violation]:
+        """Parallel-execution worktree invariants:
+
+        - a RUNNING attempt with a mutating agent has a dedicated worktree
+        - two RUNNING attempts never share a worktree
+        - each recorded worktree exists and has its expected branch checked out
+        - each attempt's base_commit resolves in git
+        """
+        violations: list[Violation] = []
+        sql = """
+            SELECT a.*, t.task_key, t.project_id FROM task_attempts a
+            JOIN tasks t ON t.id = a.task_id
+            WHERE a.status = 'RUNNING'
+        """
+        params: tuple = ()
+        if project_id is not None:
+            sql += " AND t.project_id = ?"
+            params = (project_id,)
+        running = self.db.query_all(sql, params)
+
+        seen_worktrees: dict[str, str] = {}
+        for attempt in running:
+            task_key = attempt["task_key"]
+            worktree = attempt["worktree_path"]
+            branch = attempt["branch"]
+            base_commit = attempt["base_commit"]
+            if worktree:
+                if worktree in seen_worktrees:
+                    violations.append(Violation(
+                        "WORKTREE_SHARED", Severity.ERROR,
+                        f"RUNNING attempts of {seen_worktrees[worktree]} and {task_key} "
+                        f"share worktree {worktree}",
+                    ))
+                seen_worktrees[worktree] = task_key
+                path = Path(worktree)
+                if not path.is_dir():
+                    violations.append(Violation(
+                        "WORKTREE_MISSING", Severity.ERROR,
+                        f"RUNNING attempt {attempt['id']} ({task_key}) records worktree "
+                        f"{worktree}, which does not exist",
+                    ))
+                elif branch:
+                    checked_out = GitRepository(path).current_branch()
+                    if checked_out != branch:
+                        violations.append(Violation(
+                            "WORKTREE_WRONG_BRANCH", Severity.ERROR,
+                            f"worktree {worktree} has '{checked_out}' checked out; "
+                            f"attempt {attempt['id']} expects '{branch}'",
+                        ))
+            else:
+                mutating = self.db.query_one(
+                    "SELECT 1 FROM agent_runs WHERE attempt_id = ? AND mutating = 1 "
+                    "AND status = 'RUNNING'",
+                    (attempt["id"],),
+                )
+                if mutating is not None:
+                    violations.append(Violation(
+                        "MUTATING_RUN_WITHOUT_WORKTREE", Severity.ERROR,
+                        f"RUNNING attempt {attempt['id']} ({task_key}) has a mutating "
+                        "agent but no dedicated worktree recorded",
+                    ))
+            if base_commit and self.git is not None and not self.git.commit_exists(base_commit):
+                violations.append(Violation(
+                    "ATTEMPT_BASE_COMMIT_UNRESOLVABLE", Severity.ERROR,
+                    f"attempt {attempt['id']} ({task_key}) records base commit "
+                    f"{base_commit} that does not exist in the repository",
                 ))
         return violations
 

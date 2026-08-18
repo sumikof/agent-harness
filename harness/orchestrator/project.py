@@ -1,6 +1,8 @@
-"""Project Loop: plan once, then run tasks strictly one at a time.
+"""Project Loop: plan once, then run READY tasks in parallel.
 
 Owns wiring of every component and the project-level state machine.
+Task-level parallelism is delegated to ParallelTaskScheduler; the
+project loop keeps planning, replanning and finalization serialized.
 """
 
 from __future__ import annotations
@@ -27,15 +29,19 @@ from ..database.project_repository import ProjectRepository
 from ..database.run_repository import RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
+from ..git.integration import IntegrationManager
 from ..git.repository import GitRepository
+from ..git.worktree import WorktreeManager
 from ..verification.runner import VerificationRunner
 from ..workspace_lock import WorkspaceLock
 from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded, BudgetManager
 from .invariants import InvariantChecker, Severity
 from .recovery import RecoveryIntegrityError, RecoveryManager
+from .resources import ResourcePools
+from .scheduler import ParallelTaskScheduler, SchedulerOutcome
 from .state_machine import ProjectState, TaskState
-from .task_runner import TaskOutcome, TaskRunner
+from .task_runner import TaskRunner
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +61,11 @@ class ProjectOrchestrator:
         self.lock = WorkspaceLock(config.workspace_path / "harness.lock")
         self.lock.acquire()
 
-        self.db = Database(config.db_path)
+        self.db = Database(
+            config.db_path,
+            busy_timeout_ms=config.database.busy_timeout_ms,
+            journal_mode=config.database.journal_mode,
+        )
         self.events = EventRepository(self.db)
         # Repositories share the EventRepository so every state change and
         # its ledger event are written in one transaction.
@@ -66,10 +76,20 @@ class ProjectOrchestrator:
         self.artifacts = ArtifactManager(config.artifacts_path)
         self.git = GitRepository(config.repository_path)
         self.checkpoint = CheckpointManager(self.git, self.operations)
+        self.worktrees = WorktreeManager(
+            self.git, config.worktrees_path, config.git.branch_prefix
+        )
+        self.integration = IntegrationManager(
+            self.git, self.operations, integration_branch=config.project.base_branch
+        )
+        self.pools = ResourcePools(config.parallelism)
+        # Final verification runs against the integration checkout.
         self.verifier = VerificationRunner(
             config.verification, config.repository_path, config.logs_path / "verification"
         )
-        self.context_builder = ContextBuilder(config.prompts_path)
+        self.context_builder = ContextBuilder(
+            config.prompts_path, input_budget_tokens=config.inference.input_budget_tokens
+        )
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(
             config, self.context_builder, self.artifacts, self.runs, self.events,
@@ -77,13 +97,21 @@ class ProjectOrchestrator:
         )
         self.task_runner = TaskRunner(
             config, self.invoker, self.tasks, self.runs, self.events,
-            self.artifacts, self.git, self.checkpoint, self.verifier, self.operations,
+            self.artifacts, self.git, self.worktrees, self.integration,
+            self.pools, self.operations,
+        )
+        self.scheduler = ParallelTaskScheduler(
+            config, self.tasks, self.task_runner, self.events, self.budget
         )
         self.recovery = RecoveryManager(
             self.tasks, self.events, self.artifacts, self.git, self.checkpoint,
-            operations=self.operations, runs=self.runs,
+            operations=self.operations, runs=self.runs, worktrees=self.worktrees,
+            integration=self.integration,
         )
-        self.invariants = InvariantChecker(self.db, self.git, config.artifacts_path)
+        self.invariants = InvariantChecker(
+            self.db, self.git, config.artifacts_path,
+            max_parallel_agent_runs=config.parallelism.agent_run_limit(),
+        )
         self._replan_for_new_goal = False
 
     # ------------------------------------------------------------------
@@ -281,24 +309,23 @@ class ProjectOrchestrator:
         replans = 0
         while True:
             self.budget.check_project(project_id)
-            task = self.tasks.next_runnable(project_id)
-            if task is None:
+            # The scheduler runs READY tasks in parallel (worktree-isolated)
+            # until the DAG is exhausted or a replan is requested. Planning
+            # itself stays serialized: the scheduler drains in-flight tasks
+            # before returning REPLAN.
+            outcome = await self.scheduler.run(project_id, project_ctx)
+            if outcome == SchedulerOutcome.DONE:
                 return await self._finalize(project_id, project_ctx)
 
-            outcome = await self.task_runner.run_task(project_id, task, project_ctx)
-            logger.info("task %s outcome: %s", task["task_key"], outcome)
-
-            if outcome == TaskOutcome.REPLAN:
-                replans += 1
-                if replans > MAX_REPLANS:
-                    self.projects.set_status(project_id, ProjectState.FAILED, force=True)
-                    self.events.emit("PROJECT_FAILED", project_id=project_id,
-                                     payload={"reason": "max replans exceeded"})
-                    return ProjectState.FAILED
-                self.projects.set_status(project_id, ProjectState.REPLANNING, force=True)
-                await self._plan(project_id, project_ctx, replan=True)
-                self.projects.set_status(project_id, ProjectState.RUNNING)
-            # COMPLETED / SPLIT / BLOCKED: just take the next runnable task
+            replans += 1
+            if replans > MAX_REPLANS:
+                self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+                self.events.emit("PROJECT_FAILED", project_id=project_id,
+                                 payload={"reason": "max replans exceeded"})
+                return ProjectState.FAILED
+            self.projects.set_status(project_id, ProjectState.REPLANNING, force=True)
+            await self._plan(project_id, project_ctx, replan=True)
+            self.projects.set_status(project_id, ProjectState.RUNNING)
 
     async def _finalize(self, project_id: int, project_ctx: ProjectContext) -> ProjectState:
         # Any non-terminal task blocks completion: BLOCKED tasks, but also
@@ -326,7 +353,7 @@ class ProjectOrchestrator:
         verify_op_id = self.operations.record_intent(
             OperationType.VERIFICATION_COMMAND,
             {"commands": self.verifier.commands(), "label": "final",
-             "base_diff_sha256": self.task_runner._diff_hash()},
+             "base_diff_sha256": self._main_diff_hash()},
             project_id=project_id,
         )
         result = self.verifier.run(
@@ -334,7 +361,7 @@ class ProjectOrchestrator:
             # Command-granular recovery: the intent always knows the latest
             # tree state the final verification has produced.
             on_step=lambda: self.operations.annotate(
-                verify_op_id, {"base_diff_sha256": self.task_runner._diff_hash()}),
+                verify_op_id, {"base_diff_sha256": self._main_diff_hash()}),
         )
         # Artifact first (an idempotent filesystem write), then result AND
         # final project state/events in ONE transaction: either the run is
@@ -359,6 +386,13 @@ class ProjectOrchestrator:
             logger.info("project completed")
             return ProjectState.COMPLETED
         return ProjectState.FAILED
+
+    def _main_diff_hash(self) -> str:
+        try:
+            return self.git.dirty_state_hash()
+        except Exception as exc:
+            logger.warning("could not hash dirty state: %s", exc)
+            return ""
 
     # ------------------------------------------------------------------
 

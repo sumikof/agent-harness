@@ -34,9 +34,11 @@ class FakeRunner(BaseAgentRunner):
         self.repo_path = repo_path
         self.review_verdicts = review_verdicts
         self.calls: list[Role] = []
+        self.cwd: Path = repo_path  # updated per run: the task's worktree
 
     async def run(self, request: ResolvedAgentRunSpec) -> AgentResult:
         self.calls.append(request.role)
+        self.cwd = Path(request.cwd)
         payload = self._payload(request.role)
         return AgentResult(
             status="COMPLETED",
@@ -62,7 +64,7 @@ class FakeRunner(BaseAgentRunner):
         if role == Role.ANALYST:
             return {"task": "T001", "summary": "create the file", "files": ["feature.txt"]}
         if role == Role.DEVELOPER:
-            (self.repo_path / "feature.txt").write_text("feature\n")
+            (self.cwd / "feature.txt").write_text("feature\n")
             return {"task": "T001", "summary": "wrote file", "changed_files": ["feature.txt"]}
         if role == Role.TESTER:
             return {"task": "T001", "summary": "coverage ok"}
@@ -99,7 +101,7 @@ def config(tmp_path) -> HarnessConfig:
 
 
 def install_fake(monkeypatch, fake: FakeRunner) -> None:
-    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider: fake)
+    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider, inference=None: fake)
 
 
 def test_ensure_project_identity_rules(config, tmp_path):
@@ -514,7 +516,7 @@ async def test_failed_run_cost_still_hits_run_cap(config, monkeypatch):
             return AgentResult(status="FAILED", error="boom", cost_usd=5.0)
 
     monkeypatch.setattr(agent_invoker_module, "create_runner",
-                        lambda provider: ExpensiveFailingRunner())
+                        lambda provider, inference=None: ExpensiveFailingRunner())
 
     state = await orchestrator.run()
 
@@ -532,7 +534,7 @@ async def test_verification_failure_triggers_fresh_developer(config, monkeypatch
 
     def payload_with_marker(role):
         if role == Role.DEVELOPER and fake.calls.count(Role.DEVELOPER) >= 2:
-            (config.repository_path / "marker.txt").write_text("ok\n")
+            (fake.cwd / "marker.txt").write_text("ok\n")  # into the task worktree
         return original_payload(role)
 
     fake._payload = payload_with_marker

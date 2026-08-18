@@ -107,6 +107,12 @@ class ResolvedAgentRunSpec(BaseModel):
     cwd: str = ""
     repo_root: str = ""
     repeat_guard: Optional[RepeatGuardConfig] = None
+    # Local OpenAI-compatible provider extras (unused by other providers).
+    base_url: str = ""
+    sampling: dict = Field(default_factory=dict)
+    max_output_tokens: Optional[int] = None
+    tool_schema_hash: str = ""
+    prefix_group_key: str = ""
     # Full texts needed at execution time; excluded from the persisted dump.
     system_prompt: str = ""
     prompt: str = ""

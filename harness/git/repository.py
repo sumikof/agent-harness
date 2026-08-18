@@ -382,8 +382,10 @@ class GitRepository:
         Used by crash recovery to decide whether a journaled GIT_COMMIT
         intent was already executed before the process died.
         """
+        # --all: harness commits may live on task branches (worktrees) that
+        # are not ancestors of the current checkout.
         result = self._run(
-            "log", f"-{limit}", "--fixed-strings", f"--grep={key}: {value}",
+            "log", "--all", f"-{limit}", "--fixed-strings", f"--grep={key}: {value}",
             "--format=%H", check=False,
         )
         if result.returncode != 0:
@@ -408,3 +410,81 @@ class GitRepository:
 
     def log_oneline(self, limit: int = 20) -> str:
         return self._run("log", "--oneline", f"-{limit}", check=False).stdout
+
+    # -- worktrees ---------------------------------------------------------
+
+    def add_worktree(self, path: str | Path, branch: str, base_ref: str) -> None:
+        """Create an isolated worktree on a NEW branch at base_ref."""
+        self._run("worktree", "add", "-b", branch, str(path), base_ref)
+
+    def remove_worktree(self, path: str | Path, force: bool = True) -> None:
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(str(path))
+        self._run(*args)
+        self._run("worktree", "prune", check=False)
+
+    def list_worktrees(self) -> list[str]:
+        """Paths of all linked worktrees (the main checkout excluded)."""
+        out = self._run("worktree", "list", "--porcelain").stdout
+        paths = [
+            line[len("worktree "):]
+            for line in out.splitlines()
+            if line.startswith("worktree ")
+        ]
+        return [p for p in paths if Path(p).resolve() != self.path.resolve()]
+
+    def prune_worktrees(self) -> None:
+        self._run("worktree", "prune", check=False)
+
+    def branch_exists(self, branch: str) -> bool:
+        result = self._run(
+            "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+        )
+        return result.returncode == 0
+
+    def delete_branch(self, branch: str) -> None:
+        self._run("branch", "-D", branch, check=False)
+
+    def rev_parse(self, ref: str) -> str | None:
+        result = self._run("rev-parse", ref, check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    # -- merges (serialized integration) -----------------------------------
+
+    def merge_no_ff(self, ref: str, message: str, trailers: dict[str, str] | None = None) -> str:
+        """Merge `ref` into the current branch with an explicit merge commit.
+
+        Raises MergeConflict (a GitError subclass) on conflicts, leaving the
+        merge in progress — the caller decides between resolve and abort.
+        """
+        if trailers:
+            trailer_block = "\n".join(f"{key}: {value}" for key, value in trailers.items())
+            message = f"{message}\n\n{trailer_block}"
+        result = self._run(
+            "-c", "user.name=agent-harness",
+            "-c", "user.email=agent-harness@localhost",
+            "merge", "--no-ff", "-m", message, ref,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise MergeConflict(
+                f"merge of {ref} failed: {result.stdout.strip()} {result.stderr.strip()}"
+            )
+        return self.head_commit() or ""
+
+    def merge_in_progress(self) -> bool:
+        git_dir = self._run("rev-parse", "--git-dir").stdout.strip()
+        return (self.path / git_dir / "MERGE_HEAD").exists()
+
+    def merge_abort(self) -> None:
+        self._run("merge", "--abort", check=False)
+
+    def conflicted_paths(self) -> list[str]:
+        out = self._run("diff", "--name-only", "--diff-filter=U", check=False).stdout
+        return [line for line in out.splitlines() if line.strip()]
+
+
+class MergeConflict(GitError):
+    """A merge could not complete cleanly; the caller owns abort/resolve."""

@@ -1,14 +1,27 @@
-"""Task Loop: Analyst -> Developer -> Tester -> Verification -> Reviewer.
+"""Task Loop: Analyst -> Developer -> Tester -> Verification -> Reviewer
+-> serialized Integration.
 
 All routing decisions here are deterministic Python. Agents think;
 the harness decides who runs next.
+
+Parallel-execution model: every task attempt cycle gets an ISOLATED git
+worktree + branch (created from the current integration HEAD). All roles
+of the cycle share that worktree's filesystem state — conversations stay
+fresh, uncommitted diffs are visible to Tester/Reviewer. After Reviewer
+PASS the harness commits on the task branch (task_commit) and the
+IntegrationManager merges it — strictly serialized — into the
+integration branch (integration_commit = the official checkpoint).
+Integration conflicts are a normal outcome and route into a fresh repair
+attempt based on the NEW integration HEAD.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from enum import StrEnum
 
 from ..agents import analyst, developer, diagnostician, reviewer, tester
@@ -18,7 +31,7 @@ from ..config import HarnessConfig
 from ..context.attempt_context import AttemptContext
 from ..context.project_context import ProjectContext
 from ..context.task_context import TaskContext
-from ..database.event_repository import EventRepository
+from ..database.event_repository import EventRepository, EventType
 from ..database.operation_repository import (
     OperationRepository,
     OperationStatus,
@@ -27,10 +40,13 @@ from ..database.operation_repository import (
 from ..database.run_repository import VERIFY_FAIL, VERIFY_PASS, RunRepository
 from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
+from ..git.integration import IntegrationManager, IntegrationStatus
 from ..git.repository import GitRepository
+from ..git.worktree import WorktreeHandle, WorktreeManager
 from ..verification.runner import VerificationRunner
 from .agent_invoker import AgentConfigurationError, AgentInvoker, AgentRunFailed
 from .budget import BudgetExceeded
+from .resources import ResourcePools
 from .state_machine import (
     AttemptState,
     DiagnosisVerdict,
@@ -45,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 MAX_DIAGNOSIS_ROUNDS = 2
 REVIEW_DIFF_LIMIT = 30000
+CONFLICT_DIFF_LIMIT = 20000
 
 
 class TaskOutcome(StrEnum):
@@ -52,6 +69,19 @@ class TaskOutcome(StrEnum):
     REPLAN = "REPLAN"
     SPLIT = "SPLIT"
     BLOCKED = "BLOCKED"
+
+
+@dataclass
+class TaskEnv:
+    """Per-cycle execution environment: one worktree, one verifier."""
+
+    handle: WorktreeHandle
+    checkpoint: CheckpointManager
+    verifier: VerificationRunner
+
+    @property
+    def git(self) -> GitRepository:
+        return self.handle.repo
 
 
 class TaskRunner:
@@ -64,8 +94,9 @@ class TaskRunner:
         events: EventRepository,
         artifacts: ArtifactManager,
         git: GitRepository,
-        checkpoint: CheckpointManager,
-        verifier: VerificationRunner,
+        worktrees: WorktreeManager,
+        integration: IntegrationManager,
+        pools: ResourcePools,
         operations: OperationRepository | None = None,
     ):
         self.config = config
@@ -74,10 +105,33 @@ class TaskRunner:
         self.runs = runs
         self.events = events
         self.artifacts = artifacts
-        self.git = git
-        self.checkpoint = checkpoint
-        self.verifier = verifier
+        self.git = git                     # main checkout = integration branch
+        self.worktrees = worktrees
+        self.integration = integration
+        self.pools = pools
         self.operations = operations
+
+    # ------------------------------------------------------------------
+
+    def _create_env(self, task_key: str, cycle: int) -> TaskEnv:
+        base_commit = self.git.head_commit()
+        if base_commit is None:
+            raise RuntimeError("cannot create a task worktree without a baseline commit")
+        handle = self.worktrees.create(task_key, cycle, base_commit)
+        verifier = VerificationRunner(
+            self.config.verification,
+            handle.path,
+            self.config.logs_path / "verification" / f"{task_key}-c{cycle}",
+        )
+        return TaskEnv(
+            handle=handle,
+            checkpoint=CheckpointManager(handle.repo, self.operations),
+            verifier=verifier,
+        )
+
+    def _dispose_env(self, env: TaskEnv | None) -> None:
+        if env is not None:
+            self.worktrees.remove(env.handle)
 
     async def run_task(
         self, project_id: int, task_row: sqlite3.Row, project_ctx: ProjectContext
@@ -92,27 +146,31 @@ class TaskRunner:
         task_ctx = self._build_task_ctx(task_row)
         feedback = AttemptContext()
         diagnosis_rounds = 0
+        integration_repairs = 0
         need_analysis = True
+        env: TaskEnv | None = None
 
         while True:
             try:
+                if env is None:
+                    cycle = (self.tasks.get(task_id)["attempt_count"] or 0) + 1
+                    env = self._create_env(task_key, cycle)
                 # The attempt is opened BEFORE analysis so that an Analyst
                 # failure is recorded as a failed attempt and counts toward
                 # the retry limit — otherwise a failing analysis would loop
                 # outside every budget except wall clock.
-                attempt_id = self.tasks.start_attempt(task_id, self.git.head_commit())
+                attempt_id = self.tasks.start_attempt(
+                    task_id, env.git.head_commit(),
+                    worktree_path=str(env.handle.path), branch=env.handle.branch,
+                )
                 feedback.attempt_no = self.tasks.get(task_id)["attempt_count"]
 
                 if need_analysis:
                     self.tasks.set_status(task_id, TaskState.ANALYZING, force=True)
-                    brief = await self.invoker.invoke(
-                        analyst.SPEC,
-                        project_id,
-                        project_ctx,
-                        task_ctx=task_ctx,
-                        attempt_ctx=feedback,
-                        task_id=task_id,
-                        attempt_id=attempt_id,
+                    brief = await self._invoke(
+                        analyst.SPEC, project_id, project_ctx, env,
+                        task_ctx=task_ctx, attempt_ctx=feedback,
+                        task_id=task_id, attempt_id=attempt_id,
                         artifact_path=self.artifacts.task_artifact_path(task_key, "task-brief.json"),
                     )
                     task_ctx.task_brief = brief.model_dump()
@@ -120,14 +178,15 @@ class TaskRunner:
                     need_analysis = False
 
                 kind, payload = await self._run_attempt(
-                    project_id, task_id, task_key, attempt_id, project_ctx, task_ctx, feedback
+                    project_id, task_id, task_key, attempt_id, project_ctx, task_ctx,
+                    feedback, env,
                 )
             except BudgetExceeded as exc:
-                # A pause must leave the repo at the last good commit —
-                # otherwise the next startup finds a dirty tree with no
-                # RUNNING attempt and refuses to start. The diff is archived
-                # first so nothing is lost.
-                self._archive_and_discard(task_key, "budget-paused")
+                # A pause must leave no dangling worktree state. The diff is
+                # archived first so nothing is lost; the worktree is removed
+                # (other tasks' worktrees are untouched).
+                self._archive_and_dispose(env, task_key, "budget-paused")
+                env = None
                 self._finish_running_attempts(task_id)
                 if exc.scope == "task":
                     self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
@@ -139,7 +198,8 @@ class TaskRunner:
                 # A provider/profile misconfiguration fails identically on
                 # every retry: block loudly instead of burning attempts.
                 logger.error("configuration error on %s: %s", task_key, exc)
-                self._archive_and_discard(task_key, "config-error")
+                self._archive_and_dispose(env, task_key, "config-error")
+                env = None
                 self._finish_running_attempts(task_id, AttemptState.FAILED)
                 self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
                 self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
@@ -155,17 +215,36 @@ class TaskRunner:
                 # in its context, and the tree is reset before diagnosis.
                 feedback = AttemptContext(
                     previous_attempt_summary=f"Previous attempt aborted: {exc.detail}",
-                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-aborted.diff"),
+                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-aborted.diff"),
                 )
                 kind, payload = ("AGENT_FAILURE", None)
 
             # ---- deterministic routing --------------------------------------
             if kind == "PASS":
-                return self._complete_task(project_id, task_id, task_key, attempt_id, task_row)
+                outcome, conflict_feedback = await self._complete_and_integrate(
+                    project_id, task_id, task_key, attempt_id, task_row, env, payload
+                )
+                if outcome is not None:
+                    self._dispose_env(env)
+                    env = None
+                    return outcome
+                # Integration conflict: fresh repair attempt on the NEW
+                # integration HEAD. The old worktree is already archived
+                # and removed by _complete_and_integrate.
+                env = None
+                integration_repairs += 1
+                if integration_repairs > self.config.limits.max_integration_repairs:
+                    self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
+                    self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
+                                     payload={"reason": "max integration repairs exceeded"})
+                    return TaskOutcome.BLOCKED
+                feedback = conflict_feedback
+                continue
 
             if kind == "REPLAN":
                 self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
-                self.checkpoint.discard_working_tree()
+                self._archive_and_dispose(env, task_key, f"a{attempt_id}-replan")
+                env = None
                 self.tasks.set_status(task_id, TaskState.PENDING, force=True)
                 self.events.emit("REVIEW_REPLAN", project_id=project_id, task_id=task_id,
                                  attempt_id=attempt_id,
@@ -177,35 +256,56 @@ class TaskRunner:
                 self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
                 feedback = AttemptContext(
                     verification_failure=payload.model_dump(),
-                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-verify-fail.diff"),
+                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-verify-fail.diff"),
                 )
             elif kind == "REPAIR":
                 self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
                 self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
                 feedback = AttemptContext(
                     review_feedback=payload.model_dump(),
-                    current_diff=self._bounded_diff(f"{task_key}-a{attempt_id}-repair.diff"),
+                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-repair.diff"),
                 )
             # AGENT_FAILURE: feedback already set above
 
             # ---- retry budget ----------------------------------------------
             failures = self.tasks.consecutive_failures(task_id)
             if failures < self.config.limits.max_attempts:
-                continue  # fresh Developer attempt with Attempt Context
+                # Fresh Developer attempt with Attempt Context; the SAME
+                # worktree is kept — the repair continues on the dirty state
+                # the previous roles produced.
+                continue
 
             diagnosis_rounds += 1
             outcome = await self._diagnose(
                 project_id, task_id, task_key, attempt_id,
-                project_ctx, task_ctx, feedback, diagnosis_rounds,
+                project_ctx, task_ctx, feedback, diagnosis_rounds, env,
             )
+            env = None  # diagnosis always archives + disposes the worktree
             if outcome is not None:
                 return outcome
-            # RETRY: clean slate, re-analyze
+            # RETRY: clean slate, re-analyze in a fresh worktree
             feedback_diag = feedback.diagnosis or {}
             feedback = AttemptContext(diagnosis=feedback_diag)
             need_analysis = True
 
     # ------------------------------------------------------------------
+
+    async def _invoke(
+        self, spec, project_id, project_ctx, env: TaskEnv, **kwargs
+    ):
+        """invoker.invoke bound to this task's worktree."""
+        attempt_no = None
+        if kwargs.get("attempt_id") is not None:
+            row = self.tasks.get_attempt(kwargs["attempt_id"])
+            attempt_no = row["attempt_no"] if row else None
+        volatile = {
+            "task_branch": env.handle.branch,
+            "attempt_no": attempt_no,
+        }
+        return await self.invoker.invoke(
+            spec, project_id, project_ctx,
+            workdir=env.handle.path, git=env.git, volatile=volatile, **kwargs,
+        )
 
     async def _run_attempt(
         self,
@@ -216,58 +316,55 @@ class TaskRunner:
         project_ctx: ProjectContext,
         task_ctx: TaskContext,
         feedback: AttemptContext,
+        env: TaskEnv,
     ) -> tuple[str, object]:
         # Developer (fresh session, even on repair)
         self.tasks.set_status(task_id, TaskState.EXECUTING, force=True)
-        impl = await self.invoker.invoke(
-            developer.SPEC,
-            project_id,
-            project_ctx,
-            task_ctx=task_ctx,
-            attempt_ctx=feedback,
-            task_id=task_id,
-            attempt_id=attempt_id,
+        impl = await self._invoke(
+            developer.SPEC, project_id, project_ctx, env,
+            task_ctx=task_ctx, attempt_ctx=feedback,
+            task_id=task_id, attempt_id=attempt_id,
             artifact_path=self.artifacts.task_artifact_path(task_key, "implementation.json"),
         )
         task_ctx.implementation = impl.model_dump()
 
         # Test Engineer (fresh session, test files only)
         self.tasks.set_status(task_id, TaskState.TESTING)
-        report = await self.invoker.invoke(
-            tester.SPEC,
-            project_id,
-            project_ctx,
+        report = await self._invoke(
+            tester.SPEC, project_id, project_ctx, env,
             task_ctx=task_ctx,
-            task_id=task_id,
-            attempt_id=attempt_id,
+            task_id=task_id, attempt_id=attempt_id,
             artifact_path=self.artifacts.task_artifact_path(task_key, "test-result.json"),
         )
         task_ctx.test_report = report.model_dump()
 
         # Deterministic verification: exit codes, not agent claims. The
         # command execution is journaled as an operation so a crash mid-run
-        # is visible as an unfinished VERIFICATION_COMMAND intent.
+        # is visible as an unfinished VERIFICATION_COMMAND intent. It runs
+        # in the heavy_test pool on a worker thread: builds/tests consume
+        # host CPU, not GPU inference slots, and other agents keep inferring.
         self.tasks.set_status(task_id, TaskState.VERIFYING)
         self.events.emit("TEST_STARTED", project_id=project_id, task_id=task_id, attempt_id=attempt_id)
         verify_op_id = None
         if self.operations:
             verify_op_id = self.operations.record_intent(
                 OperationType.VERIFICATION_COMMAND,
-                {"commands": self.verifier.commands(), "label": f"{task_key}-a{attempt_id}",
+                {"commands": env.verifier.commands(), "label": f"{task_key}-a{attempt_id}",
+                 "worktree": str(env.handle.path),
                  # Tree state before the commands run: recovery may only
                  # reset a diff whose hash it has durably recorded.
-                 "base_diff_sha256": self._diff_hash()},
+                 "base_diff_sha256": self._diff_hash(env)},
                 project_id=project_id, task_id=task_id, attempt_id=attempt_id,
             )
-        verification = self.verifier.run(
-            label=f"{task_key}-a{attempt_id}",
-            # After each command the intent's known tree state is refreshed,
-            # so a crash mid-verification stays recoverable at command
-            # granularity even when commands mutate the tree.
-            on_step=(lambda: self.operations.annotate(
-                verify_op_id, {"base_diff_sha256": self._diff_hash()}))
-            if verify_op_id else None,
+        on_step = (
+            (lambda: self.operations.annotate(
+                verify_op_id, {"base_diff_sha256": self._diff_hash(env)}))
+            if verify_op_id else None
         )
+        async with self.pools.heavy_test:
+            verification: VerificationResult = await asyncio.to_thread(
+                env.verifier.run, f"{task_key}-a{attempt_id}", on_step
+            )
         if self.operations and verify_op_id:
             self.operations.record_result(
                 verify_op_id, OperationStatus.COMPLETED,
@@ -290,10 +387,11 @@ class TaskRunner:
             )
             return "VERIFY_FAIL", verification
 
-        # Independent Reviewer (fresh session, read-only)
+        # Independent Reviewer (fresh session, read-only, NO developer
+        # conversation — only artifacts, diff and verification evidence)
         self.tasks.set_status(task_id, TaskState.REVIEWING)
         self.events.emit("REVIEW_STARTED", project_id=project_id, task_id=task_id, attempt_id=attempt_id)
-        diff_preview = self._bounded_diff(f"{task_key}-a{attempt_id}-review.diff",
+        diff_preview = self._bounded_diff(env, f"{task_key}-a{attempt_id}-review.diff",
                                           limit=REVIEW_DIFF_LIMIT)
         extra = (
             "## Change under review (uncommitted diff)\n```diff\n"
@@ -302,14 +400,10 @@ class TaskRunner:
             + json.dumps(verification.model_dump(), indent=2)[:4000]
             + "\n```"
         )
-        review: Review = await self.invoker.invoke(
-            reviewer.SPEC,
-            project_id,
-            project_ctx,
-            task_ctx=task_ctx,
-            extra=extra,
-            task_id=task_id,
-            attempt_id=attempt_id,
+        review: Review = await self._invoke(
+            reviewer.SPEC, project_id, project_ctx, env,
+            task_ctx=task_ctx, extra=extra,
+            task_id=task_id, attempt_id=attempt_id,
             artifact_path=self.artifacts.task_artifact_path(task_key, "review.json"),
         )
         self.runs.record_evaluation(attempt_id, review.verdict, review.model_dump(), review.score)
@@ -334,6 +428,7 @@ class TaskRunner:
         task_ctx: TaskContext,
         feedback: AttemptContext,
         diagnosis_rounds: int,
+        env: TaskEnv | None,
     ) -> TaskOutcome | None:
         """Returns an outcome, or None to signal RETRY."""
         self.tasks.set_status(task_id, TaskState.DIAGNOSING, force=True)
@@ -341,7 +436,7 @@ class TaskRunner:
                          payload={"round": diagnosis_rounds})
 
         if diagnosis_rounds > MAX_DIAGNOSIS_ROUNDS:
-            self.checkpoint.discard_working_tree()
+            self._archive_and_dispose(env, task_key, "max-diagnosis")
             self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
             self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
                              payload={"reason": "max diagnosis rounds exceeded"})
@@ -349,10 +444,10 @@ class TaskRunner:
 
         attempt_no = self.tasks.get(task_id)["attempt_count"]
         # The failed attempt's diff is already captured in the Attempt Context
-        # (and archived here), so the working tree is reset BEFORE diagnosis:
-        # a crash mid-diagnosis then leaves a clean tree that startup recovery
-        # can handle, instead of a dirty tree with no RUNNING attempt.
-        self._archive_and_discard(task_key, f"attempt{attempt_no}")
+        # (and archived here); the worktree is disposed BEFORE diagnosis so a
+        # crash mid-diagnosis leaves no dangling worktree. The Diagnostician
+        # runs read-only against the MAIN checkout.
+        self._archive_and_dispose(env, task_key, f"attempt{attempt_no}")
         try:
             # attempt_id ties the diagnostician's runs to the task so they
             # count toward max_agent_runs_per_task like every other run.
@@ -405,9 +500,21 @@ class TaskRunner:
 
     # ------------------------------------------------------------------
 
-    def _complete_task(
-        self, project_id: int, task_id: int, task_key: str, attempt_id: int, task_row: sqlite3.Row
-    ) -> TaskOutcome:
+    async def _complete_and_integrate(
+        self,
+        project_id: int,
+        task_id: int,
+        task_key: str,
+        attempt_id: int,
+        task_row: sqlite3.Row,
+        env: TaskEnv,
+        review: Review,
+    ) -> tuple[TaskOutcome | None, AttemptContext | None]:
+        """Reviewer PASSed: commit on the task branch, then integrate.
+
+        Returns (outcome, None) when the task settled, or
+        (None, conflict_feedback) to signal a fresh repair attempt.
+        """
         # Completion evidence is deterministic, not an agent claim: the
         # attempt must carry a recorded verification PASS and a Reviewer
         # PASS before the checkpoint commit may happen.
@@ -421,30 +528,91 @@ class TaskRunner:
                 f"refusing to complete {task_key}: attempt {attempt_id} has no "
                 "recorded Reviewer PASS"
             )
-        commit_hash = self.checkpoint.commit_task(
+        # 1. task_commit on the isolated task branch (journaled GIT_COMMIT).
+        task_commit = env.checkpoint.commit_task(
             task_key, task_row["title"],
             project_id=project_id, task_id=task_id, attempt_id=attempt_id,
         )
-        # The GIT_COMMIT result and every task-completion update land in ONE
-        # transaction: either the operation stays PENDING (and recovery
-        # reconciles the whole completion from the commit trailer) or all of
-        # it is durable. No window where the journal says done but the task
-        # state was lost.
-        commit_op_id = self.checkpoint.pending_operation_id
+        commit_op_id = env.checkpoint.pending_operation_id
         with self.tasks.db.transaction():
             if commit_op_id and self.operations:
                 self.operations.record_result(
-                    commit_op_id, OperationStatus.COMPLETED, {"commit": commit_hash}
+                    commit_op_id, OperationStatus.COMPLETED, {"commit": task_commit}
                 )
             self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
-            if commit_hash:
-                self.tasks.set_commit(task_id, commit_hash)
-            self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
-            self.events.emit("TASK_COMPLETED", project_id=project_id, task_id=task_id,
-                             attempt_id=attempt_id, operation_id=commit_op_id,
-                             payload={"commit": commit_hash})
-        logger.info("task %s completed (commit %s)", task_key, commit_hash)
-        return TaskOutcome.COMPLETED
+            if task_commit:
+                self.tasks.set_task_commit(task_id, task_commit)
+
+        if task_commit is None:
+            # A task may legitimately produce no diff (verification-only):
+            # nothing to integrate, current integration HEAD is the checkpoint.
+            with self.tasks.db.transaction():
+                self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+                self.events.emit("TASK_COMPLETED", project_id=project_id, task_id=task_id,
+                                 attempt_id=attempt_id, payload={"commit": None})
+            return TaskOutcome.COMPLETED, None
+
+        # 2. Serialized integration into the integration branch.
+        self.tasks.set_status(task_id, TaskState.INTEGRATING, force=True)
+        self.events.emit(EventType.INTEGRATION_STARTED, project_id=project_id,
+                         task_id=task_id, attempt_id=attempt_id,
+                         payload={"task_commit": task_commit})
+        async with self.pools.git_integration:
+            outcome = await self.integration.integrate(
+                task_key=task_key, task_commit=task_commit, title=task_row["title"],
+                project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+            )
+
+        if outcome.status in (IntegrationStatus.MERGED, IntegrationStatus.NOOP):
+            # Integration result + completion state land in ONE transaction
+            # (crash between merge and here is reconciled by trailer).
+            integration_op_id = self.integration.pending_operation_id
+            with self.tasks.db.transaction():
+                if integration_op_id and self.operations:
+                    self.operations.record_result(
+                        integration_op_id, OperationStatus.COMPLETED,
+                        {"integration_commit": outcome.integration_commit},
+                    )
+                if outcome.integration_commit:
+                    self.tasks.set_integration_commit(task_id, outcome.integration_commit)
+                self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+                self.events.emit(
+                    EventType.INTEGRATION_COMPLETED, project_id=project_id,
+                    task_id=task_id, attempt_id=attempt_id,
+                    operation_id=integration_op_id,
+                    payload={"task_commit": task_commit,
+                             "integration_commit": outcome.integration_commit},
+                )
+                self.events.emit("TASK_COMPLETED", project_id=project_id, task_id=task_id,
+                                 attempt_id=attempt_id,
+                                 payload={"commit": outcome.integration_commit})
+            logger.info("task %s completed (integration commit %s)",
+                        task_key, outcome.integration_commit)
+            return TaskOutcome.COMPLETED, None
+
+        # 3. Conflict: normal path. Archive the original change, dispose the
+        #    worktree, hand a fresh repair attempt the conflict context.
+        original_diff = self._commit_diff(env, env.handle.base_commit, task_commit)
+        archive = self.artifacts.root / "diagnostics" / f"{task_key}-integration-conflict.diff"
+        if original_diff.strip():
+            self.artifacts.save_text(archive, original_diff)
+        self.tasks.set_status(task_id, TaskState.INTEGRATION_CONFLICT, force=True)
+        self.events.emit(
+            EventType.INTEGRATION_CONFLICT, project_id=project_id, task_id=task_id,
+            attempt_id=attempt_id,
+            payload={"task_commit": task_commit, "files": outcome.conflict_files},
+        )
+        self._dispose_env(env)
+        feedback = AttemptContext(
+            integration_conflict={
+                "conflict_files": outcome.conflict_files,
+                "original_base_commit": env.handle.base_commit,
+                "original_task_commit": task_commit,
+                "original_diff": original_diff[:CONFLICT_DIFF_LIMIT],
+                "archived_diff_artifact": self.artifacts.relpath(archive),
+            },
+        )
+        return None, feedback
 
     def _insert_split_tasks(
         self, project_id: int, task_id: int, diagnosis: Diagnosis
@@ -473,24 +641,29 @@ class TaskRunner:
             inserted.append(planned.task_key)
         return inserted
 
-    def _archive_and_discard(self, task_key: str, label: str) -> None:
-        """Save the current dirty diff as an artifact, then reset the tree.
+    # ------------------------------------------------------------------
+
+    def _archive_and_dispose(self, env: TaskEnv | None, task_key: str, label: str) -> None:
+        """Save the worktree's dirty diff as an artifact, then remove the
+        worktree entirely. Only THIS task's worktree is touched.
 
         Archived as a byte-exact, re-applicable patch — the archive is the
-        only copy once the tree is reset, so a failed archive aborts the
-        reset instead of proceeding without one.
+        only copy once the worktree is removed, so a failed archive aborts
+        the removal instead of proceeding without one.
         """
-        diff = self.git.snapshot_dirty_bytes()
+        if env is None:
+            return
+        diff = env.git.snapshot_dirty_bytes()
         archive_path = self.artifacts.root / "diagnostics" / f"{task_key}-{label}.diff"
         if diff.strip():
             self.artifacts.save_bytes(archive_path, diff)
         # Real-file tar regardless of the patch: a clean filter can render
         # the diff empty while the on-disk bytes still differ.
         self.artifacts.archive_worktree_files(
-            archive_path.with_suffix(".files.tar"), self.git.path,
-            self.git.changed_paths(),
+            archive_path.with_suffix(".files.tar"), env.git.path,
+            env.git.changed_paths(),
         )
-        self.checkpoint.discard_working_tree()
+        self._dispose_env(env)
 
     def _finish_running_attempts(
         self, task_id: int, status: AttemptState = AttemptState.INTERRUPTED
@@ -500,27 +673,36 @@ class TaskRunner:
         ):
             self.tasks.finish_attempt(row["id"], status)
 
-    def _safe_diff(self) -> str:
+    def _safe_diff(self, env: TaskEnv | None) -> str:
+        if env is None:
+            return ""
         try:
-            return self.git.full_dirty_diff()
+            return env.git.full_dirty_diff()
         except Exception as exc:
             logger.warning("could not capture diff: %s", exc)
             return ""
 
-    def _diff_hash(self) -> str:
+    def _diff_hash(self, env: TaskEnv) -> str:
         try:
-            return self.git.dirty_state_hash()
+            return env.git.dirty_state_hash()
         except Exception as exc:
             logger.warning("could not hash dirty state: %s", exc)
             return ""
 
-    def _bounded_diff(self, spill_name: str, limit: int | None = None) -> str:
+    def _commit_diff(self, env: TaskEnv, base: str, head: str) -> str:
+        try:
+            return env.git._run("diff", "--no-color", f"{base}..{head}").stdout
+        except Exception as exc:
+            logger.warning("could not capture commit diff: %s", exc)
+            return ""
+
+    def _bounded_diff(self, env: TaskEnv | None, spill_name: str, limit: int | None = None) -> str:
         """The current dirty diff, spilled to an artifact when oversized.
 
         The full diff is always retained on disk; agent context receives at
         most a bounded head/tail preview plus the artifact locator.
         """
-        diff = self._safe_diff()
+        diff = self._safe_diff(env)
         threshold = limit or self.config.limits.max_inline_output_chars
         if len(diff) <= threshold:
             return diff

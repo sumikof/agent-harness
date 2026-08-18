@@ -1,22 +1,30 @@
 """Startup recovery.
 
-The harness process is expected to die mid-run. On startup, state is
-reconciled in a fixed order:
+The harness process is expected to die mid-run — possibly with MANY
+tasks RUNNING in parallel, each in its own worktree. On startup, state
+is reconciled in a fixed order:
 
     1. SQLite integrity check
     2. Event ledger integrity check (contiguous per-stream seq)
     3. Unfinished operation detection (intent without result)
-    4. Git reconciliation (did a journaled commit actually happen?)
-    5. Workspace dirty-state recovery (archive diff, reset to HEAD)
-    6. Project / task state reconciliation (requeue in-flight work)
+    4. Git reconciliation:
+       - GIT_COMMIT intents (task-branch commits) by trailer
+       - GIT_INTEGRATION intents by trailer; an in-progress merge in the
+         integration checkout is aborted (never finished blindly, never
+         merged twice — the Operation ID decides)
+    5. Worktree recovery, PER RUNNING ATTEMPT: archive that worktree's
+       dirty diff, remove the worktree, close the attempt INTERRUPTED.
+       Other tasks' worktrees are never touched. Orphan worktrees (no
+       RUNNING attempt) are archived and removed too.
+    6. Main-checkout dirty-state recovery (evidence-hash gated, as before)
+    7. Project / task state reconciliation (requeue ALL in-flight tasks)
 
-A journaled GIT_COMMIT intent whose commit already exists in the
-repository is never re-executed: the DB is reconciled to the real git
-state instead. Only after operations are settled may the working tree be
-reset — never unconditionally.
+A journaled intent whose side effect already exists in git is never
+re-executed: the DB is reconciled to the real git state instead.
 
-A dirty tree WITHOUT a recorded RUNNING attempt is not the harness's work
-to destroy: recovery refuses to start instead of resetting it.
+A dirty INTEGRATION checkout without journaled evidence is not the
+harness's work to destroy: recovery refuses to start instead of
+resetting it.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from pathlib import Path
 
 from ..agents import analyst, developer, diagnostician, planner, reviewer, tester
 from ..artifacts.manager import ArtifactManager
@@ -57,6 +66,8 @@ IN_FLIGHT_STATES = {
     TaskState.TESTING.value,
     TaskState.VERIFYING.value,
     TaskState.REVIEWING.value,
+    TaskState.INTEGRATING.value,
+    TaskState.INTEGRATION_CONFLICT.value,
     TaskState.REPAIR_REQUIRED.value,
     TaskState.DIAGNOSING.value,
 }
@@ -81,6 +92,8 @@ class RecoveryManager:
         checkpoint: CheckpointManager,
         operations: OperationRepository | None = None,
         runs: RunRepository | None = None,
+        worktrees=None,
+        integration=None,
     ):
         self.tasks = tasks
         self.events = events
@@ -89,6 +102,8 @@ class RecoveryManager:
         self.checkpoint = checkpoint
         self.operations = operations
         self.runs = runs
+        self.worktrees = worktrees        # WorktreeManager | None
+        self.integration = integration    # IntegrationManager | None
 
     def recover(self, project_row: sqlite3.Row) -> bool:
         """Reconcile state after a possible crash. Returns True if recovery acted."""
@@ -106,6 +121,14 @@ class RecoveryManager:
                 f"event ledger has non-contiguous streams: {gaps}. The history "
                 "cannot be trusted; inspect the workspace before rerunning."
             )
+
+        # 3a. Integration reconciliation FIRST: a crash mid-merge leaves the
+        # integration checkout in a merge state that must be aborted (or the
+        # DB caught up to an already-executed merge) BEFORE the dirty-state
+        # evidence rules below inspect the tree. Operation IDs decide —
+        # a merge is never executed twice.
+        if self.operations is not None:
+            acted |= self._reconcile_integrations(project_id)
 
         # 3-4. Unfinished operations. Git commits are reconciled BEFORE any
         # tree reset; in-flight dispatch/verification intents are only READ
@@ -132,19 +155,26 @@ class RecoveryManager:
                     # until the reset below has completed (double-crash
                     # safety), and is closed FAILED afterwards.
                     unexecuted_commit_intents.append(op)
-            # In-flight side effects that can explain a dirty tree: a
-            # verification command, an unexecuted checkpoint commit, or a
+            # In-flight side effects that can explain a dirty MAIN checkout:
+            # a verification command, an unexecuted checkpoint commit, or a
             # MUTATING agent session whose attempt was already closed by a
             # previous recovery pass that crashed mid-reset. A read-only
             # dispatch (e.g. the Planner, which runs without an attempt)
             # cannot have produced the diff — counting it would let user
-            # edits made while stopped be destroyed.
-            side_effect_intents = list(self.operations.unfinished(
-                OperationType.VERIFICATION_COMMAND, project_id=project_id))
+            # edits made while stopped be destroyed. Intents that ran inside
+            # a task WORKTREE are excluded here: their effects are settled
+            # by the per-worktree recovery below, never against the main
+            # checkout.
+            side_effect_intents = [
+                op for op in self.operations.unfinished(
+                    OperationType.VERIFICATION_COMMAND, project_id=project_id)
+                if self._is_main_checkout_intent(op)
+            ]
             for op in self.operations.unfinished(
                     OperationType.AGENT_DISPATCH, project_id=project_id):
                 payload = json.loads(op["payload"] or "{}")
-                if op["attempt_id"] is not None and payload.get("role") in MUTATING_ROLES:
+                if (op["attempt_id"] is not None and payload.get("role") in MUTATING_ROLES
+                        and self._is_main_checkout_intent(op)):
                     side_effect_intents.append(op)
             # Staleness rules: a commit intent is evidence only when the
             # current diff hashes to its recorded diff_sha256. A dispatch/
@@ -161,19 +191,32 @@ class RecoveryManager:
                 if self._commit_intent_matches(op, current_diff_hash)
             )
 
-        # 5. Workspace dirty-state recovery.
+        # 5. Worktree recovery — PER RUNNING ATTEMPT. Every parallel task
+        # that was in flight when the process died is recovered on its own:
+        # its worktree diff archived, its worktree removed, its attempt
+        # closed. No other task's worktree is touched. Attempts without a
+        # recorded worktree (pre-worktree data) fall through to the main-
+        # checkout recovery below.
         running = self.tasks.running_attempts(project_id)
+        worktree_attempts = [a for a in running if a["worktree_path"]]
+        legacy_attempts = [a for a in running if not a["worktree_path"]]
+        for attempt in worktree_attempts:
+            self._recover_worktree_attempt(project_id, attempt)
+            acted = True
+        acted |= self._recover_orphan_worktrees(project_id)
 
-        if running:
+        # 6. Main-checkout dirty-state recovery (evidence-hash gated).
+        if legacy_attempts:
             logger.warning(
-                "recovery: %d running attempt(s), working tree dirty=%s", len(running), dirty
+                "recovery: %d running attempt(s) on the main checkout, dirty=%s",
+                len(legacy_attempts), dirty,
             )
             # Durable BEFORE the reset: a crash after the reset but before
             # the intents are closed leaves them annotated with the settled
             # diff, so the next startup can tell them apart from new work.
             self._annotate_settlement(side_effect_intents, current_diff_hash)
             self._archive_dirty_diff(project_id)
-            for attempt in running:
+            for attempt in legacy_attempts:
                 self.tasks.finish_attempt(attempt["id"], AttemptState.INTERRUPTED)
                 self.events.emit(
                     EventType.ATTEMPT_INTERRUPTED,
@@ -256,6 +299,165 @@ class RecoveryManager:
 
     # ------------------------------------------------------------------
 
+    def _is_main_checkout_intent(self, op: sqlite3.Row) -> bool:
+        """True when this intent's side effects landed in the MAIN checkout
+        (final verification, pre-worktree data) rather than a task worktree."""
+        payload = json.loads(op["payload"] or "{}")
+        if payload.get("worktree"):
+            return False
+        if op["attempt_id"] is not None:
+            attempt = self.tasks.get_attempt(op["attempt_id"])
+            if attempt is not None and attempt["worktree_path"]:
+                return False
+        return True
+
+    def _recover_worktree_attempt(self, project_id: int, attempt: sqlite3.Row) -> None:
+        """Settle ONE crashed task attempt: archive its worktree's dirty
+        diff, remove the worktree + branch, close the attempt INTERRUPTED.
+
+        The worktree is harness-owned for the episode's whole lifetime, so
+        (like the v1 RUNNING-attempt rule) it is archived and removed
+        without evidence hashing — the diff is never destroyed, always
+        archived first.
+        """
+        worktree_path = attempt["worktree_path"]
+        branch = attempt["branch"]
+        path = Path(worktree_path)
+        if path.is_dir():
+            repo = GitRepository(path)
+            try:
+                if repo.is_repo() and repo.is_dirty():
+                    diff = repo.snapshot_dirty_bytes()
+                    archive = (self.artifacts.root / "diagnostics"
+                               / f"interrupted-{path.name}.diff")
+                    index = 0
+                    while archive.exists():
+                        index += 1
+                        archive = (self.artifacts.root / "diagnostics"
+                                   / f"interrupted-{path.name}-{index}.diff")
+                    if diff.strip():
+                        self.artifacts.save_bytes(archive, diff)
+                    self.artifacts.archive_worktree_files(
+                        archive.with_suffix(".files.tar"), repo.path, repo.changed_paths()
+                    )
+                    logger.info("recovery: archived worktree %s to %s", path, archive)
+            except Exception as exc:
+                raise RecoveryIntegrityError(
+                    f"could not archive interrupted worktree {path} before removal: {exc}"
+                )
+            if self.worktrees is not None:
+                self.worktrees.remove_path(path, branch=branch)
+        elif branch and self.worktrees is not None:
+            self.worktrees.remove_path(path, branch=branch)
+        self.tasks.finish_attempt(attempt["id"], AttemptState.INTERRUPTED)
+        self.events.emit(
+            EventType.ATTEMPT_INTERRUPTED,
+            project_id=project_id,
+            task_id=attempt["task_id"],
+            attempt_id=attempt["id"],
+            payload={"recovered_at_startup": True, "worktree": worktree_path},
+        )
+        logger.warning("recovery: interrupted attempt %d (worktree %s)",
+                       attempt["id"], worktree_path)
+
+    def _recover_orphan_worktrees(self, project_id: int) -> bool:
+        """Registered worktrees no RUNNING attempt references are crash
+        leftovers (their attempt settled in an earlier partial recovery):
+        archive whatever they hold and remove them."""
+        if self.worktrees is None or not self.git.is_repo():
+            return False
+        referenced = {
+            str(Path(a["worktree_path"]).resolve())
+            for a in self.tasks.running_attempts(project_id)
+            if a["worktree_path"]
+        }
+        acted = False
+        for path in self.worktrees.registered_paths():
+            if str(path.resolve()) in referenced:
+                continue
+            repo = GitRepository(path)
+            try:
+                if path.is_dir() and repo.is_repo() and repo.is_dirty():
+                    diff = repo.snapshot_dirty_bytes()
+                    archive = (self.artifacts.root / "diagnostics"
+                               / f"orphan-{path.name}.diff")
+                    if diff.strip():
+                        self.artifacts.save_bytes(archive, diff)
+                    self.artifacts.archive_worktree_files(
+                        archive.with_suffix(".files.tar"), repo.path, repo.changed_paths()
+                    )
+            except Exception as exc:
+                raise RecoveryIntegrityError(
+                    f"could not archive orphan worktree {path} before removal: {exc}"
+                )
+            branch = repo.current_branch() if path.is_dir() and repo.is_repo() else None
+            self.worktrees.remove_path(path, branch=branch if branch != "DETACHED" else None)
+            logger.warning("recovery: removed orphan worktree %s", path)
+            acted = True
+        return acted
+
+    def _reconcile_integrations(self, project_id: int) -> bool:
+        """Settle unfinished GIT_INTEGRATION intents against real git state.
+
+        Executed merge (found by Operation-Id trailer) -> catch the DB up
+        (task COMPLETED with integration_commit); never merged -> abort any
+        in-progress merge and fail the intent (the task requeues normally).
+        A merge is never executed twice.
+        """
+        acted = False
+        for op in self.operations.unfinished(OperationType.GIT_INTEGRATION,
+                                             project_id=project_id):
+            merge_commit = self.checkpoint.find_committed_operation(op["operation_id"])
+            if merge_commit is not None:
+                self._reconcile_executed_integration(project_id, op, merge_commit)
+            else:
+                if self.git.is_repo() and self.git.merge_in_progress():
+                    logger.warning(
+                        "recovery: aborting in-progress merge for integration intent %s",
+                        op["operation_id"],
+                    )
+                    self.git.merge_abort()
+                self.operations.record_result(
+                    op["operation_id"], OperationStatus.FAILED,
+                    {"reason": "integration intent journaled but merge never completed"},
+                )
+            acted = True
+        return acted
+
+    def _reconcile_executed_integration(
+        self, project_id: int, op: sqlite3.Row, merge_commit: str
+    ) -> None:
+        payload = json.loads(op["payload"] or "{}")
+        task_id = op["task_id"]
+        attempt_id = op["attempt_id"]
+        logger.warning(
+            "recovery: integration intent %s already merged as %s; reconciling DB",
+            op["operation_id"], merge_commit,
+        )
+        with self.tasks.db.transaction():
+            if task_id is not None:
+                self.tasks.set_integration_commit(task_id, merge_commit)
+                task = self.tasks.get(task_id)
+                if task is not None and task["status"] != TaskState.COMPLETED.value:
+                    self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
+                    self.events.emit(
+                        EventType.TASK_COMPLETED,
+                        project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+                        operation_id=op["operation_id"],
+                        payload={"commit": merge_commit, "reconciled": True},
+                    )
+            self.operations.record_result(
+                op["operation_id"], OperationStatus.RECONCILED,
+                {"integration_commit": merge_commit},
+            )
+            self.events.emit(
+                EventType.GIT_INTEGRATION_RECONCILED,
+                project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+                operation_id=op["operation_id"],
+                payload={"integration_commit": merge_commit,
+                         "task_commit": payload.get("task_commit")},
+            )
+
     def _current_diff_hash(self) -> str | None:
         try:
             # Fingerprint of the ACTUAL on-disk bytes — git filters cannot
@@ -334,6 +536,12 @@ class RecoveryManager:
         NEVER re-run. (Unexecuted intents are handled by the caller: kept
         PENDING as dirty-tree evidence until the reset completed, then
         closed FAILED so normal retry produces a fresh attempt.)
+
+        Under the worktree model a task-branch commit is NOT completion —
+        completion is the serialized integration merge (handled by
+        _reconcile_integrations). The attempt is settled as PASSED and the
+        task_commit recorded; the task itself requeues through the normal
+        in-flight reconciliation and re-runs on a fresh worktree.
         """
         operation_id = op["operation_id"]
         payload = json.loads(op["payload"] or "{}")
@@ -344,29 +552,16 @@ class RecoveryManager:
             "recovery: git commit intent %s already executed as %s; reconciling DB",
             operation_id, commit_hash,
         )
-        # The whole catch-up — attempt, current_commit, task state, the
-        # operation result and every event — lands in ONE transaction,
-        # mirroring the normal completion path. A crash mid-reconciliation
-        # then leaves the operation PENDING and the next startup repeats
-        # the reconciliation from scratch, instead of a permanent
-        # state/ledger mismatch.
+        # The whole catch-up lands in ONE transaction. A crash
+        # mid-reconciliation leaves the operation PENDING and the next
+        # startup repeats the reconciliation from scratch, instead of a
+        # permanent state/ledger mismatch.
         with self.tasks.db.transaction():
             if task_id is not None:
                 attempt = self.tasks.get_attempt(attempt_id) if attempt_id else None
                 if attempt is not None and attempt["status"] == AttemptState.RUNNING.value:
                     self.tasks.finish_attempt(attempt_id, AttemptState.PASSED)
-                self.tasks.set_commit(task_id, commit_hash)
-                task = self.tasks.get(task_id)
-                if task is not None and task["status"] != TaskState.COMPLETED.value:
-                    self.tasks.set_status(task_id, TaskState.COMPLETED, force=True)
-                    self.events.emit(
-                        EventType.TASK_COMPLETED,
-                        project_id=project_id,
-                        task_id=task_id,
-                        attempt_id=attempt_id,
-                        operation_id=operation_id,
-                        payload={"commit": commit_hash, "reconciled": True},
-                    )
+                self.tasks.set_task_commit(task_id, commit_hash)
             self.operations.record_result(
                 operation_id, OperationStatus.RECONCILED, {"commit": commit_hash}
             )

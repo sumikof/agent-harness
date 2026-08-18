@@ -26,6 +26,8 @@ class OperationType(StrEnum):
     AGENT_DISPATCH = "AGENT_DISPATCH"
     VERIFICATION_COMMAND = "VERIFICATION_COMMAND"
     GIT_COMMIT = "GIT_COMMIT"
+    # Serialized merge of a passed task branch into the integration branch.
+    GIT_INTEGRATION = "GIT_INTEGRATION"
 
 
 class OperationStatus(StrEnum):
@@ -40,12 +42,14 @@ _INTENT_EVENTS: dict[OperationType, EventType] = {
     OperationType.AGENT_DISPATCH: EventType.AGENT_DISPATCH_INTENT,
     OperationType.VERIFICATION_COMMAND: EventType.VERIFICATION_COMMAND_INTENT,
     OperationType.GIT_COMMIT: EventType.GIT_COMMIT_INTENT,
+    OperationType.GIT_INTEGRATION: EventType.GIT_INTEGRATION_INTENT,
 }
 
 _RESULT_EVENTS: dict[OperationType, EventType] = {
     OperationType.AGENT_DISPATCH: EventType.AGENT_DISPATCH_RESULT,
     OperationType.VERIFICATION_COMMAND: EventType.VERIFICATION_COMMAND_RESULT,
     OperationType.GIT_COMMIT: EventType.GIT_COMMIT_RESULT,
+    OperationType.GIT_INTEGRATION: EventType.GIT_INTEGRATION_RESULT,
 }
 
 

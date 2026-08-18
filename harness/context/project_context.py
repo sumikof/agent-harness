@@ -17,11 +17,15 @@ class ProjectContext:
     important_decisions: list[str] = field(default_factory=list)
 
     def render(self) -> str:
+        # Deliberately NO concrete filesystem path here: under parallel
+        # execution each session works in its own worktree, and the path
+        # would both be wrong and break the shared cacheable prefix. The
+        # actual working directory travels in the volatile metadata tail.
         lines = [
             "## Project Context",
             f"Project: {self.name}",
             f"Goal: {self.goal}",
-            f"Repository (your working directory): {self.repository_path}",
+            "Repository: your current working directory (an isolated checkout of the project)",
             f"Base branch: {self.base_branch}",
         ]
         for title, items in [

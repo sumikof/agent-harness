@@ -139,6 +139,24 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_single_running
         ON agent_runs(status) WHERE status = 'RUNNING'
     """,
+    # 4: parallel execution. The max-1-RUNNING-agent invariant is retired
+    #    (replaced by a configurable limit checked by the invoker/invariant
+    #    checker). What stays DB-enforced is the sharper rule: at most ONE
+    #    RUNNING *mutating* agent per task attempt — two agents editing one
+    #    worktree concurrently can never be persisted. Task rows gain the
+    #    task_commit / integration_commit split; attempts record their
+    #    worktree + branch so recovery and invariants can inspect them.
+    """
+    DROP INDEX IF EXISTS idx_agent_runs_single_running;
+    ALTER TABLE agent_runs ADD COLUMN mutating INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_runs ADD COLUMN prefix_group_key TEXT;
+    ALTER TABLE tasks ADD COLUMN task_commit TEXT;
+    ALTER TABLE tasks ADD COLUMN integration_commit TEXT;
+    ALTER TABLE task_attempts ADD COLUMN worktree_path TEXT;
+    ALTER TABLE task_attempts ADD COLUMN branch TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_single_mutating_per_attempt
+        ON agent_runs(attempt_id) WHERE status = 'RUNNING' AND mutating = 1
+    """,
 ]
 
 

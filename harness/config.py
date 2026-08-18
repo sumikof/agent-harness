@@ -23,8 +23,12 @@ class RoleProviderConfig(BaseModel):
 
 
 class ProviderConfig(BaseModel):
-    type: str = "claude"
-    model: str = "claude-sonnet-5"
+    # Default execution engine: the local OpenAI-compatible adapter serving
+    # Qwen3.6-27B-FP8 via vLLM on DGX Spark. The provider abstraction stays:
+    # "claude" (Claude Agent SDK) and future engines remain selectable
+    # globally or per role.
+    type: str = "openai-compatible"
+    model: str = "qwen3.6-27b-fp8"
     roles: dict[str, RoleProviderConfig] = Field(default_factory=dict)
 
     def for_role(self, role: str) -> tuple[str, str]:
@@ -33,6 +37,114 @@ class ProviderConfig(BaseModel):
         if override is None:
             return self.type, self.model
         return override.type or self.type, override.model or self.model
+
+
+class SamplingConfig(BaseModel):
+    """Generation profile for the local model. Fixed per profile — never
+    varied per request, so identical contexts produce identical requests."""
+
+    temperature: float = 0.6
+    top_p: float = 0.95
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+
+
+class InferenceConcurrencyConfig(BaseModel):
+    # Process-wide cap on in-flight LLM HTTP requests (semaphore). Matches
+    # the serving-side --max-num-seqs baseline.
+    max_requests: int = 16
+
+
+class InferenceConfig(BaseModel):
+    """Local OpenAI-compatible serving endpoint (vLLM on DGX Spark)."""
+
+    provider: str = "openai-compatible"
+    base_url: str = "http://127.0.0.1:8000/v1"
+    api_key: str = "not-needed"  # vLLM ignores it; the SDK requires a value
+    model: str = "qwen3.6-27b-fp8"
+    # Context profile selects max input+output budget. `performance` is the
+    # production default; longer profiles are opt-in per task, never global.
+    context_profile: str = "performance"
+    context_profiles: dict[str, int] = Field(
+        default_factory=lambda: {
+            "performance": 65536,
+            "long": 131072,
+            "maximum": 262144,
+        }
+    )
+    # Input token budget within the context profile: the rest is reserved
+    # for reasoning, tool calls, and model output. Approximate (chars/4).
+    input_budget_tokens: int = 50000
+    # Reserved output tokens per request.
+    max_output_tokens: int = 8192
+    sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    # Per-role sampling overrides (partial; unset fields fall back).
+    role_sampling: dict[str, SamplingConfig] = Field(default_factory=dict)
+    concurrency: InferenceConcurrencyConfig = Field(
+        default_factory=InferenceConcurrencyConfig
+    )
+    # Internal agents don't need token-by-token display; non-streaming
+    # reduces host CPU / HTTP overhead. Benchmarkable.
+    streaming: bool = False
+    request_timeout_seconds: int = 600
+    # In-loop transient retry (429 / 5xx / transport) inside one session:
+    # message history is preserved, the failed HTTP call is repeated.
+    # Bounded; never consumes a task attempt.
+    transient_retries: int = 4
+    transient_retry_base_delay: float = 2.0
+
+    def max_model_len(self) -> int:
+        return self.context_profiles.get(self.context_profile, 65536)
+
+    def sampling_for_role(self, role: str) -> SamplingConfig:
+        override = self.role_sampling.get(role)
+        if override is None:
+            return self.sampling
+        return override
+
+
+class ResourcePoolsConfig(BaseModel):
+    """Named semaphores separating LLM inference slots from host-heavy
+    work (builds/tests) and the strictly-serialized git integration."""
+
+    llm: int = 16
+    heavy_build: int = 2
+    heavy_test: int = 2
+    git_integration: int = 1
+
+
+class ParallelismConfig(BaseModel):
+    max_parallel_tasks: int = 16
+    # Upper bound on concurrently RUNNING AgentRuns (DB invariant). Defaults
+    # to max_parallel_tasks: each task runs one role at a time.
+    max_parallel_agent_runs: Optional[int] = None
+    resource_pools: ResourcePoolsConfig = Field(default_factory=ResourcePoolsConfig)
+    # Scheduling-fairness: a READY task skipped this many scheduling rounds
+    # is dispatched next regardless of prefix affinity.
+    starvation_rounds: int = 8
+
+    def agent_run_limit(self) -> int:
+        return self.max_parallel_agent_runs or self.max_parallel_tasks
+
+
+class GitStrategyConfig(BaseModel):
+    # Parallel tasks each get an isolated worktree + branch; integration
+    # into the base branch is strictly serialized.
+    task_worktrees: bool = True
+    integration_strategy: str = "serialized"
+    # Directory (relative to workspace) holding task worktrees.
+    worktrees_dir: str = "worktrees"
+    branch_prefix: str = "harness/task"
+
+
+class DatabaseConfig(BaseModel):
+    journal_mode: str = "WAL"
+    busy_timeout_ms: int = 5000
+    # All writes go through one serialized writer (process-wide lock).
+    # Parallel agent coroutines/threads never race write transactions.
+    single_writer: bool = True
 
 
 class VerificationConfig(BaseModel):
@@ -58,6 +170,9 @@ class LimitsConfig(BaseModel):
     # Outputs larger than this are spilled to an artifact file and only a
     # bounded preview enters agent context.
     max_inline_output_chars: int = 30000
+    # Fresh repair attempts allowed after an integration conflict before
+    # the task is BLOCKED.
+    max_integration_repairs: int = 2
 
 
 class RepeatGuardSettings(BaseModel):
@@ -80,6 +195,10 @@ class HarnessConfig(BaseModel):
     project: ProjectConfig
     workspace_dir: str = "workspace"
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    parallelism: ParallelismConfig = Field(default_factory=ParallelismConfig)
+    git: GitStrategyConfig = Field(default_factory=GitStrategyConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
@@ -99,6 +218,11 @@ class HarnessConfig(BaseModel):
     def repository_path(self) -> Path:
         repo = Path(self.project.repository)
         return repo if repo.is_absolute() else self.workspace_path / repo
+
+    @property
+    def worktrees_path(self) -> Path:
+        wd = Path(self.git.worktrees_dir)
+        return wd if wd.is_absolute() else self.workspace_path / wd
 
     @property
     def db_path(self) -> Path:
