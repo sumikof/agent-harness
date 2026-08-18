@@ -225,6 +225,21 @@ class ContextBuilder:
             trimmed[name] = head + TRUNCATION_NOTICE + tail
             total -= len(text) - len(trimmed[name])
         if total > budget_chars:
+            # The preferred floor kept dynamic sections readable; before
+            # declaring overflow, spend that floor too — a squeezed section
+            # is recoverable (full content lives in artifacts), a rejected
+            # project is not.
+            for name in _TRUNCATABLE:
+                if total <= budget_chars:
+                    break
+                text = trimmed.get(name)
+                if not text:
+                    continue
+                replacement = TRUNCATION_NOTICE.strip()
+                if len(replacement) < len(text):
+                    total -= len(text) - len(replacement)
+                    trimmed[name] = replacement
+        if total > budget_chars:
             # Only stable, untrimmable content is left (system prompt, rules,
             # project context, assignment). The provider never truncates
             # those either, so every request for this project would be

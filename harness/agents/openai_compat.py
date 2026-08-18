@@ -463,8 +463,14 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 break
             try:
                 chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                # One damaged event means the stream can no longer be
+                # trusted end-to-end: the lost fragment may be content or a
+                # tool-call argument piece, and "skip and keep going" would
+                # complete the turn with a silently partial response.
+                raise ValueError(
+                    f"malformed SSE data event ({exc}): {data[:200]!r}"
+                )
             saw_chunk = True
             if chunk.get("usage"):
                 usage = chunk["usage"]

@@ -31,6 +31,7 @@ from ..database.task_repository import TaskRepository
 from ..git.checkpoint import CheckpointManager
 from ..git.integration import IntegrationManager
 from ..git.repository import GitRepository
+from ..context.builder import ContextBudgetError
 from ..git.worktree import WorktreeManager
 from ..verification.runner import VerificationRunner
 from ..workspace_lock import WorkspaceLock
@@ -306,6 +307,16 @@ class ProjectOrchestrator:
             self.projects.set_status(project_id, ProjectState.FAILED, force=True)
             self.events.emit("PROJECT_FAILED", project_id=project_id,
                              payload={"reason": f"configuration error: {exc.detail}"})
+            return ProjectState.FAILED
+        except ContextBudgetError as exc:
+            # Stable prompt content that cannot fit the input budget fails
+            # identically on every dispatch: a configuration/content error,
+            # recorded as terminal instead of recurring as a traceback with
+            # the project stuck in PLANNING/RUNNING.
+            logger.error("project failed (context budget): %s", exc)
+            self.projects.set_status(project_id, ProjectState.FAILED, force=True)
+            self.events.emit("PROJECT_FAILED", project_id=project_id,
+                             payload={"reason": f"context budget error: {exc}"})
             return ProjectState.FAILED
         except AgentRunFailed as exc:
             logger.error("project failed: %s", exc)

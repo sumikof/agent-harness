@@ -1836,3 +1836,106 @@ def test_stable_sections_exceeding_the_budget_fail_loudly(tmp_path):
         base_branch="main",
     )
     assert builder.build_prompt(Role.DEVELOPER, fitting, system_prompt="sys")
+
+
+# -- round-12 findings -------------------------------------------------------
+
+
+async def test_stream_with_one_damaged_event_is_retried(tmp_path, monkeypatch):
+    """A malformed data event followed by valid chunks and [DONE] must still
+    invalidate the stream: the lost fragment may be content or a tool-call
+    argument piece, and skipping it completes the turn with a silently
+    partial response."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    good = {"choices": [{"delta": {
+        "role": "assistant",
+        "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}]}
+    usage = {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            body = (
+                "data: {\"choices\": [{\"delta\": {\"content\": \"lost frag"  # cut mid-JSON
+                + "\n\n"
+                + f"data: {json.dumps(good)}\n\n"
+                + "data: [DONE]\n\n"
+            ).encode()
+            return httpx.Response(200, content=body)
+        return _sse_response(httpx, [good, usage])
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(streaming=True, transient_retries=2,
+                                transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert len(calls) == 2, (
+        "a stream with a damaged event was accepted instead of retried")
+
+
+def test_dynamic_sections_are_squeezed_below_floor_before_rejecting(tmp_path):
+    """The overflow error is for STABLE content only: while trimmable text
+    remains — even below the preferred readable floor — the prompt must be
+    squeezed to fit, not rejected."""
+    from harness.context.builder import CHARS_PER_TOKEN, ContextBuilder
+    from harness.context.project_context import ProjectContext
+    from harness.orchestrator.state_machine import Role
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    budget_tokens = 1000                                    # 4000 chars
+    builder = ContextBuilder(prompts, input_budget_tokens=budget_tokens)
+    # stable content close to (but under) the budget + a large dynamic extra:
+    # the preferred floor alone would overflow, full squeeze fits.
+    project = ProjectContext(
+        name="p", goal="g" * 2500, repository_path=str(tmp_path),
+        base_branch="main",
+    )
+    prompt = builder.build_prompt(
+        Role.DEVELOPER, project, extra="E" * 50000, system_prompt="S" * 200)
+    assert len(prompt) + 200 <= budget_tokens * CHARS_PER_TOKEN, (
+        "squeezable prompt was not fitted into the budget")
+
+
+async def test_context_budget_error_fails_the_project_durably(config, monkeypatch):
+    """ContextBudgetError at dispatch must record PROJECT_FAILED — not
+    escape as a traceback that leaves the project stuck in PLANNING and
+    recurs identically on the next invocation."""
+    from harness.context.builder import ContextBudgetError
+    from harness.orchestrator.project import ProjectOrchestrator
+    from harness.orchestrator.state_machine import ProjectState
+
+    orchestrator = ProjectOrchestrator(config)
+
+    async def exploding_invoke(*args, **kwargs):
+        raise ContextBudgetError("stable prompt content exceeds the input budget")
+
+    monkeypatch.setattr(orchestrator.invoker, "invoke", exploding_invoke)
+    state = await orchestrator.run()
+
+    assert state == ProjectState.FAILED
+    row = orchestrator.projects.get(1)
+    assert row["status"] == ProjectState.FAILED.value
+    failed = orchestrator.db.query_all(
+        "SELECT * FROM events WHERE event_type = 'PROJECT_FAILED'")
+    assert failed and "context budget" in (failed[0]["payload"] or "")
