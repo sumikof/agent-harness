@@ -56,9 +56,11 @@ class SamplingConfig(BaseModel):
 
 
 class InferenceConcurrencyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     # Process-wide cap on in-flight LLM HTTP requests (semaphore). Matches
     # the serving-side --max-num-seqs baseline.
-    max_requests: int = 16
+    max_requests: int = Field(default=16, gt=0)
 
 
 class InferenceConfig(BaseModel):
@@ -168,23 +170,30 @@ class InferenceConfig(BaseModel):
 
 class ResourcePoolsConfig(BaseModel):
     """Named semaphores separating LLM inference slots from host-heavy
-    work (builds/tests) and the strictly-serialized git integration."""
+    work (builds/tests) and the strictly-serialized git integration.
 
-    llm: int = 16
-    heavy_build: int = 2
-    heavy_test: int = 2
-    git_integration: int = 1
+    Every size must be positive: a pool of 0 is a semaphore nothing can
+    ever acquire, so (for example) `heavy_test: 0` would hang every task
+    forever the moment deterministic verification asks for a slot —
+    silently, with no error to point at.
+    """
+
+    llm: int = Field(default=16, gt=0)
+    heavy_build: int = Field(default=2, gt=0)
+    heavy_test: int = Field(default=2, gt=0)
+    git_integration: int = Field(default=1, gt=0)
 
 
 class ParallelismConfig(BaseModel):
-    max_parallel_tasks: int = 16
+    max_parallel_tasks: int = Field(default=16, gt=0)
     # Upper bound on concurrently RUNNING AgentRuns (DB invariant). Defaults
     # to max_parallel_tasks: each task runs one role at a time.
-    max_parallel_agent_runs: Optional[int] = None
+    max_parallel_agent_runs: Optional[int] = Field(default=None, gt=0)
     resource_pools: ResourcePoolsConfig = Field(default_factory=ResourcePoolsConfig)
     # Scheduling-fairness: a READY task skipped this many scheduling rounds
-    # is dispatched next regardless of prefix affinity.
-    starvation_rounds: int = 8
+    # is dispatched next regardless of prefix affinity. 0 means "always
+    # prefer the oldest waiter", which is valid.
+    starvation_rounds: int = Field(default=8, ge=0)
 
     def agent_run_limit(self) -> int:
         return self.max_parallel_agent_runs or self.max_parallel_tasks

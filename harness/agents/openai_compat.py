@@ -337,55 +337,7 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
             )
 
     async def _stream_chat(self, client, payload: dict):
-        """Consume an SSE completion into the same message shape as the
-        non-streaming path. Returns (message | None, status, body).
-
-        Tool calls arrive as indexed fragments — name and id on the first
-        delta for an index, `arguments` accumulating across later ones — so
-        they are reassembled per index before the loop sees them.
-        """
-        content_parts: list[str] = []
-        tool_calls: dict[int, dict] = {}
-        usage: dict = {}
-        async with client.stream("POST", "/chat/completions", json=payload) as response:
-            if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", "replace")[:500]
-                return None, response.status_code, body
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if delta.get("content"):
-                        content_parts.append(delta["content"])
-                    for fragment in delta.get("tool_calls") or []:
-                        index = fragment.get("index", 0)
-                        call = tool_calls.setdefault(
-                            index,
-                            {"id": "", "type": "function",
-                             "function": {"name": "", "arguments": ""}},
-                        )
-                        if fragment.get("id"):
-                            call["id"] = fragment["id"]
-                        function = fragment.get("function") or {}
-                        if function.get("name"):
-                            call["function"]["name"] = function["name"]
-                        if function.get("arguments"):
-                            call["function"]["arguments"] += function["arguments"]
-        message: dict = {"role": "assistant", "content": "".join(content_parts)}
-        if tool_calls:
-            message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
-        message["_usage"] = usage
-        return message, 200, ""
+        return await stream_chat_completion(client, payload)
 
     async def _chat(
         self, spec: ResolvedAgentRunSpec, messages: list[dict], tools: list[dict]
@@ -459,3 +411,60 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                 await asyncio.sleep(delay)
                 delay *= 2
         raise TransientHTTPError(f"LLM request failed after retries: {last_error}")
+
+
+async def stream_chat_completion(client, payload: dict, url: str = "/chat/completions"):
+    """Consume an SSE completion into the same message shape as the
+    non-streaming path. Returns (message | None, status, body).
+
+    Tool calls arrive as indexed fragments — name and id on the first
+    delta for an index, `arguments` accumulating across later ones — so
+    they are reassembled per index before the caller sees them.
+
+    Module-level so the startup health gate can probe the exact same
+    accumulator the agent loop runs on: a server that reports usage in
+    ordinary JSON but omits it from SSE must fail startup, not silently
+    record zero tokens for every streamed turn.
+    """
+    content_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    usage: dict = {}
+    async with client.stream("POST", url, json=payload) as response:
+        if response.status_code != 200:
+            body = (await response.aread()).decode("utf-8", "replace")[:500]
+            return None, response.status_code, body
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                for fragment in delta.get("tool_calls") or []:
+                    index = fragment.get("index", 0)
+                    call = tool_calls.setdefault(
+                        index,
+                        {"id": "", "type": "function",
+                         "function": {"name": "", "arguments": ""}},
+                    )
+                    if fragment.get("id"):
+                        call["id"] = fragment["id"]
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        call["function"]["name"] = function["name"]
+                    if function.get("arguments"):
+                        call["function"]["arguments"] += function["arguments"]
+    message: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    message["_usage"] = usage
+    return message, 200, ""

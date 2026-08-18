@@ -51,6 +51,9 @@ HARNESS_RULES = """## Harness rules
 # serving profile with headroom for reasoning + tool calls + output.
 CHARS_PER_TOKEN = 4
 TRUNCATION_NOTICE = "\n... (section truncated by context budget; full content in artifacts)\n"
+# Preferred minimum a truncated section keeps, capped by what the budget
+# can actually hold.
+SECTION_FLOOR_CHARS = 2000
 
 # Dynamic sections eligible for budget truncation, largest first. Stable
 # sections are never truncated — cutting them would both lose rules and
@@ -80,11 +83,18 @@ class ContextBuilder:
         attempt: Optional[AttemptContext] = None,
         extra: str = "",
         volatile: Optional[dict] = None,
+        system_prompt: str = "",
     ) -> list[tuple[str, str]]:
         """The named context sections one session receives, in prompt order.
 
         Named so each section can be persisted individually in the
         ContextManifest; build_prompt() joins exactly these texts.
+
+        `system_prompt` is not returned — the provider sends it as its own
+        message — but its size counts against the budget, because the
+        server sees one request. Trimming to a budget that ignored it would
+        put every large prompt over the real limit before a single tool
+        result was appended.
         """
         sections: list[tuple[str, str]] = [
             ("harness_rules", HARNESS_RULES),
@@ -107,7 +117,7 @@ class ContextBuilder:
             sections.append(("volatile_metadata", self._render_volatile(volatile)))
 
         sections.append(("assignment", self._task_instruction(role)))
-        return self._enforce_budget(sections)
+        return self._enforce_budget(sections, reserved_chars=len(system_prompt))
 
     def build_prompt(
         self,
@@ -117,10 +127,12 @@ class ContextBuilder:
         attempt: Optional[AttemptContext] = None,
         extra: str = "",
         volatile: Optional[dict] = None,
+        system_prompt: str = "",
     ) -> str:
         """Assemble Project + Task + (needed) Attempt context for one session."""
         return "\n\n".join(
-            text for _, text in self.build_sections(role, project, task, attempt, extra, volatile)
+            text for _, text in self.build_sections(
+                role, project, task, attempt, extra, volatile, system_prompt)
         )
 
     # -- prefix cache -------------------------------------------------------
@@ -172,11 +184,20 @@ class ContextBuilder:
             lines.append(f"- {key}: {volatile[key]}")
         return "\n".join(lines)
 
-    def _enforce_budget(self, sections: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    def _enforce_budget(
+        self, sections: list[tuple[str, str]], reserved_chars: int = 0
+    ) -> list[tuple[str, str]]:
         if not self.input_budget_tokens:
             return sections
-        budget_chars = self.input_budget_tokens * CHARS_PER_TOKEN
-        total = sum(len(text) for _, text in sections)
+        # The role's system prompt is part of the same request; it is never
+        # truncated (it defines the role), so it is reserved off the top.
+        budget_chars = max(
+            self.input_budget_tokens * CHARS_PER_TOKEN - reserved_chars, 0
+        )
+        # The joiner between sections is part of what the runner sends, so
+        # it counts too — otherwise a budget met exactly is still exceeded.
+        joiner_chars = 2 * max(len(sections) - 1, 0)
+        total = sum(len(text) for _, text in sections) + joiner_chars
         if total <= budget_chars:
             return sections
         # Trim dynamic sections only, in fixed order, until within budget.
@@ -188,7 +209,11 @@ class ContextBuilder:
             if not text:
                 continue
             excess = total - budget_chars
-            keep = max(len(text) - excess - len(TRUNCATION_NOTICE), 2000)
+            # Keep a readable slice, but never one the budget cannot hold:
+            # a section floor larger than the budget would leave the request
+            # over the limit, which is worse than a shorter section.
+            floor = min(SECTION_FLOOR_CHARS, max(budget_chars // 4, 0))
+            keep = max(len(text) - excess - len(TRUNCATION_NOTICE), floor)
             if keep >= len(text):
                 continue
             head = text[: keep * 2 // 3]

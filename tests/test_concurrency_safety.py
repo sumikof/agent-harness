@@ -1279,3 +1279,234 @@ def test_partial_usage_object_does_not_pass_the_health_gate(monkeypatch):
     assert not report.models["partial"].usage_reported
     assert not report.ok
     assert any("prompt_tokens" in e for e in report.errors)
+
+
+# -- the health gate must probe the path production actually uses -----------
+
+
+def _sse(chunks: list[dict]) -> bytes:
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    return (body + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _streaming_only_broken_transport():
+    """A server that reports usage in JSON completions but omits it from SSE.
+
+    This is exactly the configuration a JSON-only health probe passes and
+    a streaming agent loop then mis-records: every turn books zero tokens.
+    """
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        tool_call = {"id": "c", "type": "function", "function": {
+            "name": "read_file", "arguments": json.dumps({"path": "README.md"})}}
+        if body.get("stream"):
+            # Same content, same tool call — but no usage anywhere in the stream.
+            if body.get("tools"):
+                delta = {"role": "assistant", "tool_calls": [dict(tool_call, index=0)]}
+            else:
+                delta = {"role": "assistant",
+                         "content": '```json\n{"status": "ok"}\n```'}
+            return httpx.Response(200, content=_sse([{"choices": [{"delta": delta}]}]))
+        if body.get("tools"):
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant",
+                                         "tool_calls": [tool_call]}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": '```json\n{"status": "ok"}\n```'}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
+
+    return httpx.MockTransport(handler)
+
+
+def _patch_async_client(monkeypatch, transport):
+    import httpx
+
+    real_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
+
+
+def test_health_gate_probes_the_configured_streaming_path(monkeypatch):
+    """With streaming on, the probe must stream — a server that only reports
+    usage in JSON must not pass a streaming deployment."""
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    _patch_async_client(monkeypatch, _streaming_only_broken_transport())
+
+    streamed = asyncio.run(
+        verify_endpoint(InferenceConfig(streaming=True), ["m"]))
+    assert not streamed.models["m"].usage_reported, (
+        "the health gate passed a streaming deployment whose SSE responses "
+        "carry no usage; every streamed turn would record zero tokens")
+    assert not streamed.ok
+    assert any("prompt_tokens" in e for e in streamed.errors)
+
+    # Capabilities still have to be readable off the stream, otherwise the
+    # probe would only be failing because it cannot parse SSE at all.
+    assert streamed.models["m"].completion_ok
+    assert streamed.models["m"].tool_calling_ok
+    assert streamed.models["m"].structured_output_ok
+
+
+def test_health_gate_still_passes_the_same_server_without_streaming(monkeypatch):
+    """The non-streaming path of that same server is genuinely fine — the
+    failure above is about the configured path, not a broken endpoint."""
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    _patch_async_client(monkeypatch, _streaming_only_broken_transport())
+
+    report = asyncio.run(verify_endpoint(InferenceConfig(streaming=False), ["m"]))
+    assert report.models["m"].usage_reported
+    assert report.ok
+
+
+def test_streaming_probe_sends_stream_options_include_usage(monkeypatch):
+    """vLLM only emits usage in SSE when asked; a probe that forgets
+    stream_options would fail every streaming endpoint."""
+    import httpx
+
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        seen.append(body)
+        if not body.get("stream_options", {}).get("include_usage"):
+            usage = {}
+        else:
+            usage = {"prompt_tokens": 8, "completion_tokens": 2}
+        if body.get("tools"):
+            delta = {"role": "assistant", "tool_calls": [{
+                "index": 0, "id": "c", "type": "function", "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"})}}]}
+        else:
+            delta = {"role": "assistant",
+                     "content": '```json\n{"status": "ok"}\n```'}
+        chunks = [{"choices": [{"delta": delta}]}]
+        if usage:
+            chunks.append({"choices": [], "usage": usage})
+        return httpx.Response(200, content=_sse(chunks))
+
+    _patch_async_client(monkeypatch, httpx.MockTransport(handler))
+
+    report = asyncio.run(verify_endpoint(InferenceConfig(streaming=True), ["m"]))
+    assert seen and all(b.get("stream") for b in seen)
+    assert all(b["stream_options"]["include_usage"] for b in seen)
+    assert report.ok
+
+
+def test_streaming_probe_reports_http_failures(monkeypatch):
+    """A streaming endpoint that rejects the request must surface as an
+    error, not as a silently empty message."""
+    import httpx
+
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        return httpx.Response(400, text="streaming not supported")
+
+    _patch_async_client(monkeypatch, httpx.MockTransport(handler))
+
+    report = asyncio.run(verify_endpoint(InferenceConfig(streaming=True), ["m"]))
+    assert not report.ok
+    assert any("400" in e for e in report.errors)
+
+
+# -- resource pool sizes must be usable, not merely present -----------------
+
+
+def test_non_positive_pool_and_parallelism_sizes_are_rejected():
+    """`heavy_test: 0` builds an asyncio.Semaphore(0): every task that asks
+    for the pool blocks forever. Refuse it at load time."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from harness.config import (
+        InferenceConcurrencyConfig,
+        ParallelismConfig,
+        ResourcePoolsConfig,
+    )
+
+    for field in ("llm", "heavy_build", "heavy_test", "git_integration"):
+        for bad in (0, -1):
+            with _pytest.raises(ValidationError):
+                ResourcePoolsConfig(**{field: bad})
+    for field in ("max_parallel_tasks", "max_parallel_agent_runs"):
+        for bad in (0, -1):
+            with _pytest.raises(ValidationError):
+                ParallelismConfig(**{field: bad})
+    for bad in (0, -1):
+        with _pytest.raises(ValidationError):
+            InferenceConcurrencyConfig(max_requests=bad)
+
+    # ...and valid sizes still load.
+    pools = ResourcePoolsConfig(llm=4, heavy_build=1, heavy_test=2, git_integration=1)
+    assert pools.heavy_test == 2
+    # starvation_rounds legitimately disables the anti-starvation bump at 0.
+    assert ParallelismConfig(starvation_rounds=0).starvation_rounds == 0
+
+
+# -- the context budget must cover the whole request ------------------------
+
+
+def test_context_budget_accounts_for_the_system_prompt(tmp_path):
+    """The system prompt travels in the same request; a budget that ignores
+    it puts every large prompt over the real limit."""
+    from harness.context.builder import CHARS_PER_TOKEN, ContextBuilder
+    from harness.context.project_context import ProjectContext
+    from harness.orchestrator.state_machine import Role
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    system_prompt = "S" * 1500
+    # A realistic project context: stable sections are never truncated (that
+    # would both lose rules and fracture the shared prefix), so the budget is
+    # only meetable when the dynamic sections can absorb the overflow.
+    project = ProjectContext(
+        name="p", goal="ship the thing", repository_path=str(tmp_path),
+        base_branch="main", architecture_rules=["keep modules small"],
+    )
+
+    for budget_tokens in (1000, 5000, 50000):
+        builder = ContextBuilder(prompts, input_budget_tokens=budget_tokens)
+        prompt = builder.build_prompt(
+            Role.DEVELOPER, project, extra="E" * 200000,
+            system_prompt=system_prompt,
+        )
+        limit = budget_tokens * CHARS_PER_TOKEN
+        total = len(prompt) + len(system_prompt)
+        assert total <= limit, (
+            f"budget {budget_tokens} tokens ({limit} chars): the request the "
+            f"runner sends is {total} chars — the system prompt was not counted")

@@ -216,7 +216,8 @@ class AgentInvoker:
 
         system_prompt = self.context_builder.system_prompt(spec.prompt_file)
         sections = self.context_builder.build_sections(
-            spec.role, project_ctx, task_ctx, attempt_ctx, extra, volatile=volatile_meta
+            spec.role, project_ctx, task_ctx, attempt_ctx, extra,
+            volatile=volatile_meta, system_prompt=system_prompt,
         )
         prefix_key = self._prefix_group_key(spec, profile, project_ctx)
 

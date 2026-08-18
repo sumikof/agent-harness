@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 
 from ..config import InferenceConfig
-from .openai_compat import auth_headers
+from .openai_compat import auth_headers, stream_chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -186,16 +186,36 @@ async def verify_endpoint(
             return report
 
         async def chat(messages, model, tools=None, max_tokens=256):
+            """One probe request, issued through the SAME response path the
+            agents will use.
+
+            Probing only JSON completions would pass an endpoint that
+            reports usage in ordinary responses while omitting it from SSE;
+            the streaming loop would then record zero tokens on every turn
+            and no startup gate would have caught it. So when
+            `inference.streaming` is on, the probe streams and is
+            reassembled by the production accumulator.
+            """
+            streaming = bool(inference.streaming)
             payload = {
                 "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
-                "stream": False,
+                "stream": streaming,
             }
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
+            if streaming:
+                payload["stream_options"] = {"include_usage": True}
+                message, status, body = await stream_chat_completion(
+                    client, payload, url=f"{base}/chat/completions"
+                )
+                if message is None:
+                    raise InferenceHealthError(f"HTTP {status}: {body}")
+                usage = message.pop("_usage", None) or {}
+                return {"choices": [{"message": message}], "usage": usage}
             response = await client.post(f"{base}/chat/completions", json=payload)
             response.raise_for_status()
             return response.json()
