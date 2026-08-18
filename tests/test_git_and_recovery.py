@@ -150,3 +150,72 @@ def test_recovery_noop_when_clean(tmp_path, repo):
     recovery = RecoveryManager(tasks, events, artifacts, repo, CheckpointManager(repo))
     assert not recovery.recover(projects.get(project_id))
     db.close()
+
+
+# -- final-review findings: merge classification, ref pinning ---------------
+
+
+def test_environmental_merge_failure_is_not_a_conflict(repo):
+    """A merge that fails for a non-conflict reason (dirty tree in the way,
+    index.lock, disk errors) must raise GitError, not MergeConflict: the
+    conflict path archives-and-discards a reviewed change and burns a
+    repair attempt on work that had no real conflict."""
+    from harness.git.repository import GitError, MergeConflict
+
+    default = repo.current_branch()
+    repo._run("checkout", "-b", "feature")
+    (repo.path / "hello.txt").write_text("feature change\n")
+    repo.add_all()
+    repo.commit("feature edit")
+    repo._run("checkout", default)
+    # Uncommitted local change that the merge would overwrite: git refuses
+    # with exit 1, but leaves NO conflicted paths and NO merge in progress.
+    (repo.path / "hello.txt").write_text("local uncommitted\n")
+
+    with pytest.raises(GitError) as excinfo:
+        repo.merge_no_ff("feature", "integrate")
+    assert not isinstance(excinfo.value, MergeConflict), (
+        "an environmental merge failure was classified as a conflict")
+    assert not repo.merge_in_progress()
+
+
+def test_real_conflict_still_raises_merge_conflict(repo):
+    """The classification change must not swallow genuine conflicts."""
+    from harness.git.repository import MergeConflict
+
+    default = repo.current_branch()
+    repo._run("checkout", "-b", "feature")
+    (repo.path / "hello.txt").write_text("feature side\n")
+    repo.add_all()
+    repo.commit("feature edit")
+    repo._run("checkout", default)
+    (repo.path / "hello.txt").write_text("main side\n")
+    repo.add_all()
+    repo.commit("main edit")
+
+    with pytest.raises(MergeConflict):
+        repo.merge_no_ff("feature", "integrate")
+    assert repo.conflicted_paths() or repo.merge_in_progress()
+    repo.merge_abort()
+
+
+def test_pin_ref_keeps_a_commit_reachable_after_branch_deletion(repo):
+    """tasks.task_commit is recorded before the conflict path deletes the
+    task branch; without a pinned ref the commit is gc-prunable and the DB
+    points at an object trailer lookups can no longer find."""
+    default = repo.current_branch()
+    repo._run("checkout", "-b", "task-branch")
+    (repo.path / "work.txt").write_text("reviewed change\n")
+    repo.add_all()
+    repo.commit("task work")
+    task_commit = repo.head_commit()
+    repo._run("checkout", default)
+
+    repo.pin_ref("refs/harness/conflicts/T001-attempt-1", task_commit)
+    repo.delete_branch("task-branch")
+
+    pinned = repo.rev_parse("refs/harness/conflicts/T001-attempt-1")
+    assert pinned == task_commit
+    # the ref keeps the commit visible to `git log --all` trailer lookups
+    out = repo._run("log", "--all", "--format=%H").stdout
+    assert task_commit in out

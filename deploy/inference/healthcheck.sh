@@ -21,9 +21,12 @@ step() { echo "==> $1"; }
 ok()   { echo "    OK${1:+: $1}"; }
 bad()  { echo "    FAILED${1:+: $1}" >&2; fail=1; }
 
+# 2048, not 64: with the reasoning parser active the model spends tokens on
+# reasoning_content BEFORE the tool call / answer; a tight cap truncates
+# mid-thought and fails a healthy endpoint.
 chat() {  # chat <json-messages> [extra-json-fields]
     curl -fsS "${BASE}/v1/chat/completions" -H 'Content-Type: application/json' \
-        -d "{\"model\":\"${MODEL_ALIAS}\",\"stream\":false,\"max_tokens\":64,\"temperature\":0,${2:+$2,}\"messages\":$1}"
+        -d "{\"model\":\"${MODEL_ALIAS}\",\"stream\":false,\"max_tokens\":2048,\"temperature\":0,${2:+$2,}\"messages\":$1}"
 }
 
 metric_sum() {  # metric_sum <substring...> — sum of matching counters

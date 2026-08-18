@@ -643,6 +643,12 @@ class TaskRunner:
             attempt_id=attempt_id,
             payload={"task_commit": task_commit, "files": outcome.conflict_files},
         )
+        # The DB has just recorded task_commit, but disposal deletes the task
+        # branch — the commit's only ref. Pin it so tasks.task_commit never
+        # points at a gc-prunable object and trailer lookups keep finding it.
+        self.git.pin_ref(
+            f"refs/harness/conflicts/{task_key}-attempt-{attempt_id}", task_commit
+        )
         self._dispose_env(env)
         feedback = AttemptContext(
             integration_conflict={

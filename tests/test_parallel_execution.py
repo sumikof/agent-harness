@@ -227,6 +227,14 @@ async def test_integration_conflict_routes_to_fresh_repair(config, monkeypatch):
     # the failed integration op is settled, nothing PENDING
     assert orchestrator.operations.unfinished() == []
     assert orchestrator.worktrees.registered_paths() == []
+    # the conflicted task_commit was recorded in the DB and its branch was
+    # deleted — a pinned ref must keep that commit reachable (never let the
+    # DB point at a gc-prunable object)
+    pinned = orchestrator.git._run(
+        "for-each-ref", "--format=%(refname)", "refs/harness/conflicts/",
+        check=False,
+    ).stdout.strip().splitlines()
+    assert pinned, "conflicted task_commit has no pinned ref after branch deletion"
 
 
 async def test_parallel_crash_recovery_recovers_every_running_task(config, monkeypatch):

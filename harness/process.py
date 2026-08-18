@@ -78,15 +78,30 @@ def run_command(
         _terminate_group(process)
         # Drain whatever the group produced before it died, so the timeout
         # report still carries the diagnostic output.
+        note = ""
         try:
             stdout, stderr = process.communicate(timeout=TERM_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = "", ""
-        output = f"TIMEOUT after {timeout}s\n{stdout or ''}\n{stderr or ''}"
+        except subprocess.TimeoutExpired as drain_exc:
+            # A descendant that re-setsid'd escaped the killed group and
+            # still holds the pipe. Salvage whatever was captured instead
+            # of handing the agent a timeout report with zero diagnostics.
+            stdout = _as_text(drain_exc.stdout)
+            stderr = _as_text(drain_exc.stderr)
+            note = ("\n(output partially lost: a process outside the killed "
+                    "group still holds the output pipe)")
+        output = f"TIMEOUT after {timeout}s\n{stdout or ''}\n{stderr or ''}{note}"
         return CommandResult(exit_code=-1, output=output, timed_out=True)
 
     output = (stdout or "") + ("\n" + stderr if stderr else "")
     return CommandResult(exit_code=process.returncode, output=output)
+
+
+def _as_text(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data)
 
 
 def _terminate_group(process: subprocess.Popen) -> None:

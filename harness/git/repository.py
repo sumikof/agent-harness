@@ -477,10 +477,20 @@ class GitRepository:
             check=False,
         )
         if result.returncode != 0:
-            raise MergeConflict(
-                f"merge of {ref} failed: {result.stdout.strip()} {result.stderr.strip()}"
-            )
+            detail = f"{result.stdout.strip()} {result.stderr.strip()}".strip()
+            # Only an actual conflict is a conflict. A stale index.lock, a
+            # full disk or an object-store error also exit non-zero but leave
+            # no conflicted paths and no merge in progress; classifying those
+            # as CONFLICT would archive-and-discard a reviewed change and
+            # burn a repair attempt on work that had no real conflict.
+            if self.merge_in_progress() or self.conflicted_paths():
+                raise MergeConflict(f"merge of {ref} failed: {detail}")
+            raise GitError(f"merge of {ref} failed without conflict state: {detail}")
         return self.head_commit() or ""
+
+    def pin_ref(self, name: str, commit: str) -> None:
+        """Keep `commit` reachable under refs/... after its branch is gone."""
+        self._run("update-ref", name, commit, check=False)
 
     def merge_in_progress(self) -> bool:
         git_dir = self._run("rev-parse", "--git-dir").stdout.strip()

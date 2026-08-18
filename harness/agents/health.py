@@ -49,6 +49,12 @@ _TOOL_SMOKE_SCHEMA = [{
     },
 }]
 
+# Capability probes run with the reasoning parser active: a thinking model
+# spends tokens on reasoning_content BEFORE the tool call / JSON it was
+# asked for. A tight cap (e.g. 256) truncates mid-thought and fails a
+# healthy endpoint. Startup-only, so the larger budget costs nothing.
+PROBE_MAX_TOKENS = 2048
+
 # Long shared prefix for the cache smoke test (needs to exceed the
 # server's prefix-match block size comfortably).
 _PREFIX_FILLER = ("The harness verifies serving features before use. " * 400).strip()
@@ -189,7 +195,7 @@ async def verify_endpoint(
             report.errors.append(f"/models failed: {exc}")
             return report
 
-        async def chat(messages, model, tools=None, max_tokens=256):
+        async def chat(messages, model, tools=None, max_tokens=PROBE_MAX_TOKENS):
             """One probe request, issued through the SAME response path the
             agents will use.
 

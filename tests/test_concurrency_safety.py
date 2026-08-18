@@ -745,9 +745,15 @@ def test_orchestrator_budget_follows_the_profile(config):
     config.inference.context_profile = "performance"
     config.inference.input_budget_tokens = 200_000     # cannot fit the window
     orchestrator = ProjectOrchestrator(config)
+    # The INITIAL prompt budget sits BELOW the effective input budget: the
+    # difference is the reserve one tool turn needs, so the loop's first
+    # tool result never forces the unseen newest turn out of the window.
     assert orchestrator.context_builder.input_budget_tokens == (
+        config.inference.prompt_budget_tokens())
+    assert orchestrator.context_builder.input_budget_tokens < (
         config.inference.effective_input_budget())
     assert orchestrator.context_builder.input_budget_tokens < 200_000
+    assert orchestrator.context_builder.input_budget_tokens > 0
 
 
 # -- benchmark profile selection -------------------------------------------
@@ -1089,9 +1095,15 @@ async def test_tool_loop_history_is_clamped_to_the_input_budget(tmp_path, monkey
     big.write_text("x" * 120_000 + "\n")          # far past one tool result cap
     sizes: list[int] = []
 
+    unelided_latest: list[bool] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         sizes.append(_messages_size(body["messages"]))
+        tool_messages = [m for m in body["messages"] if m.get("role") == "tool"]
+        if tool_messages:
+            unelided_latest.append(
+                tool_messages[-1]["content"] != ELIDED_TOOL_RESULT)
         if len(sizes) <= 3:
             return httpx.Response(200, json={"choices": [{"message": {
                 "role": "assistant", "content": None,
@@ -1119,11 +1131,19 @@ async def test_tool_loop_history_is_clamped_to_the_input_budget(tmp_path, monkey
     result = await runner.run(spec)
 
     assert result.status == "COMPLETED"
+    from harness.agents.local_tools import MAX_TOOL_OUTPUT_CHARS
     limit = inference.effective_input_budget() * CHARS_PER_TOKEN
     assert sizes, "no request was sent"
-    assert max(sizes) <= limit, (
-        f"history grew to {max(sizes)} chars, past the {limit}-char budget")
+    # The newest tool result is deliberately NOT elidable (the model has
+    # not seen it yet), so the hard bound is budget + one full turn; the
+    # elidable part of the history must stay inside the budget itself.
+    turn_allowance = MAX_TOOL_OUTPUT_CHARS + 4000
+    assert max(sizes) <= limit + turn_allowance, (
+        f"history grew to {max(sizes)} chars, past the {limit}-char budget "
+        f"plus one unseen turn ({turn_allowance})")
     assert len(sizes) > 3, "the tool loop did not actually run"
+    assert unelided_latest and all(unelided_latest), (
+        "a request elided the tool result the model had never seen")
 
 
 def test_elision_keeps_the_assignment_and_tool_call_pairing(tmp_path):
@@ -1223,7 +1243,13 @@ def test_clamping_elides_tool_call_arguments_not_just_results(tmp_path):
     runner._fit_to_window(messages)
 
     limit = inference.effective_input_budget() * CHARS_PER_TOKEN
-    assert _messages_size(messages) <= limit, "history still exceeds the budget"
+    # The final turn is the model's unseen result — protected. Everything
+    # BEFORE it must have been squeezed inside the budget.
+    seen = messages[:-2]
+    assert _messages_size(seen) <= limit, "seen history still exceeds the budget"
+    assert messages[-1]["content"] != ELIDED_TOOL_RESULT, (
+        "the unseen newest tool result was elided")
+    assert messages[-2]["tool_calls"][0]["function"]["arguments"] != ELIDED_ARGUMENTS
     calls = [c for m in messages for c in (m.get("tool_calls") or [])]
     assert any(c["function"]["arguments"] == ELIDED_ARGUMENTS for c in calls)
     # protocol pairing survives: every call keeps its id and name, and the
@@ -1569,3 +1595,142 @@ def test_streaming_probe_sees_reasoning_without_retaining_it(monkeypatch):
     assert message["_reasoning_seen"] is True
     assert secret not in json.dumps(message), (
         "hidden reasoning text leaked into the accumulated message")
+
+
+# -- final-review findings ---------------------------------------------------
+
+
+def test_llm_task_keys_cannot_escape_into_paths():
+    """task_key flows into worktree dirs, branch names and artifact paths;
+    security must not depend on the prompt, so hostile keys are rejected at
+    plan ingestion — for split tasks exactly as for planned ones."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from harness.artifacts.schemas import Diagnosis, PlannedTask
+
+    for bad in ("../../../../tmp/x", "a/b", "a b", ".hidden", "", "-lead",
+                "x" * 65, "a\x00b"):
+        with _pytest.raises(ValidationError):
+            PlannedTask(task_key=bad, title="t")
+    with _pytest.raises(ValidationError):
+        PlannedTask(task_key="T001", title="t", dependencies=["../up"])
+    # split tasks are PlannedTask too, so the Diagnostician's replacements
+    # go through the same gate
+    with _pytest.raises(ValidationError):
+        Diagnosis(recommendation="SPLIT",
+                  split_tasks=[{"task_key": "../x", "title": "t"}])
+
+    assert PlannedTask(task_key="T001", title="t").task_key == "T001"
+    assert PlannedTask(task_key="T001-fix_2", title="t",
+                       dependencies=["T000"]).dependencies == ["T000"]
+
+
+def test_health_probes_leave_room_for_thinking_tokens():
+    """With the reasoning parser active the model spends tokens on
+    reasoning_content before the tool call / JSON; a tight probe cap
+    truncates mid-thought and fails a healthy endpoint at startup."""
+    import httpx
+
+    from harness.agents.health import PROBE_MAX_TOKENS, verify_endpoint
+    from harness.config import InferenceConfig
+
+    assert PROBE_MAX_TOKENS >= 1024
+
+    probe_budgets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        probe_budgets.append(body["max_tokens"])
+        usage = {"prompt_tokens": 8, "completion_tokens": 2}
+        if body.get("tools"):
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant",
+                "tool_calls": [{"id": "c", "type": "function", "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"})}}]}}],
+                "usage": usage})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": '```json\n{"status": "ok"}\n```'}}],
+            "usage": usage})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    import unittest.mock as um
+    with um.patch.object(
+        httpx, "AsyncClient",
+        lambda *a, **k: real_client(*a, **{**k, "transport": transport}),
+    ):
+        report = asyncio.run(verify_endpoint(InferenceConfig(), ["m"]))
+
+    assert report.ok
+    # capability probes carry the roomy budget; only the prefix-cache
+    # probes (which need no completion) stay tiny
+    capability = [b for b in probe_budgets if b != 8]
+    assert capability and all(b == PROBE_MAX_TOKENS for b in capability)
+
+
+async def test_malformed_200_body_is_retried_in_session(tmp_path, monkeypatch):
+    """A proxy or overloaded server returning 200 with an unparseable body
+    is as transient as a 5xx: it must hit the in-session retry, not abort
+    the session and discard the tool-loop history."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, text="<html>gateway buffering</html>")
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(transient_retries=2, transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED", (
+        f"malformed 200 body aborted the session: {result.error}")
+    assert len(calls) == 2, "the malformed response was not retried in-session"
+
+
+def test_timeout_report_salvages_output_when_a_descendant_holds_the_pipe(monkeypatch):
+    """A re-setsid'd descendant escapes the killed group and keeps the pipe
+    open; the drain then times out too. The report must still carry what
+    was captured before the deadline — not empty output."""
+    import harness.process as hp
+
+    monkeypatch.setattr(hp, "TERM_GRACE_SECONDS", 1)
+    result = hp.run_command(
+        "echo diagnostic-line; setsid sleep 8 & sleep 30", cwd="/tmp", timeout=1
+    )
+    assert result.timed_out
+    assert "diagnostic-line" in result.output, (
+        "the timeout report lost the output captured before the deadline")
+    assert "outside the killed group" in result.output

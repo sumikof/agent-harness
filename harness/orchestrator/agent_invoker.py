@@ -43,6 +43,7 @@ from ..agents.profile import (
     ResolvedAgentRunSpec,
 )
 from ..artifacts.manager import ArtifactManager, sha256_text
+from ..concurrency import run_thread_uninterruptible
 from ..config import HarnessConfig
 from ..context.attempt_context import AttemptContext
 from ..context.builder import ContextBuilder
@@ -387,7 +388,11 @@ class AgentInvoker:
         pre_dispatch_snapshot: Optional[WorktreeSnapshot] = None
         if spec.mutates_repo and git is not None and git.head_commit() is not None:
             try:
-                pre_dispatch_snapshot = git.snapshot_worktree_state()
+                # Reads and tars every changed file — worker thread, so the
+                # 15 other in-flight tasks keep their loops moving meanwhile.
+                pre_dispatch_snapshot = await asyncio.to_thread(
+                    git.snapshot_worktree_state
+                )
             except Exception as exc:
                 logger.warning("could not snapshot worktree before dispatch: %s", exc)
         for attempt in range(TECHNICAL_RETRIES + 1):
@@ -480,12 +485,15 @@ class AgentInvoker:
                         )
                     dispatch_op_id = None
                     if self.operations:
-                        base_diff_hash = None
-                        if spec.mutates_repo and git is not None:
-                            try:
-                                base_diff_hash = git.dirty_state_hash()
-                            except Exception as exc:
-                                logger.warning("could not hash pre-dispatch state: %s", exc)
+                        # The hash of the state recovery may reset to IS the
+                        # snapshot's hash: between technical attempts the
+                        # tree is restored to exactly that state. Re-reading
+                        # every changed file here would do the same work
+                        # again — inside the process-wide write lock.
+                        base_diff_hash = (
+                            pre_dispatch_snapshot.state_hash
+                            if pre_dispatch_snapshot is not None else None
+                        )
                         dispatch_op_id = self.operations.record_intent(
                             OperationType.AGENT_DISPATCH,
                             {
@@ -621,7 +629,15 @@ class AgentInvoker:
                 # transient failure; redispatching on top of that would run
                 # the same assignment against an unknown base. Archive the
                 # partial diff and restore the session-start state first.
-                self._restore_worktree_for_retry(spec, run_id, pre_dispatch_snapshot, git)
+                # Restore is real file I/O (archive partial diff + rewrite
+                # tree bytes) and must finish even if this coroutine is
+                # cancelled mid-retry — a half-restored tree would be
+                # archived as if it were the agent's work.
+                await run_thread_uninterruptible(
+                    self._restore_worktree_for_retry,
+                    spec, run_id, pre_dispatch_snapshot, git,
+                    label=f"worktree restore for {spec.role.value} run {run_id}",
+                )
                 logger.warning(
                     "%s failed technically (%s); retrying in %.0fs", spec.role, result.error, delay
                 )

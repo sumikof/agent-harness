@@ -307,16 +307,26 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
         budget_chars = self.inference.effective_input_budget() * CHARS_PER_TOKEN
         if _messages_size(messages) <= budget_chars:
             return
+        # The results of the FINAL turn are the one part of the history the
+        # model has not seen yet — eliding them would blind the loop to the
+        # call it just made, and with a budget-sized initial prompt that
+        # blindness repeats every turn until the repeat guard aborts. They
+        # are exempt from both passes; over budget beats never seeing any
+        # tool output.
+        last_assistant = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "assistant"),
+            default=-1,
+        )
         # Oldest completed turns first. A turn is elided as a PAIR: the tool
         # result and the arguments of the call that produced it. Those
         # arguments carry the whole file body for write_file/edit_file, so
         # eliding only the result leaves the larger half in the history.
         # The call keeps its id and name, so the assistant/tool pairing the
         # protocol requires still holds.
-        for message in messages:
+        for index, message in enumerate(messages):
             if _messages_size(messages) <= budget_chars:
                 return
-            if message.get("role") != "tool":
+            if message.get("role") != "tool" or index > last_assistant:
                 continue
             call_id = message.get("tool_call_id")
             if message.get("content") != ELIDED_TOOL_RESULT:
@@ -387,11 +397,15 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                     status, body = response.status_code, response.text[:500]
                     message = None
                     if status == 200:
+                        # json() raising (proxy/overload returning 200 with an
+                        # HTML or truncated body) is as transient as a 5xx —
+                        # it must reach the in-session retry below, not abort
+                        # the session and discard the tool-loop history.
                         data = response.json()
                         choice = (data.get("choices") or [{}])[0]
                         message = dict(choice.get("message") or {})
                         message["_usage"] = data.get("usage") or {}
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ValueError) as exc:
                 last_error = f"transport error: {type(exc).__name__}: {exc}"
             else:
                 if message is not None:

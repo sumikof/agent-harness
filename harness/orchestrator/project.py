@@ -91,9 +91,11 @@ class ProjectOrchestrator:
         )
         # The budget honours the selected context profile: `long`/`maximum`
         # widen it, and a configured budget can never exceed the window.
+        # The INITIAL prompt gets less than the full input budget so the
+        # tool loop has room to grow before anything must be elided.
         self.context_builder = ContextBuilder(
             config.prompts_path,
-            input_budget_tokens=config.inference.effective_input_budget(),
+            input_budget_tokens=config.inference.prompt_budget_tokens(),
         )
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(

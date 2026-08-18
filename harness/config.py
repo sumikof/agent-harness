@@ -41,6 +41,9 @@ class ProviderConfig(BaseModel):
 
 # Below this the context profile cannot hold a usable prompt at all.
 MIN_INPUT_HEADROOM_TOKENS = 1024
+# Room kept free for tool-loop growth per prompt: one MAX_TOOL_OUTPUT_CHARS
+# tool result (~7.5k tokens at 4 chars/token) plus the assistant turn.
+TOOL_LOOP_RESERVE_TOKENS = 8192
 
 
 class SamplingConfig(BaseModel):
@@ -151,6 +154,19 @@ class InferenceConfig(BaseModel):
 
     def input_headroom(self) -> int:
         return self.max_model_len() - self.max_output_tokens
+
+    def prompt_budget_tokens(self) -> int:
+        """Budget for the INITIAL prompt: the input budget minus room for at
+        least one tool turn (assistant message + one full tool result).
+
+        Building the first prompt right up to the input budget means the
+        very first tool call pushes the history over it, and the only thing
+        left to elide is the result the model has not seen yet. The
+        reserve keeps one whole turn inside the budget so elision always
+        has an already-seen turn to take space from first.
+        """
+        effective = self.effective_input_budget()
+        return effective - min(TOOL_LOOP_RESERVE_TOKENS, effective // 4)
 
     def sampling_for_role(self, role: str) -> SamplingConfig:
         """The global profile with the role's EXPLICIT overrides applied.
