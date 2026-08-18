@@ -43,6 +43,7 @@ from ..agents.profile import (
     ResolvedAgentRunSpec,
 )
 from ..artifacts.manager import ArtifactManager, sha256_text
+from ..concurrency import run_thread_uninterruptible
 from ..config import HarnessConfig
 from ..context.attempt_context import AttemptContext
 from ..context.builder import ContextBuilder
@@ -90,7 +91,9 @@ class AgentConfigurationError(Exception):
 
 
 class ConcurrentRunError(Exception):
-    """A second RUNNING AgentRun would violate the max-1 invariant."""
+    """Dispatch would violate a concurrency invariant: either the
+    configured max_parallel_agent_runs limit, or the hard rule that at
+    most ONE mutating agent runs per task attempt (worktree)."""
 
 
 class AgentInvoker:
@@ -104,6 +107,8 @@ class AgentInvoker:
         budget: BudgetManager,
         operations: Optional[OperationRepository] = None,
         git: Optional[GitRepository] = None,
+        llm_gate=None,
+        resource_pools=None,
     ):
         self.config = config
         self.context_builder = context_builder
@@ -113,8 +118,32 @@ class AgentInvoker:
         self.budget = budget
         self.operations = operations
         self.git = git
+        # The configured LLM pool (ResourcePools.llm). Passed to every local
+        # provider so `parallelism.resource_pools.llm` and the scheduler's
+        # metrics observe the SAME gate the requests actually go through.
+        self.llm_gate = llm_gate or getattr(resource_pools, "llm", None)
+        # Host pools travel to the provider so agent-run builds/tests draw
+        # from the same limits as harness verification.
+        self.resource_pools = resource_pools
+        self._admission: Optional[asyncio.Semaphore] = None
+        self._admission_loop = None
 
     # ------------------------------------------------------------------
+
+    def _admission_gate(self) -> asyncio.Semaphore:
+        """Waitable admission control for concurrent AgentRuns.
+
+        Reaching `max_parallel_agent_runs` is ordinary contention — the
+        dispatch queues here instead of raising. Bound lazily to the running
+        loop so one invoker can serve sequential event loops.
+        """
+        loop = asyncio.get_running_loop()
+        if self._admission is None or self._admission_loop is not loop:
+            self._admission = asyncio.Semaphore(
+                self.config.parallelism.agent_run_limit()
+            )
+            self._admission_loop = loop
+        return self._admission
 
     def build_profile(self, spec: RoleSpec) -> AgentProfile:
         provider_type, model = self.config.provider.for_role(spec.role.value)
@@ -150,14 +179,22 @@ class AgentInvoker:
         task_id: Optional[int] = None,
         attempt_id: Optional[int] = None,
         artifact_path: Optional[Path] = None,
+        workdir: Optional[Path] = None,
+        git: Optional[GitRepository] = None,
+        volatile: Optional[dict] = None,
     ) -> BaseModel:
-        """Run the role in a fresh session; return its validated output model."""
+        """Run the role in a fresh session; return its validated output model.
+
+        `workdir`/`git` select the task's isolated worktree; they default
+        to the main repository for project-scope roles (Planner).
+        """
         self.budget.check_project(project_id)
         if task_id is not None:
             self.budget.check_task(task_id)
 
         profile = self.build_profile(spec)
-        runner = create_runner(profile.provider)
+        runner = create_runner(profile.provider, self.config.inference,
+                               self.llm_gate, self.resource_pools)
 
         # Capability validation happens BEFORE anything is dispatched. A
         # provider missing a required capability is a configuration error,
@@ -169,10 +206,21 @@ class AgentInvoker:
                 f"provider '{profile.provider}' lacks required capabilities: {', '.join(missing)}",
             )
 
+        workdir = workdir or self.config.repository_path
+        git = git or self.git
+        # Volatile metadata travels at the PROMPT TAIL only — the stable
+        # prefix (rules + project context) stays byte-identical across
+        # sessions of the same role/project for vLLM prefix caching.
+        volatile_meta = {"working_directory": str(workdir)}
+        if volatile:
+            volatile_meta.update(volatile)
+
         system_prompt = self.context_builder.system_prompt(spec.prompt_file)
         sections = self.context_builder.build_sections(
-            spec.role, project_ctx, task_ctx, attempt_ctx, extra
+            spec.role, project_ctx, task_ctx, attempt_ctx, extra,
+            volatile=volatile_meta, system_prompt=system_prompt,
         )
+        prefix_key = self._prefix_group_key(spec, profile, project_ctx)
 
         schema_feedback = ""
         last_error = "unknown"
@@ -187,6 +235,9 @@ class AgentInvoker:
                 project_id,
                 task_id,
                 attempt_id,
+                workdir=workdir,
+                git=git,
+                prefix_group_key=prefix_key,
             )
             if result.status != "COMPLETED":
                 raise AgentRunFailed(spec.role.value, result.error or "agent session failed")
@@ -206,7 +257,7 @@ class AgentInvoker:
                         attempt_no=attempt_no,
                         producer_role=spec.role.value,
                         producer_run_id=run_id,
-                        base_commit=self.git.head_commit() if self.git else None,
+                        base_commit=git.head_commit() if git else None,
                         input_manifest_hash=run_row["context_manifest_hash"]
                         if run_row else None,
                         created_at=utcnow(),
@@ -225,6 +276,25 @@ class AgentInvoker:
 
     # ------------------------------------------------------------------
 
+    def _prefix_group_key(self, spec: RoleSpec, profile: AgentProfile,
+                          project_ctx: ProjectContext) -> str:
+        """PrefixGroupKey for this dispatch: model + role profile + project
+        context + tool schema + shared prompt text. Stable for identical
+        context; volatile metadata cannot reach it by construction."""
+        tool_hash = ""
+        if profile.provider in ("openai-compatible", "openai_compatible", "vllm"):
+            from ..agents.local_tools import tool_schema_hash
+
+            tool_hash = tool_schema_hash(spec.role)
+        return self.context_builder.compute_prefix_group_key(
+            model=profile.model,
+            agent_profile_hash=profile.profile_hash(),
+            project=project_ctx,
+            role=spec.role,
+            prompt_file=spec.prompt_file,
+            tool_schema_hash=tool_hash,
+        )
+
     def _persist_manifest(
         self,
         profile: AgentProfile,
@@ -235,6 +305,7 @@ class AgentInvoker:
         project_id: int,
         task_id: Optional[int],
         attempt_no: Optional[int],
+        git: Optional[GitRepository] = None,
     ) -> tuple[ContextManifest, Path, str]:
         """Write every context section + the manifest to artifact files.
 
@@ -263,7 +334,7 @@ class AgentInvoker:
             task_id=task_id,
             attempt_no=attempt_no,
             role=profile.role,
-            base_commit=self.git.head_commit() if self.git else None,
+            base_commit=git.head_commit() if git else None,
             sections=refs,
             prompt_template_hash=profile.prompt_template_hash,
             agent_profile_hash=profile.profile_hash(),
@@ -292,9 +363,14 @@ class AgentInvoker:
         project_id: int,
         task_id: Optional[int],
         attempt_id: Optional[int],
+        workdir: Optional[Path] = None,
+        git: Optional[GitRepository] = None,
+        prefix_group_key: str = "",
     ) -> tuple[AgentResult, Optional[int]]:
         delay = TECHNICAL_RETRY_DELAY
         prompt = "\n\n".join(text for _, text in sections) + schema_feedback
+        workdir = workdir or self.config.repository_path
+        git = git or self.git
         attempt_no = None
         if attempt_id is not None:
             row = self.runs.db.query_one(
@@ -310,9 +386,13 @@ class AgentInvoker:
         # from the actual on-disk bytes (tar + deletions), so git clean
         # filters cannot distort what gets restored.
         pre_dispatch_snapshot: Optional[WorktreeSnapshot] = None
-        if spec.mutates_repo and self.git is not None and self.git.head_commit() is not None:
+        if spec.mutates_repo and git is not None and git.head_commit() is not None:
             try:
-                pre_dispatch_snapshot = self.git.snapshot_worktree_state()
+                # Reads and tars every changed file — worker thread, so the
+                # 15 other in-flight tasks keep their loops moving meanwhile.
+                pre_dispatch_snapshot = await asyncio.to_thread(
+                    git.snapshot_worktree_state
+                )
             except Exception as exc:
                 logger.warning("could not snapshot worktree before dispatch: %s", exc)
         for attempt in range(TECHNICAL_RETRIES + 1):
@@ -326,7 +406,7 @@ class AgentInvoker:
             #    persist it aborts the dispatch entirely.
             manifest, manifest_path, manifest_hash = self._persist_manifest(
                 profile, system_prompt, sections, schema_feedback, prompt,
-                project_id, task_id, attempt_no,
+                project_id, task_id, attempt_no, git=git,
             )
 
             # 2. Resolve the run spec (still nothing dispatched).
@@ -334,8 +414,8 @@ class AgentInvoker:
                 role=spec.role,
                 system_prompt=system_prompt,
                 prompt=prompt,
-                cwd=self.config.repository_path,
-                repo_root=self.config.repository_path,
+                cwd=workdir,
+                repo_root=workdir,
                 model=profile.model,
                 max_turns=profile.max_turns,
                 timeout_seconds=profile.timeout_seconds,
@@ -348,186 +428,216 @@ class AgentInvoker:
                     abort_after=self.config.repeat_guard.abort_after,
                     exempt_tools=list(self.config.repeat_guard.exempt_tools),
                 ),
+                prefix_group_key=prefix_group_key,
             )
             resolved: ResolvedAgentRunSpec = await runner.resolve(request)
 
-            # 3. One WRITE-LOCKED transaction: RUNNING check + run row +
-            #    resolved spec + dispatch intent. BEGIN IMMEDIATE serializes
-            #    the check-then-insert against other processes, and a partial
-            #    unique index on agent_runs(status='RUNNING') enforces the
-            #    max-1-agent invariant even if a racer slips through.
-            #    Durable COMMIT happens before the side effect (dispatch).
-            db = self.runs.db
-            with db.transaction(immediate=True):
-                stale = self.runs.running_runs()
-                if stale:
-                    raise ConcurrentRunError(
-                        f"agent run(s) {[r['id'] for r in stale]} still RUNNING; "
-                        "refusing to dispatch a second concurrent agent"
-                    )
-                try:
-                    run_id = self.runs.start_run(
-                        project_id,
-                        spec.role.value,
-                        attempt_id,
-                        provider=resolved.provider,
-                        model=resolved.model,
-                        profile_hash=resolved.profile_hash,
-                        profile_version=resolved.profile_version,
-                        context_manifest_path=resolved.context_manifest_path,
-                        context_manifest_hash=resolved.context_manifest_hash,
-                        resolved_spec=resolved.persistable_dump(),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # The partial unique index caught a concurrent RUNNING
-                    # row that slipped in from another process.
-                    raise ConcurrentRunError(
-                        f"another agent run became RUNNING concurrently: {exc}"
-                    )
-                dispatch_op_id = None
-                if self.operations:
-                    base_diff_hash = None
-                    if spec.mutates_repo and self.git is not None:
-                        try:
-                            base_diff_hash = self.git.dirty_state_hash()
-                        except Exception as exc:
-                            logger.warning("could not hash pre-dispatch state: %s", exc)
-                    dispatch_op_id = self.operations.record_intent(
-                        OperationType.AGENT_DISPATCH,
-                        {
-                            "role": spec.role.value,
-                            "provider": resolved.provider,
-                            "model": resolved.model,
-                            "technical_attempt": attempt,
-                            "run_id": run_id,
-                            # Recovery may only reset a diff whose hash it
-                            # has durably recorded.
-                            "base_diff_sha256": base_diff_hash,
-                        },
+            # Admission control: a dispatch waits for a free AgentRun slot
+            # instead of failing. Normal contention at the configured limit
+            # is backpressure, not an error — the DB checks inside stay as
+            # invariant guards for state that should now be unreachable.
+            async with self._admission_gate():
+                # 3. One WRITE-LOCKED transaction: concurrency checks + run row +
+                #    resolved spec + dispatch intent. Two invariants are checked:
+                #      - RUNNING AgentRun count <= configured max_parallel_agent_runs
+                #      - at most ONE RUNNING mutating agent per task attempt
+                #        (also DB-enforced by a partial unique index)
+                #    Durable COMMIT happens before the side effect (dispatch).
+                db = self.runs.db
+                with db.transaction(immediate=True):
+                    running = self.runs.running_runs()
+                    limit = self.config.parallelism.agent_run_limit()
+                    if len(running) >= limit:
+                        # Unreachable while admission control holds: this is
+                        # an invariant guard against state the harness did
+                        # not create (e.g. an externally modified database).
+                        raise ConcurrentRunError(
+                            f"{len(running)} agent runs already RUNNING (limit {limit}) "
+                            "despite holding an admission slot; refusing to dispatch"
+                        )
+                    if spec.mutates_repo and attempt_id is not None:
+                        conflicting = self.runs.running_mutating_for_attempt(attempt_id)
+                        if conflicting:
+                            raise ConcurrentRunError(
+                                f"mutating agent run(s) {[r['id'] for r in conflicting]} still "
+                                f"RUNNING for attempt {attempt_id}; one worktree, one writer"
+                            )
+                    try:
+                        run_id = self.runs.start_run(
+                            project_id,
+                            spec.role.value,
+                            attempt_id,
+                            provider=resolved.provider,
+                            model=resolved.model,
+                            profile_hash=resolved.profile_hash,
+                            profile_version=resolved.profile_version,
+                            context_manifest_path=resolved.context_manifest_path,
+                            context_manifest_hash=resolved.context_manifest_hash,
+                            resolved_spec=resolved.persistable_dump(),
+                            mutating=spec.mutates_repo,
+                            prefix_group_key=prefix_group_key,
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        # The partial unique index caught a concurrent mutating
+                        # RUNNING row for this attempt from another process.
+                        raise ConcurrentRunError(
+                            f"another mutating agent run became RUNNING concurrently: {exc}"
+                        )
+                    dispatch_op_id = None
+                    if self.operations:
+                        # The hash of the state recovery may reset to IS the
+                        # snapshot's hash: between technical attempts the
+                        # tree is restored to exactly that state. Re-reading
+                        # every changed file here would do the same work
+                        # again — inside the process-wide write lock.
+                        base_diff_hash = (
+                            pre_dispatch_snapshot.state_hash
+                            if pre_dispatch_snapshot is not None else None
+                        )
+                        dispatch_op_id = self.operations.record_intent(
+                            OperationType.AGENT_DISPATCH,
+                            {
+                                "role": spec.role.value,
+                                "provider": resolved.provider,
+                                "model": resolved.model,
+                                "technical_attempt": attempt,
+                                "run_id": run_id,
+                                # Recovery may only reset a diff whose hash it
+                                # has durably recorded.
+                                "base_diff_sha256": base_diff_hash,
+                            },
+                            project_id=project_id,
+                            task_id=task_id,
+                            attempt_id=attempt_id,
+                            agent_run_id=run_id,
+                        )
+                        db.execute(
+                            "UPDATE agent_runs SET dispatch_operation_id = ? WHERE id = ?",
+                            (dispatch_op_id, run_id),
+                        )
+                    self.events.emit(
+                        EventType.AGENT_STARTED,
                         project_id=project_id,
                         task_id=task_id,
                         attempt_id=attempt_id,
                         agent_run_id=run_id,
+                        operation_id=dispatch_op_id,
+                        payload={"role": spec.role.value, "run_id": run_id,
+                                 "technical_attempt": attempt},
                     )
-                    db.execute(
-                        "UPDATE agent_runs SET dispatch_operation_id = ? WHERE id = ?",
-                        (dispatch_op_id, run_id),
+
+                # 4. Side effect: the actual agent session.
+                result = await runner.run(resolved)
+
+                # A run that tripped the repeat-action guard is never adopted as
+                # a success: its output came from a session stuck in a loop.
+                if result.loop_detected and result.status == "COMPLETED":
+                    result.status = "FAILED"
+                    result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
+                # Per-run budget: the SDK offers no mid-run cost cutoff, so the
+                # cap is applied to the run's EFFECTIVE status before anything is
+                # recorded — run row, operation result and events then agree.
+                cap = self.config.budget.agent_run_usd
+                cap_exceeded = result.cost_usd > cap
+                if cap_exceeded and result.status == "COMPLETED":
+                    result.status = "FAILED"
+                    result.error = f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}"
+
+                # 5. Result — run row, operation result, billing and every event
+                #    land in ONE transaction, so a crash right after the provider
+                #    returned cannot leave a COMPLETED run with a dangling
+                #    PENDING dispatch or unrecorded cost.
+                with db.transaction():
+                    self.runs.finish_run(
+                        run_id,
+                        status=result.status,
+                        session_id=result.session_id,
+                        output_artifact=spec.output_artifact,
+                        token_usage=result.token_usage,
+                        cost_usd=result.cost_usd,
+                        error=result.error,
                     )
-                self.events.emit(
-                    EventType.AGENT_STARTED,
-                    project_id=project_id,
-                    task_id=task_id,
-                    attempt_id=attempt_id,
-                    agent_run_id=run_id,
-                    operation_id=dispatch_op_id,
-                    payload={"role": spec.role.value, "run_id": run_id,
-                             "technical_attempt": attempt},
-                )
-
-            # 4. Side effect: the actual agent session.
-            result = await runner.run(resolved)
-
-            # A run that tripped the repeat-action guard is never adopted as
-            # a success: its output came from a session stuck in a loop.
-            if result.loop_detected and result.status == "COMPLETED":
-                result.status = "FAILED"
-                result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
-            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
-            # cap is applied to the run's EFFECTIVE status before anything is
-            # recorded — run row, operation result and events then agree.
-            cap = self.config.budget.agent_run_usd
-            cap_exceeded = result.cost_usd > cap
-            if cap_exceeded and result.status == "COMPLETED":
-                result.status = "FAILED"
-                result.error = f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}"
-
-            # 5. Result — run row, operation result, billing and every event
-            #    land in ONE transaction, so a crash right after the provider
-            #    returned cannot leave a COMPLETED run with a dangling
-            #    PENDING dispatch or unrecorded cost.
-            with db.transaction():
-                self.runs.finish_run(
-                    run_id,
-                    status=result.status,
-                    session_id=result.session_id,
-                    output_artifact=spec.output_artifact,
-                    token_usage=result.token_usage,
-                    cost_usd=result.cost_usd,
-                    error=result.error,
-                )
-                if self.operations and dispatch_op_id:
-                    self.operations.record_result(
-                        dispatch_op_id,
-                        OperationStatus.COMPLETED
-                        if result.status == "COMPLETED"
-                        else OperationStatus.FAILED,
-                        {"status": result.status, "error": result.error,
-                         "cost_usd": result.cost_usd},
-                    )
-                self.budget.record_cost(project_id, task_id, result.cost_usd)
-                for warning in result.loop_warnings:
+                    if self.operations and dispatch_op_id:
+                        self.operations.record_result(
+                            dispatch_op_id,
+                            OperationStatus.COMPLETED
+                            if result.status == "COMPLETED"
+                            else OperationStatus.FAILED,
+                            {"status": result.status, "error": result.error,
+                             "cost_usd": result.cost_usd},
+                        )
+                    self.budget.record_cost(project_id, task_id, result.cost_usd)
+                    for warning in result.loop_warnings:
+                        self.events.emit(
+                            EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                        )
+                    if result.loop_detected:
+                        # The guard only flags; the Orchestrator owns the
+                        # transition: the run fails the attempt (reasoning-retry
+                        # path — fresh session, possibly diagnosis), never a
+                        # provider retry of the same context.
+                        self.events.emit(
+                            EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id,
+                            payload={"role": spec.role.value, "run_id": run_id},
+                        )
+                    if result.telemetry:
+                        self.events.emit(
+                            EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                        )
                     self.events.emit(
-                        EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                        EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
+                        project_id=project_id,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        agent_run_id=run_id,
+                        payload={
+                            "role": spec.role.value,
+                            "run_id": run_id,
+                            "cost_usd": result.cost_usd,
+                            "turns": result.num_turns,
+                            "error": result.error,
+                            "failure_kind": result.failure_kind.value if result.failure_kind else None,
+                        },
                     )
+                # An over-budget run fails the attempt (normal retry/diagnosis
+                # path) instead of being retried — failed runs included, so a
+                # high-cost failure is never blindly redispatched. Only the raise
+                # lives outside the transaction; the state was recorded above.
+                if cap_exceeded:
+                    raise AgentRunFailed(
+                        spec.role.value,
+                        f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
+                    )
+                if result.status == "COMPLETED":
+                    return result, run_id
                 if result.loop_detected:
-                    # The guard only flags; the Orchestrator owns the
-                    # transition: the run fails the attempt (reasoning-retry
-                    # path — fresh session, possibly diagnosis), never a
-                    # provider retry of the same context.
-                    self.events.emit(
-                        EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id,
-                        payload={"role": spec.role.value, "run_id": run_id},
+                    raise AgentRunFailed(
+                        spec.role.value,
+                        "loop detected (repeated identical tool call) — aborting for a fresh attempt",
                     )
-                if result.telemetry:
-                    self.events.emit(
-                        EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                # Permanent failures (auth, config, missing model) fail
+                # identically on retry — surface immediately instead.
+                if result.failure_kind == FailureKind.PERMANENT:
+                    raise AgentRunFailed(
+                        spec.role.value, f"permanent provider failure: {result.error}"
                     )
-                self.events.emit(
-                    EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
-                    project_id=project_id,
-                    task_id=task_id,
-                    attempt_id=attempt_id,
-                    agent_run_id=run_id,
-                    payload={
-                        "role": spec.role.value,
-                        "run_id": run_id,
-                        "cost_usd": result.cost_usd,
-                        "turns": result.num_turns,
-                        "error": result.error,
-                        "failure_kind": result.failure_kind.value if result.failure_kind else None,
-                    },
-                )
-            # An over-budget run fails the attempt (normal retry/diagnosis
-            # path) instead of being retried — failed runs included, so a
-            # high-cost failure is never blindly redispatched. Only the raise
-            # lives outside the transaction; the state was recorded above.
-            if cap_exceeded:
-                raise AgentRunFailed(
-                    spec.role.value,
-                    f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
-                )
-            if result.status == "COMPLETED":
-                return result, run_id
-            if result.loop_detected:
-                raise AgentRunFailed(
-                    spec.role.value,
-                    "loop detected (repeated identical tool call) — aborting for a fresh attempt",
-                )
-            # Permanent failures (auth, config, missing model) fail
-            # identically on retry — surface immediately instead.
-            if result.failure_kind == FailureKind.PERMANENT:
-                raise AgentRunFailed(
-                    spec.role.value, f"permanent provider failure: {result.error}"
-                )
             if attempt < TECHNICAL_RETRIES:
                 # A mutating role may have half-edited the tree before the
                 # transient failure; redispatching on top of that would run
                 # the same assignment against an unknown base. Archive the
                 # partial diff and restore the session-start state first.
-                self._restore_worktree_for_retry(spec, run_id, pre_dispatch_snapshot)
+                # Restore is real file I/O (archive partial diff + rewrite
+                # tree bytes) and must finish even if this coroutine is
+                # cancelled mid-retry — a half-restored tree would be
+                # archived as if it were the agent's work.
+                await run_thread_uninterruptible(
+                    self._restore_worktree_for_retry,
+                    spec, run_id, pre_dispatch_snapshot, git,
+                    label=f"worktree restore for {spec.role.value} run {run_id}",
+                )
                 logger.warning(
                     "%s failed technically (%s); retrying in %.0fs", spec.role, result.error, delay
                 )
@@ -536,33 +646,38 @@ class AgentInvoker:
         return result, run_id
 
     def _restore_worktree_for_retry(
-        self, spec: RoleSpec, run_id: Optional[int], snapshot: Optional[WorktreeSnapshot]
+        self,
+        spec: RoleSpec,
+        run_id: Optional[int],
+        snapshot: Optional[WorktreeSnapshot],
+        git: Optional[GitRepository] = None,
     ) -> None:
         """Bring the worktree back to its session-start state (snapshot),
         which may legitimately be dirty — e.g. the Tester runs on top of the
         Developer's uncommitted implementation. Byte-exact both ways: the
         partial work is archived (patch + real-file tar) and the start state
         restored from real-file bytes, immune to git clean filters."""
-        if not spec.mutates_repo or self.git is None:
+        git = git or self.git
+        if not spec.mutates_repo or git is None:
             return
         try:
-            if self.git.head_commit() is None:
+            if git.head_commit() is None:
                 return
             if snapshot is None:
                 raise RuntimeError("no pre-dispatch worktree snapshot available")
-            if self.git.dirty_state_hash() != snapshot.state_hash:
+            if git.dirty_state_hash() != snapshot.state_hash:
                 archive_path = (
                     self.artifacts.root / "diagnostics"
                     / f"{spec.role.value}-run{run_id}-transient-retry.diff"
                 )
-                diff = self.git.snapshot_dirty_bytes()
+                diff = git.snapshot_dirty_bytes()
                 if diff.strip():
                     self.artifacts.save_bytes(archive_path, diff)
                 self.artifacts.archive_worktree_files(
-                    archive_path.with_suffix(".files.tar"), self.git.path,
-                    self.git.changed_paths(),
+                    archive_path.with_suffix(".files.tar"), git.path,
+                    git.changed_paths(),
                 )
-            self.git.restore_worktree_state(snapshot)
+            git.restore_worktree_state(snapshot)
         except Exception as exc:
             # Without a known base state a blind redispatch is worse than
             # failing the attempt — surface instead of retrying.

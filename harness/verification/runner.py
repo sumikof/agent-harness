@@ -8,12 +8,12 @@ checks process exit codes itself. Success == every exit code 0.
 from __future__ import annotations
 
 import hashlib
-import subprocess
 import time
 from pathlib import Path
 
 from ..artifacts.schemas import VerificationResult, VerificationStep
 from ..config import VerificationConfig
+from ..process import run_command
 from . import java, node, python
 
 TAIL_CHARS = 4000
@@ -61,20 +61,11 @@ class VerificationRunner:
     def _run_command(self, command: str, log_name: str) -> VerificationStep:
         log_file = self.logs_dir / f"{log_name}.log"
         started = time.monotonic()
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(self.repo_path),
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds,
-            )
-            exit_code = result.returncode
-            output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        except subprocess.TimeoutExpired as exc:
-            exit_code = -1
-            output = f"TIMEOUT after {self.config.timeout_seconds}s\n{exc.stdout or ''}\n{exc.stderr or ''}"
+        # Own process group, killed as a group on timeout: build/test workers
+        # must not outlive the step and keep writing into the worktree.
+        result = run_command(command, self.repo_path, self.config.timeout_seconds)
+        exit_code = result.exit_code
+        output = result.output
         duration = time.monotonic() - started
         # Full output is always retained on disk; only a bounded tail (plus
         # hash + size for integrity/locating) travels into agent context.

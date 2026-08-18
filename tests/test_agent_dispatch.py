@@ -62,7 +62,7 @@ def ok_result(payload: dict | None = None) -> AgentResult:
 
 
 def install(monkeypatch, runner):
-    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider: runner)
+    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda *_a, **_k: runner)
     monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
 
 
@@ -193,7 +193,9 @@ async def test_permanent_failure_is_never_provider_retried(config, monkeypatch):
     assert len(runner.specs) == 1  # exactly one call, no blind retry
 
 
-async def test_second_concurrent_running_agent_is_refused(config, monkeypatch):
+async def test_agent_run_limit_is_enforced(config, monkeypatch):
+    """RUNNING AgentRun count may never exceed max_parallel_agent_runs."""
+    config.parallelism.max_parallel_agent_runs = 1
     orchestrator = ProjectOrchestrator(config)
     project = orchestrator.ensure_project()
     # a stale RUNNING run (as if another dispatch were in flight)
@@ -206,9 +208,24 @@ async def test_second_concurrent_running_agent_is_refused(config, monkeypatch):
     assert runner.specs == []
 
 
-async def test_running_agent_in_another_project_also_blocks_dispatch(config, monkeypatch):
-    """The max-1-agent guarantee is workspace-wide: a RUNNING run belonging
-    to ANOTHER project in the same DB must also refuse the dispatch."""
+async def test_dispatch_allowed_below_agent_run_limit(config, monkeypatch):
+    """Parallel dispatch is legal now: an existing RUNNING run does not
+    block another one while the configured limit has headroom."""
+    config.parallelism.max_parallel_agent_runs = 4
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    orchestrator.runs.start_run(project["id"], "developer")
+    runner = ScriptedRunner([ok_result()])
+    install(monkeypatch, runner)
+
+    await invoke_planner(orchestrator)
+    assert len(runner.specs) == 1
+
+
+async def test_running_agent_in_another_project_counts_toward_limit(config, monkeypatch):
+    """The limit is workspace-wide: a RUNNING run belonging to ANOTHER
+    project in the same DB consumes a slot too."""
+    config.parallelism.max_parallel_agent_runs = 1
     orchestrator = ProjectOrchestrator(config)
     orchestrator.ensure_project()
     other_pid = orchestrator.projects.create("other-project", "/elsewhere", "main", "g", 10.0)
@@ -446,22 +463,38 @@ async def test_complete_task_refuses_without_recorded_evidence(config):
     project = orchestrator.ensure_project()
     pid = project["id"]
     tid = orchestrator.tasks.create(pid, "T001", "task")
-    aid = orchestrator.tasks.start_attempt(tid, orchestrator.git.head_commit())
-    task_row = orchestrator.tasks.get(tid)
+    env = orchestrator.task_runner._create_env("T001", 1)
+    try:
+        aid = orchestrator.tasks.start_attempt(
+            tid, env.git.head_commit(),
+            worktree_path=str(env.handle.path), branch=env.handle.branch,
+        )
+        task_row = orchestrator.tasks.get(tid)
+        (env.handle.path / "change.txt").write_text("x\n")
 
-    with pytest.raises(RuntimeError, match="verification PASS"):
-        orchestrator.task_runner._complete_task(pid, tid, "T001", aid, task_row)
+        with pytest.raises(RuntimeError, match="verification PASS"):
+            await orchestrator.task_runner._complete_and_integrate(
+                pid, tid, "T001", aid, task_row, env, None)
 
-    orchestrator.runs.record_evaluation(aid, "VERIFY_PASS", {"passed": True})
-    with pytest.raises(RuntimeError, match="Reviewer PASS"):
-        orchestrator.task_runner._complete_task(pid, tid, "T001", aid, task_row)
+        orchestrator.runs.record_evaluation(aid, "VERIFY_PASS", {"passed": True})
+        with pytest.raises(RuntimeError, match="Reviewer PASS"):
+            await orchestrator.task_runner._complete_and_integrate(
+                pid, tid, "T001", aid, task_row, env, None)
 
-    orchestrator.runs.record_evaluation(aid, "PASS", {"verdict": "PASS"})
-    outcome = orchestrator.task_runner._complete_task(pid, tid, "T001", aid, task_row)
-    assert outcome.value == "COMPLETED"
-    # the GIT_COMMIT operation result was settled in the same transaction
-    # as the task-completion updates — nothing is left PENDING
-    assert orchestrator.operations.unfinished() == []
+        orchestrator.runs.record_evaluation(aid, "PASS", {"verdict": "PASS"})
+        outcome, feedback = await orchestrator.task_runner._complete_and_integrate(
+            pid, tid, "T001", aid, task_row, env, None)
+        assert outcome is not None and outcome.value == "COMPLETED"
+        assert feedback is None
+        # the GIT_COMMIT + GIT_INTEGRATION operation results were settled in
+        # the same transaction as the task updates — nothing is left PENDING
+        assert orchestrator.operations.unfinished() == []
+        task = orchestrator.tasks.get(tid)
+        assert task["task_commit"] and task["integration_commit"]
+        # the change actually reached the integration branch
+        assert (orchestrator.git.path / "change.txt").exists()
+    finally:
+        orchestrator.worktrees.remove_path(env.handle.path)
 
 
 async def test_loop_detected_run_is_never_adopted(config, monkeypatch):

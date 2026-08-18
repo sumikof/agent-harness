@@ -53,7 +53,58 @@ def cmd_init(config: HarnessConfig) -> int:
     return 0
 
 
+LOCAL_PROVIDER_TYPES = {"openai-compatible", "openai_compatible", "vllm"}
+
+
+def local_role_models(config: HarnessConfig) -> list[str]:
+    """Every model a LOCAL-provider role will actually dispatch.
+
+    The invoker resolves each role through `provider.for_role`, so the
+    health gate validates exactly those models (there is no separate
+    inference-side model setting to drift from them).
+    """
+    from .orchestrator.state_machine import Role
+
+    models: list[str] = []
+    for role in Role:
+        provider_type, model = config.provider.for_role(role.value)
+        if provider_type in LOCAL_PROVIDER_TYPES and model not in models:
+            models.append(model)
+    return models
+
+
+def _uses_local_inference(config: HarnessConfig) -> bool:
+    return bool(local_role_models(config))
+
+
+def cmd_health(config: HarnessConfig) -> int:
+    """Verify the local inference endpoint (liveness, model, completion,
+    tool calling, structured output, prefix cache) before any task runs."""
+    from .agents.health import verify_endpoint
+
+    models = local_role_models(config) or [config.provider.model]
+    report = asyncio.run(verify_endpoint(config.inference, models))
+    print(f"endpoint          : {config.inference.base_url}")
+    print(f"models available  : {report.models_checked or report.model_available}")
+    print(f"completion        : {report.completion_ok} (usage={report.usage_reported})")
+    print(f"tool calling      : {report.tool_calling_ok}")
+    print(f"structured output : {report.structured_output_ok}")
+    print(f"reasoning content : {report.reasoning_content_seen}")
+    print(f"prefix cache      : {'verified' if report.prefix_cache_verified else report.prefix_cache_note or 'unverified'}")
+    for error in report.errors:
+        print(f"ERROR: {error}")
+    return 0 if report.ok else 1
+
+
 def cmd_run(config: HarnessConfig) -> int:
+    # A misconfigured/absent inference server must not start long-running
+    # tasks: the endpoint is verified (real smoke tests, not just a ping)
+    # before the orchestrator touches any state.
+    if _uses_local_inference(config):
+        if cmd_health(config) != 0:
+            print("refusing to start: inference endpoint failed verification "
+                  "(see deploy/inference/healthcheck.sh)")
+            return 1
     try:
         orchestrator = ProjectOrchestrator(config)
         final_state = asyncio.run(orchestrator.run())
@@ -117,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="prepare the workspace")
     sub.add_parser("run", help="run or resume the project loop")
+    sub.add_parser("health", help="verify the local inference endpoint")
     sub.add_parser("status", help="show project and task state")
     events_parser = sub.add_parser("events", help="show recent events")
     events_parser.add_argument("--limit", type=int, default=50)
@@ -133,6 +185,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(config)
     if args.command == "run":
         return cmd_run(config)
+    if args.command == "health":
+        return cmd_health(config)
     if args.command == "status":
         return cmd_status(config)
     if args.command == "events":

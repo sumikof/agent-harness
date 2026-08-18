@@ -31,6 +31,8 @@ class TaskState(StrEnum):
     TESTING = "TESTING"
     VERIFYING = "VERIFYING"
     REVIEWING = "REVIEWING"
+    INTEGRATING = "INTEGRATING"
+    INTEGRATION_CONFLICT = "INTEGRATION_CONFLICT"
     COMPLETED = "COMPLETED"
     REPAIR_REQUIRED = "REPAIR_REQUIRED"
     FAILED = "FAILED"
@@ -95,7 +97,11 @@ TASK_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.EXECUTING: {TaskState.TESTING, TaskState.FAILED, TaskState.BLOCKED},
     TaskState.TESTING: {TaskState.VERIFYING, TaskState.FAILED, TaskState.BLOCKED},
     TaskState.VERIFYING: {TaskState.REVIEWING, TaskState.REPAIR_REQUIRED, TaskState.FAILED},
-    TaskState.REVIEWING: {TaskState.COMPLETED, TaskState.REPAIR_REQUIRED, TaskState.FAILED, TaskState.BLOCKED},
+    TaskState.REVIEWING: {TaskState.INTEGRATING, TaskState.COMPLETED, TaskState.REPAIR_REQUIRED, TaskState.FAILED, TaskState.BLOCKED},
+    # Serialized integration of the reviewed task branch. Conflicts are a
+    # normal outcome: they route to a fresh repair attempt on the new base.
+    TaskState.INTEGRATING: {TaskState.COMPLETED, TaskState.INTEGRATION_CONFLICT, TaskState.FAILED, TaskState.BLOCKED},
+    TaskState.INTEGRATION_CONFLICT: {TaskState.EXECUTING, TaskState.READY, TaskState.BLOCKED},
     TaskState.REPAIR_REQUIRED: {TaskState.EXECUTING, TaskState.FAILED, TaskState.DIAGNOSING},
     TaskState.FAILED: {TaskState.DIAGNOSING, TaskState.BLOCKED, TaskState.READY},
     TaskState.DIAGNOSING: {TaskState.READY, TaskState.BLOCKED, TaskState.PENDING},

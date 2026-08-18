@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Optional
+
+from .prefix import canonical_json
 
 
 @dataclass
@@ -35,11 +36,11 @@ class TaskContext:
             lines.extend(f"- {f}" for f in self.relevant_files)
         if include_brief and self.task_brief:
             lines.append("\n### Task Brief (from Task Analyst)")
-            lines.append(json.dumps(self.task_brief, indent=2, ensure_ascii=False))
+            lines.append(canonical_json(self.task_brief, indent=2))
         if self.implementation:
             lines.append("\n### Implementation summary (from Developer)")
-            lines.append(json.dumps(self.implementation, indent=2, ensure_ascii=False))
+            lines.append(canonical_json(self.implementation, indent=2))
         if self.test_report:
             lines.append("\n### Test report (from Test Engineer)")
-            lines.append(json.dumps(self.test_report, indent=2, ensure_ascii=False))
+            lines.append(canonical_json(self.test_report, indent=2))
         return "\n".join(lines)

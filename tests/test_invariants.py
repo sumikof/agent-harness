@@ -91,25 +91,47 @@ def test_completed_commit_must_resolve_in_git(world):
     assert "COMPLETED_COMMIT_UNRESOLVABLE" in codes(violations, Severity.ERROR)
 
 
-def test_at_most_one_running_agent_run(world):
-    world.runs.start_run(world.pid, "developer")
-    # one RUNNING run alone trips only provenance checks, not concurrency
+def test_running_agent_runs_within_limit_allowed(world):
+    """Parallel RUNNING runs are legal up to the configured limit."""
+    for _ in range(3):
+        world.runs.start_run(world.pid, "developer")
+    world.checker.max_parallel_agent_runs = 4
     assert "CONCURRENT_AGENT_RUNS" not in codes(world.checker.check_all(world.pid))
-    # the DB-level unique index makes a second RUNNING row impossible via
-    # normal writes — the checker guards the case where that constraint is
-    # absent (externally modified / legacy database), so simulate it
-    world.db.execute("DROP INDEX idx_agent_runs_single_running")
-    world.runs.start_run(world.pid, "reviewer")
+
+
+def test_running_agent_runs_over_limit_flagged(world):
+    world.checker.max_parallel_agent_runs = 2
+    for _ in range(3):
+        world.runs.start_run(world.pid, "developer")
     violations = world.checker.check_all(world.pid)
     assert "CONCURRENT_AGENT_RUNS" in codes(violations, Severity.ERROR)
 
 
-def test_second_running_run_rejected_by_db_constraint(world):
+def test_second_mutating_run_per_attempt_rejected_by_db_constraint(world):
+    """One worktree, one writer: the partial unique index refuses a second
+    RUNNING mutating run for the same attempt. Non-mutating runs (reviewer)
+    and mutating runs on OTHER attempts stay legal."""
     import sqlite3
 
-    world.runs.start_run(world.pid, "developer")
+    tid = world.tasks.create(world.pid, "T001", "t")
+    aid = world.tasks.start_attempt(tid, None)
+    world.runs.start_run(world.pid, "developer", aid, mutating=True)
+    world.runs.start_run(world.pid, "reviewer", aid, mutating=False)  # legal
+    tid2 = world.tasks.create(world.pid, "T002", "t2")
+    aid2 = world.tasks.start_attempt(tid2, None)
+    world.runs.start_run(world.pid, "developer", aid2, mutating=True)  # legal
     with pytest.raises(sqlite3.IntegrityError):
-        world.runs.start_run(world.pid, "reviewer")
+        world.runs.start_run(world.pid, "tester", aid, mutating=True)
+
+
+def test_concurrent_mutating_runs_per_attempt_flagged(world):
+    tid = world.tasks.create(world.pid, "T001", "t")
+    aid = world.tasks.start_attempt(tid, None)
+    world.runs.start_run(world.pid, "developer", aid, mutating=True)
+    world.db.execute("DROP INDEX idx_agent_runs_single_mutating_per_attempt")
+    world.runs.start_run(world.pid, "tester", aid, mutating=True)
+    violations = world.checker.check_all(world.pid)
+    assert "CONCURRENT_MUTATING_RUNS_PER_ATTEMPT" in codes(violations, Severity.ERROR)
 
 
 def test_running_run_requires_manifest_spec_and_intent(world):

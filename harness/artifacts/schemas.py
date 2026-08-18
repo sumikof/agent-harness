@@ -8,7 +8,13 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+# task_key flows into worktree directories, branch names and artifact
+# paths. Security must not depend on the prompt: a key like "../../x" is
+# rejected here, at ingestion, before it can reach the filesystem.
+TASK_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
 
 
 class PlannedTask(BaseModel):
@@ -17,6 +23,20 @@ class PlannedTask(BaseModel):
     goal: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list, description="task_keys this task depends on")
+
+    @field_validator("task_key", "dependencies")
+    @classmethod
+    def _safe_task_keys(cls, value):
+        import re
+
+        keys = value if isinstance(value, list) else [value]
+        for key in keys:
+            if not isinstance(key, str) or not re.match(TASK_KEY_PATTERN, key):
+                raise ValueError(
+                    f"task_key {key!r} is not a safe identifier "
+                    f"(must match {TASK_KEY_PATTERN})"
+                )
+        return value
 
 
 class ProjectPlan(BaseModel):

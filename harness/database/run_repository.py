@@ -32,14 +32,17 @@ class RunRepository:
         context_manifest_hash: str | None = None,
         resolved_spec: dict | None = None,
         dispatch_operation_id: str | None = None,
+        mutating: bool = False,
+        prefix_group_key: str | None = None,
     ) -> int:
         cur = self.db.execute(
             """
             INSERT INTO agent_runs (attempt_id, project_id, role, status, input_artifact,
                                     started_at, provider, model, profile_hash, profile_version,
                                     context_manifest_path, context_manifest_hash,
-                                    resolved_spec, dispatch_operation_id)
-            VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    resolved_spec, dispatch_operation_id,
+                                    mutating, prefix_group_key)
+            VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 attempt_id,
@@ -55,6 +58,8 @@ class RunRepository:
                 context_manifest_hash,
                 json.dumps(resolved_spec, ensure_ascii=False) if resolved_spec else None,
                 dispatch_operation_id,
+                1 if mutating else 0,
+                prefix_group_key,
             ),
         )
         return cur.lastrowid
@@ -99,13 +104,20 @@ class RunRepository:
             (project_id,),
         )
 
+    def running_mutating_for_attempt(self, attempt_id: int) -> list[sqlite3.Row]:
+        return self.db.query_all(
+            "SELECT * FROM agent_runs WHERE status = 'RUNNING' AND mutating = 1 "
+            "AND attempt_id = ?",
+            (attempt_id,),
+        )
+
     def interrupt_running(self, project_id: int | None = None) -> list[int]:
         """Close RUNNING run rows left behind by a crash. Returns their ids.
 
         Recovery passes None: the workspace lock guarantees no other live
         process, so ANY remaining RUNNING row — regardless of project — is a
-        crash leftover, and leaving it would block the workspace-wide
-        max-1-agent slot for every project sharing the DB.
+        crash leftover, and leaving it would consume slots of the bounded
+        parallel-agent-run budget for every project sharing the DB.
         """
         rows = self.running_runs(project_id)
         for row in rows:

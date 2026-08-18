@@ -76,6 +76,14 @@ class TaskRepository:
 
     def next_runnable(self, project_id: int) -> sqlite3.Row | None:
         """Next PENDING/READY task (by sequence) whose dependencies are all COMPLETED."""
+        runnable = self.runnable_tasks(project_id)
+        return runnable[0] if runnable else None
+
+    def runnable_tasks(self, project_id: int) -> list[sqlite3.Row]:
+        """ALL PENDING/READY tasks whose dependencies are satisfied, by
+        sequence. The parallel scheduler may dispatch several of them
+        concurrently; dependency management stays in the harness — never
+        in an LLM."""
         candidates = self.db.query_all(
             """
             SELECT * FROM tasks
@@ -91,11 +99,11 @@ class TaskRepository:
                 (project_id,),
             )
         }
-        for task in candidates:
-            deps = json.loads(task["dependencies"] or "[]")
-            if all(dep in completed for dep in deps):
-                return task
-        return None
+        return [
+            task
+            for task in candidates
+            if all(dep in completed for dep in json.loads(task["dependencies"] or "[]"))
+        ]
 
     def has_unfinished(self, project_id: int) -> bool:
         row = self.db.query_one(
@@ -125,6 +133,39 @@ class TaskRepository:
                     task_id=task_id,
                     payload={"from": row["status"], "to": status.value, "forced": force},
                 )
+
+    def rewire_dependencies(
+        self, project_id: int, old_key: str, new_keys: list[str]
+    ) -> list[str]:
+        """Repoint unfinished tasks that depend on `old_key` at `new_keys`.
+
+        Used when a task is SPLIT: the original becomes SKIPPED, and SKIPPED
+        satisfies dependencies (a dropped task must not deadlock its
+        dependents). Without rewiring, a dependent would enter the runnable
+        frontier ALONGSIDE the replacements — under a parallel scheduler it
+        could then start before the work it depends on has been integrated.
+        Returns the task keys whose dependencies were changed.
+        """
+        changed: list[str] = []
+        terminal = ("COMPLETED", "SKIPPED")
+        for row in self.list_for_project(project_id):
+            if row["status"] in terminal or row["task_key"] in new_keys:
+                continue
+            deps = json.loads(row["dependencies"] or "[]")
+            if old_key not in deps:
+                continue
+            rewired: list[str] = []
+            for dep in deps:
+                if dep != old_key:
+                    rewired.append(dep)
+                    continue
+                rewired.extend(key for key in new_keys if key not in rewired)
+            self.db.execute(
+                "UPDATE tasks SET dependencies = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(rewired, ensure_ascii=False), utcnow(), row["id"]),
+            )
+            changed.append(row["task_key"])
+        return changed
 
     def update_definition(
         self,
@@ -157,6 +198,22 @@ class TaskRepository:
             (commit_hash, utcnow(), task_id),
         )
 
+    def set_task_commit(self, task_id: int, commit_hash: str) -> None:
+        """The commit created on the task branch after Reviewer PASS."""
+        self.db.execute(
+            "UPDATE tasks SET task_commit = ?, updated_at = ? WHERE id = ?",
+            (commit_hash, utcnow(), task_id),
+        )
+
+    def set_integration_commit(self, task_id: int, commit_hash: str) -> None:
+        """The commit on the integration branch after serialized merge —
+        the official project checkpoint (current_commit tracks it too)."""
+        self.db.execute(
+            "UPDATE tasks SET integration_commit = ?, current_commit = ?, "
+            "updated_at = ? WHERE id = ?",
+            (commit_hash, commit_hash, utcnow(), task_id),
+        )
+
     def add_spent(self, task_id: int, cost_usd: float) -> float:
         self.db.execute(
             "UPDATE tasks SET spent_usd = spent_usd + ?, updated_at = ? WHERE id = ?",
@@ -166,19 +223,27 @@ class TaskRepository:
 
     # -- attempts ----------------------------------------------------------
 
-    def start_attempt(self, task_id: int, base_commit: str | None) -> int:
+    def start_attempt(
+        self,
+        task_id: int,
+        base_commit: str | None,
+        worktree_path: str | None = None,
+        branch: str | None = None,
+    ) -> int:
         task_row = self.get(task_id)
-        row = self.db.query_one(
-            "SELECT MAX(attempt_no) AS max_no FROM task_attempts WHERE task_id = ?", (task_id,)
-        )
-        attempt_no = (row["max_no"] or 0) + 1
         with self.db.transaction():
+            row = self.db.query_one(
+                "SELECT MAX(attempt_no) AS max_no FROM task_attempts WHERE task_id = ?", (task_id,)
+            )
+            attempt_no = (row["max_no"] or 0) + 1
             cur = self.db.execute(
                 """
-                INSERT INTO task_attempts (task_id, attempt_no, status, base_commit, started_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO task_attempts (task_id, attempt_no, status, base_commit,
+                                           worktree_path, branch, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, attempt_no, AttemptState.RUNNING.value, base_commit, utcnow()),
+                (task_id, attempt_no, AttemptState.RUNNING.value, base_commit,
+                 worktree_path, branch, utcnow()),
             )
             attempt_id = cur.lastrowid
             self.db.execute(
@@ -191,9 +256,18 @@ class TaskRepository:
                     project_id=task_row["project_id"] if task_row else None,
                     task_id=task_id,
                     attempt_id=attempt_id,
-                    payload={"attempt_no": attempt_no, "base_commit": base_commit},
+                    payload={"attempt_no": attempt_no, "base_commit": base_commit,
+                             "worktree_path": worktree_path, "branch": branch},
                 )
         return attempt_id
+
+    def set_attempt_worktree(
+        self, attempt_id: int, worktree_path: str | None, branch: str | None
+    ) -> None:
+        self.db.execute(
+            "UPDATE task_attempts SET worktree_path = ?, branch = ? WHERE id = ?",
+            (worktree_path, branch, attempt_id),
+        )
 
     def finish_attempt(self, attempt_id: int, status: AttemptState) -> None:
         attempt = self.get_attempt(attempt_id)

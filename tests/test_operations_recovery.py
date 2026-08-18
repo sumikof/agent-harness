@@ -113,8 +113,11 @@ def test_reconcile_commit_done_but_db_not_updated(world):
     assert acted
     assert commit_count(world.git) == before          # no double commit
     task = world.tasks.get(tid)
-    assert task["status"] == "COMPLETED"
-    assert task["current_commit"] == commit
+    # A task-branch commit is NOT completion under the integration model:
+    # the attempt and commit are settled, and the task requeues for a fresh
+    # cycle (completion only ever comes from a serialized integration merge).
+    assert task["task_commit"] == commit
+    assert task["status"] == "READY"
     assert world.tasks.get_attempt(aid)["status"] == "PASSED"
     op = world.operations.get(op_id)
     assert op["status"] == OperationStatus.RECONCILED.value
@@ -185,13 +188,14 @@ def test_reconciliation_is_atomic(world, monkeypatch):
 
     # everything rolled back together — nothing half-applied
     assert world.tasks.get(tid)["status"] == "REVIEWING"
-    assert world.tasks.get(tid)["current_commit"] is None
+    assert world.tasks.get(tid)["task_commit"] is None
     assert world.tasks.get_attempt(aid)["status"] == "RUNNING"
     assert world.operations.get(op_id)["status"] == "PENDING"
 
     monkeypatch.undo()
     world.recovery.recover(world.projects.get(world.pid))  # next startup succeeds
-    assert world.tasks.get(tid)["status"] == "COMPLETED"
+    assert world.tasks.get(tid)["task_commit"] is not None
+    assert world.tasks.get(tid)["status"] == "READY"   # requeued for a fresh cycle
     assert world.operations.get(op_id)["status"] == "RECONCILED"
 
 
