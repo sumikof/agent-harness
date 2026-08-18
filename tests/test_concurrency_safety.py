@@ -1013,3 +1013,41 @@ def test_diagnostician_reads_a_snapshot_not_the_moving_integration_branch(config
     finally:
         orchestrator.worktrees.remove(snapshot)
     assert not snapshot.path.exists()
+
+
+def test_stale_snapshot_is_reclaimed_not_silently_bypassed(config):
+    """A leftover snapshot from a crashed diagnosis must be reclaimed. Failing
+    would fall back to reading the moving integration branch — losing exactly
+    the isolation the snapshot provides."""
+    from harness.git.repository import GitRepository
+
+    orchestrator = ProjectOrchestrator(config)
+    orchestrator.ensure_project()
+    head = orchestrator.git.head_commit()
+
+    first = orchestrator.worktrees.create_snapshot("T001-diagnosis1", head)
+    assert first.path.is_dir()
+    # crash: the snapshot is never disposed, and the same label comes round again
+    second = orchestrator.worktrees.create_snapshot("T001-diagnosis1", head)
+    assert second.path.is_dir()
+    assert second.repo.current_branch() == "DETACHED"
+    assert second.repo.head_commit() == head
+    orchestrator.worktrees.remove(second)
+
+    # a foreign checkout under our root is refused, never clobbered
+    foreign = config.worktrees_path / "T001-diagnosis1"
+    orchestrator.git.add_worktree(foreign, "someones-branch", head)
+    with pytest.raises(Exception, match="refusing to reuse"):
+        orchestrator.worktrees.create_snapshot("T001-diagnosis1", head)
+    assert GitRepository(foreign).current_branch() == "someones-branch"
+
+
+def test_deployment_artifacts_are_not_committable():
+    """start.sh generates a launch script and the benchmark accumulates raw
+    measurements; neither belongs in the repository (the FROZEN tuning
+    profile does)."""
+    ignored = (REPO_ROOT / ".gitignore").read_text()
+    assert "deploy/inference/.generated/" in ignored
+    assert "config/benchmark-results.json" in ignored
+    assert ".env" in ignored                       # operator's HF token
+    assert "inference-tuning.json" not in ignored  # the frozen profile is source

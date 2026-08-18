@@ -84,7 +84,18 @@ class WorktreeManager:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / label
         if path.exists():
-            raise GitError(f"snapshot worktree path {path} already exists")
+            # A leftover from a crashed diagnosis. It is ours by construction
+            # (under our root, detached), so reclaim it rather than fail —
+            # failing would fall back to reading the moving integration
+            # branch, losing the isolation this exists to provide.
+            existing = GitRepository(path)
+            checked_out = existing.current_branch() if existing.is_repo() else None
+            if checked_out not in (None, "DETACHED"):
+                raise GitError(
+                    f"refusing to reuse {path}: '{checked_out}' is checked out there"
+                )
+            logger.warning("reclaiming stale snapshot worktree %s", path)
+            self.remove_path(path)
         self.main.add_detached_worktree(path, commit)
         return WorktreeHandle(
             task_key=label, cycle=0, path=path, branch=None,
