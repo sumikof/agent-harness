@@ -32,6 +32,10 @@ from .openai_compat import auth_headers, stream_chat_completion
 
 logger = logging.getLogger(__name__)
 
+# Stand-in recorded when a streamed response carried reasoning deltas. The
+# reasoning text itself is never kept — only the fact that the parser fired.
+REASONING_SEEN_MARKER = "<reasoning emitted>"
+
 _TOOL_SMOKE_SCHEMA = [{
     "type": "function",
     "function": {
@@ -215,6 +219,11 @@ async def verify_endpoint(
                 if message is None:
                     raise InferenceHealthError(f"HTTP {status}: {body}")
                 usage = message.pop("_usage", None) or {}
+                if message.pop("_reasoning_seen", False):
+                    # A flag, not the text: enough for the probe to see that
+                    # the reasoning parser is active without the harness ever
+                    # holding hidden reasoning.
+                    message["reasoning_content"] = REASONING_SEEN_MARKER
                 return {"choices": [{"message": message}], "usage": usage}
             response = await client.post(f"{base}/chat/completions", json=payload)
             response.raise_for_status()

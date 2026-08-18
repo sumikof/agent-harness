@@ -429,6 +429,11 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
     content_parts: list[str] = []
     tool_calls: dict[int, dict] = {}
     usage: dict = {}
+    # Whether the server emitted hidden reasoning — a BOOLEAN, never the
+    # text: reasoning is not persisted or forwarded anywhere. The health
+    # probe needs it so a thinking model's response counts as a completion
+    # on the streaming path exactly as it does on the JSON one.
+    reasoning_seen = False
     async with client.stream("POST", url, json=payload) as response:
         if response.status_code != 200:
             body = (await response.aread()).decode("utf-8", "replace")[:500]
@@ -449,6 +454,8 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 delta = choice.get("delta") or {}
                 if delta.get("content"):
                     content_parts.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning_seen = True
                 for fragment in delta.get("tool_calls") or []:
                     index = fragment.get("index", 0)
                     call = tool_calls.setdefault(
@@ -467,4 +474,5 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
     if tool_calls:
         message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
     message["_usage"] = usage
+    message["_reasoning_seen"] = reasoning_seen
     return message, 200, ""

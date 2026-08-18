@@ -1328,6 +1328,10 @@ def _streaming_only_broken_transport():
     return httpx.MockTransport(handler)
 
 
+def _sse_response(httpx_mod, chunks: list[dict]):
+    return httpx_mod.Response(200, content=_sse(chunks))
+
+
 def _patch_async_client(monkeypatch, transport):
     import httpx
 
@@ -1510,3 +1514,58 @@ def test_context_budget_accounts_for_the_system_prompt(tmp_path):
         assert total <= limit, (
             f"budget {budget_tokens} tokens ({limit} chars): the request the "
             f"runner sends is {total} chars — the system prompt was not counted")
+
+
+def test_streaming_probe_sees_reasoning_without_retaining_it(monkeypatch):
+    """A thinking model that answers only in reasoning deltas must count as a
+    working completion on the streaming path, as it does on the JSON path —
+    and the harness must still never hold the reasoning text."""
+    import httpx
+
+    from harness.agents.health import verify_endpoint
+    from harness.agents.openai_compat import stream_chat_completion
+    from harness.config import InferenceConfig
+
+    secret = "SECRET-CHAIN-OF-THOUGHT"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "m"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        usage = {"prompt_tokens": 8, "completion_tokens": 2}
+        if body.get("tools"):
+            delta = {"role": "assistant", "tool_calls": [{
+                "index": 0, "id": "c", "type": "function", "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"})}}]}
+        else:
+            delta = {"role": "assistant", "reasoning_content": secret,
+                     "content": '```json\n{"status": "ok"}\n```'}
+        return _sse_response(httpx, [
+            {"choices": [{"delta": delta}]},
+            {"choices": [], "usage": usage},
+        ])
+
+    _patch_async_client(monkeypatch, httpx.MockTransport(handler))
+
+    report = asyncio.run(verify_endpoint(InferenceConfig(streaming=True), ["m"]))
+    assert report.ok
+    assert report.models["m"].reasoning_content_seen, (
+        "streaming probe reported no reasoning although the server emitted it")
+
+    # The accumulator the agent loop runs on keeps the flag, never the text.
+    async def accumulate():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://x/v1"
+        ) as client:
+            return await stream_chat_completion(client, {"model": "m"})
+
+    message, status, _ = asyncio.run(accumulate())
+    assert status == 200
+    assert message["_reasoning_seen"] is True
+    assert secret not in json.dumps(message), (
+        "hidden reasoning text leaked into the accumulated message")
