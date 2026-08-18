@@ -574,6 +574,14 @@ class RecoveryManager:
             "recovery: git commit intent %s already executed as %s; reconciling DB",
             operation_id, commit_hash,
         )
+        # Settling the attempt makes its worktree an orphan, and orphan
+        # cleanup deletes the task branch — possibly this commit's only
+        # ref. Pin it FIRST (and outside the transaction: a pinned ref with
+        # an unreconciled DB is harmless, the reverse loses the commit).
+        self.git.pin_ref(
+            f"refs/harness/reconciled/attempt-{attempt_id or operation_id}",
+            commit_hash,
+        )
         # The whole catch-up lands in ONE transaction. A crash
         # mid-reconciliation leaves the operation PENDING and the next
         # startup repeats the reconciliation from scratch, instead of a

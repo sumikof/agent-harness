@@ -28,7 +28,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from ..config import InferenceConfig
+from ..config import MAX_TOOL_OUTPUT_CHARS, InferenceConfig
 from ..orchestrator.resources import PrefixAffinityGate, global_llm_gate
 from ..orchestrator.state_machine import Role
 from ..security.hooks import RepeatActionGuard
@@ -42,6 +42,9 @@ _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
 
 # Same chars-per-token heuristic the ContextBuilder budgets with.
 CHARS_PER_TOKEN = 4
+TRUNCATION_NOTICE = ("\n... (result truncated: this turn returned "
+                     "multiple large tool results; full output is in "
+                     "the file/artifact itself)\n")
 ELIDED_TOOL_RESULT = "[earlier tool result elided to fit the context window]"
 ELIDED_ARGUMENTS = '{"_elided": true}'
 
@@ -324,6 +327,22 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
             (i for i, m in enumerate(messages) if m.get("role") == "assistant"),
             default=-1,
         )
+        # The prompt-budget reserve funds ONE result; a multi-call turn
+        # multiplies them (the batch's ARGUMENTS stay collectively bounded
+        # by max_output_tokens — one response generated them all). So the
+        # protected results share the single-result allowance: each keeps a
+        # fair head slice, the overflow moves to a notice. Bounded partial
+        # visibility of every result, never blindness, never an unbounded
+        # batch.
+        trailing = [m for i, m in enumerate(messages)
+                    if i > last_assistant and m.get("role") == "tool"]
+        aggregate = sum(len(m.get("content") or "") for m in trailing)
+        if len(trailing) > 1 and aggregate > MAX_TOOL_OUTPUT_CHARS:
+            share = MAX_TOOL_OUTPUT_CHARS // len(trailing)
+            for message in trailing:
+                content = message.get("content") or ""
+                if len(content) > share:
+                    message["content"] = content[:share] + TRUNCATION_NOTICE
         # Oldest completed turns first. A turn is elided as a PAIR: the tool
         # result and the arguments of the call that produced it. Those
         # arguments carry the whole file body for write_file/edit_file, so
@@ -434,7 +453,8 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                                 f"response message is not an object: {body!r}")
                         _validate_message_shape(raw_message, body)
                         message = dict(raw_message)
-                        message["_usage"] = data.get("usage") or {}
+                        message["_usage"] = _validate_usage_shape(
+                            data.get("usage"), body)
             except (httpx.HTTPError, ValueError) as exc:
                 last_error = f"transport error: {type(exc).__name__}: {exc}"
             else:
@@ -455,6 +475,22 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                 await asyncio.sleep(delay)
                 delay *= 2
         raise TransientHTTPError(f"LLM request failed after retries: {last_error}")
+
+
+def _validate_usage_shape(usage, context: str) -> dict:
+    """A truthy non-object usage (or non-integer counts) would blow up in
+    the session loop AFTER _chat returned — past the in-session retry."""
+    if usage is None:
+        return {}
+    if not isinstance(usage, dict):
+        raise ValueError(f"usage is not an object: {context!r}")
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            raise ValueError(f"usage.{key} is not an integer: {context!r}")
+    return usage
 
 
 def _validate_message_shape(message: dict, context: str) -> None:
@@ -537,7 +573,7 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 raise ValueError(f"SSE chunk is not an object: {data[:200]!r}")
             saw_chunk = True
             if chunk.get("usage"):
-                usage = chunk["usage"]
+                usage = _validate_usage_shape(chunk["usage"], data[:200])
             choices = chunk.get("choices") or []
             if not isinstance(choices, list):
                 raise ValueError(f"SSE chunk has non-list choices: {data[:200]!r}")

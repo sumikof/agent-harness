@@ -2333,3 +2333,95 @@ def test_inference_section_has_no_duplicate_model_setting():
     )
     with _pytest.raises(ValueError, match="provider.model"):
         asyncio.run(runner.resolve(request))
+
+
+# -- round-17 findings -------------------------------------------------------
+
+
+def test_multi_call_turn_results_share_the_single_result_allowance():
+    """One assistant turn with N tool calls yields N protected results; the
+    reserve funds ONE. The batch must be capped to that allowance (fair
+    share per result) instead of shipping N x MAX_TOOL_OUTPUT_CHARS."""
+    from harness.agents.openai_compat import (
+        CHARS_PER_TOKEN,
+        LocalOpenAICompatibleAgentRunner,
+    )
+    from harness.config import MAX_TOOL_OUTPUT_CHARS, InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    inference = InferenceConfig(input_budget_tokens=10000)   # 40000 chars
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    calls = [{"id": f"c{i}", "type": "function", "function": {
+        "name": "read_file", "arguments": json.dumps({"path": f"f{i}"})}}
+        for i in range(3)]
+    messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "A" * 39000},            # near the budget
+        {"role": "assistant", "content": "", "tool_calls": calls},
+    ] + [
+        {"role": "tool", "tool_call_id": f"c{i}",
+         "content": f"R{i}:" + "x" * MAX_TOOL_OUTPUT_CHARS}
+        for i in range(3)
+    ]
+
+    runner._fit_to_window(messages)
+
+    trailing = [m for m in messages if m.get("role") == "tool"]
+    aggregate = sum(len(m["content"]) for m in trailing)
+    assert aggregate <= MAX_TOOL_OUTPUT_CHARS + 3 * 200, (
+        f"protected multi-call batch kept {aggregate} chars — the reserve "
+        f"funds only {MAX_TOOL_OUTPUT_CHARS}")
+    # every result keeps a visible head slice — bounded, never blind
+    for i, m in enumerate(trailing):
+        assert m["content"].startswith(f"R{i}:")
+
+
+async def test_wrong_shape_usage_is_retried(tmp_path, monkeypatch):
+    """usage: 1 / [1] / string counts pass the message checks but blow up at
+    usage.get(...) AFTER _chat returned — they must retry in-session."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    good_message = {"role": "assistant",
+                    "content": '```json\n{"task": "T1", "summary": "s"}\n```'}
+    bodies = [
+        json.dumps({"choices": [{"message": good_message}], "usage": 1}),
+        json.dumps({"choices": [{"message": good_message}], "usage": [1]}),
+        json.dumps({"choices": [{"message": good_message}],
+                    "usage": {"prompt_tokens": "5"}}),
+    ]
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) <= len(bodies):
+            return httpx.Response(
+                200, content=bodies[len(calls) - 1].encode(),
+                headers={"content-type": "application/json"})
+        return httpx.Response(200, json={
+            "choices": [{"message": good_message}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}})
+
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url,
+                            transport=httpx.MockTransport(handler)))
+
+    inference = InferenceConfig(transient_retries=4, transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED", (
+        f"wrong-shape usage aborted the session: {result.error}")
+    assert len(calls) == len(bodies) + 1

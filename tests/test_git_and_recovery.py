@@ -219,3 +219,62 @@ def test_pin_ref_keeps_a_commit_reachable_after_branch_deletion(repo):
     # the ref keeps the commit visible to `git log --all` trailer lookups
     out = repo._run("log", "--all", "--format=%H").stdout
     assert task_commit in out
+
+
+def test_reconciled_commit_is_pinned_before_orphan_cleanup(tmp_path, repo):
+    """Crash window: commit_task executed, integration intent not yet
+    recorded. Recovery settles the attempt (making its worktree an orphan)
+    — the reconciled commit must get a pinned ref BEFORE cleanup can
+    delete the task branch, its possibly-only ref."""
+    from harness.database.operation_repository import (
+        OperationRepository,
+        OperationType,
+    )
+
+    db = Database(tmp_path / "harness.db")
+    projects = ProjectRepository(db)
+    tasks = TaskRepository(db)
+    events = EventRepository(db)
+    artifacts = ArtifactManager(tmp_path / "artifacts")
+    operations = OperationRepository(db)
+
+    project_id = projects.create("p", str(repo.path), "main", "g", 10.0)
+    task_id = tasks.create(project_id, "T001", "task")
+    tasks.set_status(task_id, TaskState.READY)
+    tasks.set_status(task_id, TaskState.ANALYZING)
+    tasks.set_status(task_id, TaskState.EXECUTING)
+    attempt_id = tasks.start_attempt(task_id, repo.head_commit())
+
+    # the commit exists on a task branch, exactly as commit_task leaves it
+    default = repo.current_branch()
+    repo._run("checkout", "-b", "harness/task/T001/attempt-1")
+    (repo.path / "done.txt").write_text("reviewed\n")
+    repo.add_all()
+    commit = repo.commit("task work (T001)")
+    repo._run("checkout", default)
+
+    op_id = operations.record_intent(
+        OperationType.GIT_COMMIT,
+        {"task_key": "T001", "task_id": task_id, "attempt_id": attempt_id},
+        project_id=project_id, task_id=task_id, attempt_id=attempt_id,
+    )
+    op_row = db.query_one(
+        "SELECT * FROM operations WHERE operation_id = ?", (op_id,))
+
+    recovery = RecoveryManager(
+        tasks, events, artifacts, repo, CheckpointManager(repo),
+        operations=operations,
+    )
+    recovery._reconcile_executed_commit(project_id, op_row, commit)
+
+    pinned = repo._run(
+        "for-each-ref", "--format=%(objectname)", "refs/harness/reconciled/",
+        check=False).stdout.strip().splitlines()
+    assert commit in pinned, (
+        "reconciled task_commit has no pinned ref; orphan cleanup deleting "
+        "the task branch would leave it gc-prunable")
+
+    # even with the branch gone, the commit stays reachable
+    repo.delete_branch("harness/task/T001/attempt-1")
+    out = repo._run("log", "--all", "--format=%H").stdout
+    assert commit in out
