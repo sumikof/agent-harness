@@ -43,6 +43,25 @@ _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
 # Same chars-per-token heuristic the ContextBuilder budgets with.
 CHARS_PER_TOKEN = 4
 ELIDED_TOOL_RESULT = "[earlier tool result elided to fit the context window]"
+ELIDED_ARGUMENTS = '{"_elided": true}'
+
+
+def _elide_call_arguments(messages: list[dict], call_id: str | None) -> None:
+    """Compact the arguments of a call whose result is already known.
+
+    Once the tool has run, the outcome is what matters; the arguments are
+    dead weight — and for write_file/edit_file they are the entire file
+    body. Valid JSON is kept so the message still parses as a tool call.
+    """
+    if not call_id:
+        return
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            if call.get("id") == call_id:
+                function = call.get("function") or {}
+                if function.get("arguments") != ELIDED_ARGUMENTS:
+                    function["arguments"] = ELIDED_ARGUMENTS
+                return
 
 
 def _messages_size(messages: list[dict]) -> int:
@@ -288,14 +307,21 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
         budget_chars = self.inference.effective_input_budget() * CHARS_PER_TOKEN
         if _messages_size(messages) <= budget_chars:
             return
+        # Oldest completed turns first. A turn is elided as a PAIR: the tool
+        # result and the arguments of the call that produced it. Those
+        # arguments carry the whole file body for write_file/edit_file, so
+        # eliding only the result leaves the larger half in the history.
+        # The call keeps its id and name, so the assistant/tool pairing the
+        # protocol requires still holds.
         for message in messages:
             if _messages_size(messages) <= budget_chars:
                 return
             if message.get("role") != "tool":
                 continue
-            if message.get("content") == ELIDED_TOOL_RESULT:
-                continue
-            message["content"] = ELIDED_TOOL_RESULT
+            call_id = message.get("tool_call_id")
+            if message.get("content") != ELIDED_TOOL_RESULT:
+                message["content"] = ELIDED_TOOL_RESULT
+            _elide_call_arguments(messages, call_id)
         # Still oversized with every tool result elided: drop older assistant
         # prose too (never the first two messages — system + assignment).
         for message in messages[2:]:

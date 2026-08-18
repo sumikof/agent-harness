@@ -665,17 +665,17 @@ async def test_health_probes_capabilities_on_every_role_model(monkeypatch):
             if model == "weak":          # served, but cannot tool-call
                 return httpx.Response(200, json={
                     "choices": [{"message": {"role": "assistant", "content": "sorry"}}],
-                    "usage": {"completion_tokens": 2}})
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
             return httpx.Response(200, json={"choices": [{"message": {
                 "role": "assistant",
                 "tool_calls": [{"id": "c", "type": "function", "function": {
                     "name": "read_file",
                     "arguments": json.dumps({"path": "README.md"})}}]}}],
-                "usage": {"completion_tokens": 2}})
+                "usage": {"prompt_tokens": 8, "completion_tokens": 2}})
         return httpx.Response(200, json={
             "choices": [{"message": {"role": "assistant",
                                      "content": '```json\n{"status": "ok"}\n```'}}],
-            "usage": {"completion_tokens": 3}})
+            "usage": {"prompt_tokens": 9, "completion_tokens": 3}})
 
     transport = httpx.MockTransport(handler)
     real_client = httpx.AsyncClient
@@ -1188,3 +1188,94 @@ def test_non_positive_output_reservation_is_refused():
     with pytest.raises(pydantic.ValidationError):
         InferenceConfig(input_budget_tokens=0)
     assert InferenceConfig(max_output_tokens=1).effective_input_budget() > 0
+
+
+def test_clamping_elides_tool_call_arguments_not_just_results(tmp_path):
+    """write_file/edit_file carry the whole file body in the CALL arguments.
+    Eliding only the result leaves the larger half of the turn in history."""
+    from harness.agents.openai_compat import (
+        ELIDED_ARGUMENTS,
+        ELIDED_TOOL_RESULT,
+        CHARS_PER_TOKEN,
+        LocalOpenAICompatibleAgentRunner,
+        _messages_size,
+    )
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    inference = InferenceConfig(input_budget_tokens=2000)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "ASSIGNMENT"},
+    ]
+    for i in range(4):
+        messages.append({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": f"w{i}", "type": "function", "function": {
+                "name": "write_file",
+                # the file body lives HERE, not in the result
+                "arguments": json.dumps({"path": f"f{i}.py", "content": "z" * 8000})}}],
+        })
+        messages.append({"role": "tool", "tool_call_id": f"w{i}",
+                         "content": "wrote 8000 chars"})
+
+    runner._fit_to_window(messages)
+
+    limit = inference.effective_input_budget() * CHARS_PER_TOKEN
+    assert _messages_size(messages) <= limit, "history still exceeds the budget"
+    calls = [c for m in messages for c in (m.get("tool_calls") or [])]
+    assert any(c["function"]["arguments"] == ELIDED_ARGUMENTS for c in calls)
+    # protocol pairing survives: every call keeps its id and name, and the
+    # compacted arguments are still valid JSON
+    for call in calls:
+        assert call["id"] and call["function"]["name"]
+        json.loads(call["function"]["arguments"])
+    assert messages[0]["content"] == "SYSTEM"
+    assert messages[1]["content"] == "ASSIGNMENT"
+
+
+def test_partial_usage_object_does_not_pass_the_health_gate(monkeypatch):
+    """`{"completion_tokens": 5}` without prompt_tokens would let every input
+    count be recorded as zero."""
+    import httpx
+
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "partial"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        if body.get("tools"):
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant",
+                "tool_calls": [{"id": "c", "type": "function", "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"})}}]}}],
+                "usage": {"completion_tokens": 5}})          # prompt_tokens missing
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": '```json\n{"status": "ok"}\n```'}}],
+            "usage": {"completion_tokens": 5}})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
+
+    async def run():
+        return await verify_endpoint(InferenceConfig(), ["partial"])
+
+    report = asyncio.run(run())
+    assert not report.models["partial"].usage_reported
+    assert not report.ok
+    assert any("prompt_tokens" in e for e in report.errors)

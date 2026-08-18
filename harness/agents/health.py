@@ -218,8 +218,14 @@ async def verify_endpoint(
                     (message.get("content") or "").strip()
                     or message.get("reasoning_content")
                 )
-                model_report.usage_reported = bool(
-                    data.get("usage", {}).get("completion_tokens"))
+                # BOTH counts, not just one: a partial usage object leaves
+                # every missing prompt count recorded as zero, so input
+                # telemetry and the budgets derived from it stay corrupt.
+                usage = data.get("usage") or {}
+                model_report.usage_reported = all(
+                    isinstance(usage.get(key), int) and usage[key] > 0
+                    for key in ("prompt_tokens", "completion_tokens")
+                )
                 model_report.reasoning_content_seen = bool(
                     message.get("reasoning_content"))
             except Exception as exc:
@@ -227,8 +233,9 @@ async def verify_endpoint(
                 continue
             if not model_report.usage_reported:
                 report.errors.append(
-                    f"[{name}] endpoint returned no usage counts; token telemetry "
-                    "and every budget derived from it would be wrong"
+                    f"[{name}] endpoint did not report both prompt_tokens and "
+                    "completion_tokens; token telemetry and every budget derived "
+                    "from it would be wrong"
                 )
 
             # 4. tool calling (qwen3_coder parser server-side)
