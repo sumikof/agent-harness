@@ -1045,9 +1045,21 @@ def test_stale_snapshot_is_reclaimed_not_silently_bypassed(config):
 def test_deployment_artifacts_are_not_committable():
     """start.sh generates a launch script and the benchmark accumulates raw
     measurements; neither belongs in the repository (the FROZEN tuning
-    profile does)."""
-    ignored = (REPO_ROOT / ".gitignore").read_text()
-    assert "deploy/inference/.generated/" in ignored
-    assert "config/benchmark-results.json" in ignored
-    assert ".env" in ignored                       # operator's HF token
-    assert "inference-tuning.json" not in ignored  # the frozen profile is source
+    profile does).
+
+    Asked of git itself rather than matched against .gitignore text — a
+    filename mentioned in a comment there is not an ignore rule.
+    """
+    import subprocess
+
+    def is_ignored(path: str) -> bool:
+        return subprocess.run(
+            ["git", "check-ignore", "-q", path],
+            cwd=REPO_ROOT, capture_output=True,
+        ).returncode == 0
+
+    assert is_ignored("deploy/inference/.generated/launch.sh")
+    assert is_ignored("config/benchmark-results.json")
+    assert is_ignored("deploy/inference/.env")        # operator's HF token
+    # the frozen production profile is source, not an artifact
+    assert not is_ignored("config/inference-tuning.json")
