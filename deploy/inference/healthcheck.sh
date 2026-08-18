@@ -65,16 +65,19 @@ fi
 
 step "5. prefix caching (metrics must move, not just the CLI flag)"
 FILLER="$(printf 'The harness verifies serving features before production use. %.0s' $(seq 1 400))"
-BEFORE="$(metric_sum prefix_cache)"
+# HIT counters only: prefix_cache_queries_total advances for the two probe
+# requests whether or not anything was cached, so summing every prefix_cache
+# series would report "verified" for a cache that never hit.
+BEFORE="$(metric_sum prefix_cache hit)"
 chat "[{\"role\":\"user\",\"content\":\"${FILLER} Reply: one\"}]" >/dev/null || bad "prefix request 1 failed"
 chat "[{\"role\":\"user\",\"content\":\"${FILLER} Reply: two\"}]" >/dev/null || bad "prefix request 2 failed"
-AFTER="$(metric_sum prefix_cache)"
+AFTER="$(metric_sum prefix_cache hit)"
 if [[ -z "${BEFORE}" || -z "${AFTER}" ]]; then
-    bad "no prefix_cache metrics exposed — verify --enable-prefix-caching and the vLLM version"
+    bad "no prefix_cache HIT metrics exposed — verify --enable-prefix-caching and the vLLM version"
 elif [[ "${AFTER}" -gt "${BEFORE}" ]]; then
-    ok "prefix cache metrics advanced (${BEFORE} -> ${AFTER})"
+    ok "prefix cache hits advanced (${BEFORE} -> ${AFTER})"
 else
-    bad "prefix cache metrics did not move (${BEFORE} -> ${AFTER}); caching may be inactive"
+    bad "prefix cache HITS did not increase (${BEFORE} -> ${AFTER}); the cache is not serving the shared prefix"
 fi
 
 step "6. speculative decoding (only if SPECULATIVE_CONFIG is set)"

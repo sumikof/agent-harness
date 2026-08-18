@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -389,16 +390,51 @@ def persist(args, summaries: list[dict]) -> None:
     warn_regression(runs, summaries)
 
 
-def read_env_profile() -> dict:
-    """The serving configuration currently in deploy/inference/.env."""
+# The serving settings whose measured values define a tuning profile.
+PROFILE_KEYS = (
+    "MODEL", "SERVED_MODEL_NAME", "MODEL_REVISION", "VLLM_IMAGE",
+    "VLLM_MIN_VERSION", "MAX_MODEL_LEN", "MAX_NUM_SEQS",
+    "MAX_NUM_BATCHED_TOKENS", "GPU_MEMORY_UTILIZATION", "KV_CACHE_DTYPE",
+    "REASONING_PARSER", "TOOL_CALL_PARSER", "SPECULATIVE_CONFIG",
+    "TENSOR_PARALLEL_SIZE", "EXTRA_ARGS",
+)
+
+
+def read_env_profile(env_path: Path | None = None) -> dict:
+    """The serving configuration as `start.sh` actually sees it.
+
+    The file must be read with SHELL semantics, not split on '=': start.sh
+    sources it, so quoting and expansion decide the effective values. A raw
+    split would record SPECULATIVE_CONFIG with its surrounding quotes still
+    attached — which then fails to parse as JSON in the written profile.
+    """
+    if env_path is None:
+        env_path = Path(__file__).resolve().parent.parent / "deploy" / "inference" / ".env"
+    if not env_path.exists():
+        return {}
+    # Ask bash for the values it would export, one NUL-separated pair per key.
+    program = "set -a; . \"$1\"; set +a; " + "".join(
+        f'printf "%s=%s\\0" {key} "${key}"; ' for key in PROFILE_KEYS
+    )
+    try:
+        completed = subprocess.run(
+            ["bash", "-c", program, "bash", str(env_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"WARNING: could not source {env_path} ({exc}); "
+              "serving profile not recorded for this run", file=sys.stderr)
+        return {}
+    if completed.returncode != 0:
+        print(f"WARNING: sourcing {env_path} failed: {completed.stderr.strip()}",
+              file=sys.stderr)
+        return {}
     env = {}
-    env_path = Path(__file__).resolve().parent.parent / "deploy" / "inference" / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env[key.strip()] = value.strip()
+    for pair in completed.stdout.split("\0"):
+        if "=" in pair:
+            key, _, value = pair.partition("=")
+            if value != "":
+                env[key] = value
     return env
 
 
@@ -436,11 +472,30 @@ def write_tuning_profile(out_dir: Path, args, runs: list[dict]) -> None:
     gets written. Production pins this file — no startup auto-tuning.
     """
     scored = [(score_of(run), run) for run in runs]
-    candidates = [(score[0], score[1], run) for score, run in scored if score]
+    candidates = []
+    incomplete = []
+    for score, run in scored:
+        if not score:
+            continue
+        # A run recorded before serving settings were captured (or one whose
+        # .env could not be sourced) cannot become the production winner:
+        # the profile would be written from hard-coded defaults instead of
+        # the configuration that produced the measurement.
+        if not run.get("server_profile"):
+            incomplete.append(run.get("label"))
+            continue
+        candidates.append((score[0], score[1], run))
+    if incomplete:
+        print(
+            f"ignoring run(s) {sorted(set(incomplete))} with no recorded serving "
+            "configuration; re-measure them to make them eligible",
+            file=sys.stderr,
+        )
     if not candidates:
         print(
-            f"no run measured concurrency {TARGET_CONCURRENCY} without errors; "
-            "tuning profile NOT written — rerun the sweep before production",
+            f"no eligible run measured concurrency {TARGET_CONCURRENCY} without "
+            "errors and with a recorded serving configuration; tuning profile "
+            "NOT written — rerun the sweep before production",
             file=sys.stderr,
         )
         return

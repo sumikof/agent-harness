@@ -34,7 +34,7 @@ class WorktreeHandle:
     task_key: str
     cycle: int                 # attempt-cycle number (first attempt_no of the cycle)
     path: Path
-    branch: str
+    branch: str | None          # None for a detached read-only snapshot
     base_commit: str
     repo: GitRepository        # GitRepository rooted at the worktree
 
@@ -70,6 +70,25 @@ class WorktreeManager:
             branch=branch,
             base_commit=base_commit,
             repo=GitRepository(path),
+        )
+
+    def create_snapshot(self, label: str, commit: str) -> WorktreeHandle:
+        """A read-only, branchless worktree pinned at `commit`.
+
+        Read-only roles that are not tied to a task attempt (the
+        Diagnostician) must not analyse the integration checkout directly:
+        other tasks merge into it while they work, so files read at
+        different moments can come from different commits — and a merge in
+        progress is visible as a conflicted tree.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / label
+        if path.exists():
+            raise GitError(f"snapshot worktree path {path} already exists")
+        self.main.add_detached_worktree(path, commit)
+        return WorktreeHandle(
+            task_key=label, cycle=0, path=path, branch=None,
+            base_commit=commit, repo=GitRepository(path),
         )
 
     def remove(self, handle: WorktreeHandle, delete_branch: bool = True) -> None:
@@ -126,6 +145,15 @@ class WorktreeManager:
 
     def owns_branch(self, branch: str | None) -> bool:
         return bool(branch) and branch.startswith(f"{self.branch_prefix}/")
+
+    def owns_checkout(self, branch: str | None) -> bool:
+        """Ownership by what is checked out INSIDE a worktree under our root.
+
+        Harness worktrees are either on a task branch or detached (a
+        read-only snapshot). A checkout on any other branch is somebody
+        else's work, even under our root.
+        """
+        return branch == "DETACHED" or self.owns_branch(branch)
 
     def managed_paths(self) -> list[Path]:
         """Registered worktrees located under this manager's root."""

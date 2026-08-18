@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ProjectConfig(BaseModel):
@@ -39,6 +39,10 @@ class ProviderConfig(BaseModel):
         return override.type or self.type, override.model or self.model
 
 
+# Below this the context profile cannot hold a usable prompt at all.
+MIN_INPUT_HEADROOM_TOKENS = 1024
+
+
 class SamplingConfig(BaseModel):
     """Generation profile for the local model. Fixed per profile — never
     varied per request, so identical contexts produce identical requests."""
@@ -58,9 +62,18 @@ class InferenceConcurrencyConfig(BaseModel):
 
 
 class InferenceConfig(BaseModel):
-    """Local OpenAI-compatible serving endpoint (vLLM on DGX Spark)."""
+    """Local OpenAI-compatible serving endpoint (vLLM on DGX Spark).
 
-    provider: str = "openai-compatible"
+    There is deliberately no `provider` field here: `provider.type` (and
+    the per-role overrides) decide which engine a role dispatches to, and a
+    second copy of that choice would either be ignored or contradict the
+    authoritative one. Unknown keys are rejected rather than ignored, so a
+    stale or misspelled setting fails at load instead of silently doing
+    nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     base_url: str = "http://127.0.0.1:8000/v1"
     api_key: str = "not-needed"  # vLLM ignores it; the SDK requires a value
     model: str = "qwen3.6-27b-fp8"
@@ -96,13 +109,23 @@ class InferenceConfig(BaseModel):
     transient_retry_base_delay: float = 2.0
 
     @model_validator(mode="after")
-    def _known_profile(self) -> "InferenceConfig":
+    def _profile_fits(self) -> "InferenceConfig":
         # Checked on the whole model: `context_profiles` is declared after
         # `context_profile`, so a field validator would not see it yet.
         if self.context_profile not in self.context_profiles:
             raise ValueError(
                 f"unknown context_profile '{self.context_profile}'; "
                 f"available: {sorted(self.context_profiles)}"
+            )
+        # An output reservation that consumes the whole window leaves no room
+        # for input. Clamping to a one-token budget would hide that: every
+        # request would still reserve more than the server can hold.
+        if self.input_headroom() < MIN_INPUT_HEADROOM_TOKENS:
+            raise ValueError(
+                f"max_output_tokens={self.max_output_tokens} leaves only "
+                f"{self.input_headroom()} input tokens in context_profile "
+                f"'{self.context_profile}' (window {self.max_model_len()}); "
+                f"at least {MIN_INPUT_HEADROOM_TOKENS} are required"
             )
         return self
 
@@ -116,10 +139,13 @@ class InferenceConfig(BaseModel):
         the budget can never exceed what is left of the profile's window
         after the reserved output. A configured `input_budget_tokens` that
         does not fit is clamped rather than silently overrunning the
-        server's --max-model-len.
+        server's --max-model-len. The reservation itself is validated at
+        load, so this never has to invent a degenerate budget.
         """
-        headroom = self.max_model_len() - self.max_output_tokens
-        return max(1, min(self.input_budget_tokens, headroom))
+        return min(self.input_budget_tokens, self.input_headroom())
+
+    def input_headroom(self) -> int:
+        return self.max_model_len() - self.max_output_tokens
 
     def sampling_for_role(self, role: str) -> SamplingConfig:
         """The global profile with the role's EXPLICIT overrides applied.

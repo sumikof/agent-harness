@@ -34,6 +34,19 @@ if [[ "$(printf '%s\n%s\n' "${VLLM_MIN_VERSION:-0.19}" "${CONTAINER_VLLM_VERSION
 fi
 echo "    vLLM ${CONTAINER_VLLM_VERSION} OK"
 
+if [[ -n "${SPECULATIVE_CONFIG:-}" ]]; then
+    # Sourcing strips shell quoting, so a value that was not quoted in .env
+    # arrives here as malformed JSON. Fail with the fix instead of handing
+    # vLLM something it will reject at startup.
+    if ! printf '%s' "${SPECULATIVE_CONFIG}" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+        echo "ERROR: SPECULATIVE_CONFIG is not valid JSON after shell expansion:" >&2
+        echo "       ${SPECULATIVE_CONFIG}" >&2
+        echo "       Single-quote the whole value in .env, e.g." >&2
+        echo "       SPECULATIVE_CONFIG='{\"method\":\"qwen3_next_mtp\",\"num_speculative_tokens\":2}'" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p .generated
 {
     echo '#!/usr/bin/env bash'

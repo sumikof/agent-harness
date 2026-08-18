@@ -390,7 +390,7 @@ class RecoveryManager:
                     checked_out = candidate.current_branch()
             # A worktree inside our root but on a foreign branch is not ours
             # to remove — leave it and let the operator decide.
-            if checked_out is not None and not self.worktrees.owns_branch(checked_out):
+            if checked_out is not None and not self.worktrees.owns_checkout(checked_out):
                 logger.warning(
                     "recovery: leaving worktree %s alone; branch '%s' is not a "
                     "harness task branch", path, checked_out,

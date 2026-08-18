@@ -300,7 +300,7 @@ async def verify_endpoint(
 
 
 async def _prefix_cache_counters(client, root: str) -> float | None:
-    """Sum of prefix-cache hit counters from vLLM /metrics.
+    """Sum of prefix-cache HIT counters from vLLM /metrics.
 
     Metric names vary across vLLM versions — matched by substring, never
     hardcoded to one release's naming.
@@ -317,7 +317,10 @@ async def _prefix_cache_counters(client, root: str) -> float | None:
         if line.startswith("#"):
             continue
         name = line.split("{")[0].split(" ")[0]
-        if "prefix_cache" in name and ("hit" in name or "queries" in name):
+        # HIT counters only. A queries/lookups counter advances for the probe
+        # requests regardless of whether anything was cached, which would
+        # report an ineffective cache as verified.
+        if "prefix_cache" in name and "hit" in name:
             match = re.search(r"\s([0-9.eE+-]+)$", line)
             if match:
                 try:

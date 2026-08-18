@@ -841,3 +841,175 @@ def test_metric_sum_distinguishes_absent_from_zero(tmp_path):
 
     assert run_awk("prefix_cache", present) == "12"
     assert run_awk("spec_decod", absent) == "", "absent metrics reported as zero"
+
+
+# -- .env shell semantics ---------------------------------------------------
+
+
+def test_shipped_env_example_sources_to_valid_speculative_json():
+    """start.sh SOURCES .env as Bash, so an unquoted JSON value loses its
+    double quotes and vLLM rejects the documented default deployment."""
+    import subprocess
+
+    env_example = REPO_ROOT / "deploy" / "inference" / ".env.example"
+    value = subprocess.run(
+        ["bash", "-c", 'set -a; . "$1"; set +a; printf "%s" "$SPECULATIVE_CONFIG"',
+         "bash", str(env_example)],
+        capture_output=True, text=True,
+    ).stdout
+    parsed = json.loads(value)          # raises if the quoting is wrong
+    assert parsed["method"] == "qwen3_next_mtp"
+
+
+def test_env_profile_is_read_with_shell_semantics(tmp_path):
+    """A raw '=' split would keep the surrounding quotes, so the recorded
+    speculative setting would no longer parse as JSON."""
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import benchmark_inference as bench
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "MAX_NUM_SEQS=16\n"
+        "SPECULATIVE_CONFIG='{\"method\":\"qwen3_next_mtp\","
+        "\"num_speculative_tokens\":2}'\n"
+    )
+    profile = bench.read_env_profile(env_file)
+    assert profile["MAX_NUM_SEQS"] == "16"
+    assert json.loads(profile["SPECULATIVE_CONFIG"])["num_speculative_tokens"] == 2
+
+
+def test_legacy_runs_without_serving_config_cannot_win(tmp_path):
+    """A record written before serving settings were captured would make the
+    profile describe hard-coded defaults instead of the winning run."""
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import benchmark_inference as bench
+
+    class Args:
+        model = "qwen3.6-27b-fp8"
+        label = "new"
+
+    fastest_legacy = _bench_run("legacy", 9999)
+    fastest_legacy["server_profile"] = None
+    eligible = _bench_run("mtp2", 2100, spec={"method": "qwen3_next_mtp",
+                                              "num_speculative_tokens": 2})
+    bench.write_tuning_profile(tmp_path, Args, [fastest_legacy, eligible])
+
+    profile = json.loads((tmp_path / "inference-tuning.json").read_text())
+    assert profile["benchmark_label"] == "mtp2"
+    assert profile["profile"]["speculative"]["num_speculative_tokens"] == 2
+
+
+# -- prefix cache verification measures HITS --------------------------------
+
+
+def test_prefix_cache_check_ignores_query_counters(tmp_path):
+    """prefix_cache_queries_total advances for the probe requests whether or
+    not anything was cached; summing it would verify an inert cache."""
+    import subprocess
+
+    script = (REPO_ROOT / "deploy" / "inference" / "healthcheck.sh").read_text()
+    assert "metric_sum prefix_cache hit" in script, "the check no longer targets hits"
+    awk_program = script[script.index("awk -v pats=", script.index('${BASE}/metrics')):]
+    awk_program = awk_program[awk_program.index("'") + 1:]
+    awk_program = awk_program[:awk_program.index("'")]
+
+    queries_only = tmp_path / "q.txt"
+    queries_only.write_text("vllm:prefix_cache_queries_total 12\n")
+    with_hits = tmp_path / "h.txt"
+    with_hits.write_text("vllm:prefix_cache_queries_total 12\n"
+                         "vllm:prefix_cache_hits_total 4\n")
+
+    def run_awk(path):
+        return subprocess.run(["awk", "-v", "pats=prefix_cache hit",
+                               awk_program, str(path)],
+                              capture_output=True, text=True).stdout
+
+    assert run_awk(queries_only) == "", "a queries-only endpoint looked verified"
+    assert run_awk(with_hits) == "4"
+
+
+async def test_health_prefix_probe_counts_hits_only(monkeypatch):
+    import httpx
+
+    from harness.agents.health import _prefix_cache_counters
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=(
+            "vllm:prefix_cache_queries_total 100\n"
+            "vllm:prefix_cache_hits_total 7\n"
+        ))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await _prefix_cache_counters(client, "http://server") == 7.0
+
+
+# -- context window arithmetic ----------------------------------------------
+
+
+def test_output_reservation_cannot_consume_the_window():
+    """Clamping to a one-token budget would hide the misconfiguration: every
+    request would still reserve more than the server context holds."""
+    import pydantic
+
+    from harness.config import InferenceConfig
+
+    with pytest.raises(pydantic.ValidationError, match="max_output_tokens"):
+        InferenceConfig(max_output_tokens=65536)          # the whole window
+    with pytest.raises(pydantic.ValidationError, match="max_output_tokens"):
+        InferenceConfig(max_output_tokens=65024)          # leaves 512
+
+    fits = InferenceConfig(max_output_tokens=8192)
+    assert fits.effective_input_budget() > 0
+    assert (fits.effective_input_budget() + fits.max_output_tokens
+            <= fits.max_model_len())
+
+
+def test_duplicate_and_unknown_inference_keys_are_refused():
+    """`inference.provider` duplicated the authoritative provider.type and
+    was never read; unknown keys must fail rather than be ignored."""
+    import pydantic
+
+    from harness.config import InferenceConfig
+
+    with pytest.raises(pydantic.ValidationError, match="extra_forbidden"):
+        InferenceConfig(provider="openai-compatible")
+    with pytest.raises(pydantic.ValidationError, match="extra_forbidden"):
+        InferenceConfig(typo_key=1)
+
+
+# -- read-only roles need a stable tree -------------------------------------
+
+def test_diagnostician_reads_a_snapshot_not_the_moving_integration_branch(config):
+    """The integration checkout advances while other tasks merge into it, so
+    a read-only role analysing it could read files from different commits —
+    or from a merge in progress. It gets a detached snapshot instead."""
+    orchestrator = ProjectOrchestrator(config)
+    orchestrator.ensure_project()
+    pinned = orchestrator.git.head_commit()
+
+    snapshot = orchestrator.worktrees.create_snapshot("T001-diagnosis1", pinned)
+    try:
+        assert snapshot.path.is_dir()
+        assert snapshot.branch is None                       # nothing to commit to
+        assert snapshot.repo.head_commit() == pinned
+        assert snapshot.repo.current_branch() == "DETACHED"
+
+        # the integration branch moves on; the snapshot does not
+        (orchestrator.git.path / "later.txt").write_text("integrated later\n")
+        orchestrator.git.add_all()
+        moved = orchestrator.git.commit("another task integrated")
+        assert orchestrator.git.head_commit() == moved
+        assert snapshot.repo.head_commit() == pinned
+        assert not (snapshot.path / "later.txt").exists()
+
+        # recovery recognises a crashed snapshot as harness-owned
+        assert orchestrator.worktrees.owns(snapshot.path)
+        assert orchestrator.worktrees.owns_checkout("DETACHED")
+        assert not orchestrator.worktrees.owns_checkout("someones-feature")
+    finally:
+        orchestrator.worktrees.remove(snapshot)
+    assert not snapshot.path.exists()

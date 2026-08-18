@@ -470,6 +470,19 @@ class TaskRunner:
         # crash mid-diagnosis leaves no dangling worktree. The Diagnostician
         # runs read-only against the MAIN checkout.
         self._archive_and_dispose(env, task_key, f"attempt{attempt_no}")
+        # The Diagnostician is read-only but must still see a STABLE tree:
+        # the integration checkout moves under it while other tasks merge,
+        # so files read at different moments could come from different
+        # commits — or from a merge in progress. It gets its own detached
+        # snapshot at the current integration HEAD instead.
+        snapshot = None
+        head = self.git.head_commit()
+        if head is not None:
+            try:
+                snapshot = self.worktrees.create_snapshot(
+                    f"{task_key}-diagnosis{attempt_no}", head)
+            except Exception as exc:
+                logger.warning("could not create a diagnosis snapshot: %s", exc)
         try:
             # attempt_id ties the diagnostician's runs to the task so they
             # count toward max_agent_runs_per_task like every other run.
@@ -482,6 +495,8 @@ class TaskRunner:
                 task_id=task_id,
                 attempt_id=attempt_id,
                 artifact_path=self.artifacts.diagnostics_path(task_key, attempt_no),
+                workdir=snapshot.path if snapshot else None,
+                git=snapshot.repo if snapshot else None,
             )
         except (AgentRunFailed, BudgetExceeded) as exc:
             self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
@@ -490,6 +505,10 @@ class TaskRunner:
             if isinstance(exc, BudgetExceeded) and exc.scope == "project":
                 raise
             return TaskOutcome.BLOCKED
+        finally:
+            if snapshot is not None:
+                with contextlib.suppress(Exception):
+                    self.worktrees.remove(snapshot)
 
         verdict = DiagnosisVerdict(diagnosis.recommendation)
         self.events.emit("DIAGNOSIS_COMPLETED", project_id=project_id, task_id=task_id,

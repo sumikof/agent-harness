@@ -417,6 +417,14 @@ class GitRepository:
         """Create an isolated worktree on a NEW branch at base_ref."""
         self._run("worktree", "add", "-b", branch, str(path), base_ref)
 
+    def add_detached_worktree(self, path: str | Path, commit: str) -> None:
+        """Create a worktree pinned to `commit` with NO branch.
+
+        A read-only snapshot: nothing can be committed to it and there is no
+        ref to clean up afterwards.
+        """
+        self._run("worktree", "add", "--detach", str(path), commit)
+
     def remove_worktree(self, path: str | Path, force: bool = True) -> None:
         args = ["worktree", "remove"]
         if force:
