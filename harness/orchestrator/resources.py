@@ -83,14 +83,14 @@ class PrefixAffinityGate:
         try:
             await waiter.future
         except asyncio.CancelledError:
-            if not waiter.future.done():
+            if waiter.future.done() and not waiter.future.cancelled():
+                # Slot was granted concurrently with cancellation — return it.
+                self.release(group_key)
+            else:
                 try:
                     self._waiters.remove(waiter)
                 except ValueError:
                     pass
-            else:
-                # Slot was granted concurrently with cancellation — return it.
-                self.release(group_key)
             raise
 
     def release(self, group_key: str | None = None) -> None:

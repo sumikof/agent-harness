@@ -1,0 +1,29 @@
+{
+  "_comment": "KNOWN-GOOD BASELINE for DGX Spark, NOT final values. Run deploy/inference/benchmark.sh on the actual hardware; scripts/benchmark_inference.py freezes the measured profile into inference-tuning.json. Production pins that file — never auto-tune at startup.",
+  "hardware": "DGX Spark",
+  "model": "Qwen/Qwen3.6-27B-FP8",
+  "served_model_name": "qwen3.6-27b-fp8",
+  "vllm_version": "RECORD-THE-MEASURED-VERSION (>= 0.19 required)",
+  "container": "PIN-THE-VERIFIED-TAG (never latest)",
+  "benchmark_label": "baseline",
+  "primary_score": {
+    "metric": "aggregate_output_tokens_per_s @ concurrency 16",
+    "value": null
+  },
+  "profile": {
+    "max_model_len": 65536,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 32768,
+    "gpu_memory_utilization": 0.8,
+    "kv_cache_dtype": "auto",
+    "prefix_caching": true,
+    "chunked_prefill": true,
+    "language_model_only": true,
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "qwen3_coder",
+    "speculative": {
+      "method": "qwen3_next_mtp",
+      "num_speculative_tokens": 2
+    }
+  }
+}

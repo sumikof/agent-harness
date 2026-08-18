@@ -101,6 +101,7 @@ class ParallelTaskScheduler:
             if not inflight:
                 break
 
+            self._emit_metrics(project_id, inflight)
             done, _ = await asyncio.wait(inflight.keys(), return_when=asyncio.FIRST_COMPLETED)
             for finished in done:
                 row = inflight.pop(finished)
@@ -131,6 +132,27 @@ class ParallelTaskScheduler:
         return SchedulerOutcome.REPLAN if replan_requested else SchedulerOutcome.DONE
 
     # ------------------------------------------------------------------
+
+    def _emit_metrics(self, project_id: int, inflight: dict) -> None:
+        """One observability snapshot per scheduling round (ledger event):
+        task/LLM concurrency, queue depths, prefix-affinity effectiveness."""
+        gate = self.task_runner.pools.llm
+        try:
+            self.events.emit(
+                EventType.METRICS_SNAPSHOT,
+                project_id=project_id,
+                payload={
+                    "tasks_in_flight": len(inflight),
+                    "task_keys": sorted(row["task_key"] for row in inflight.values()),
+                    "ready_queue_length": len(self._wait_rounds),
+                    "llm_in_flight": gate.in_flight,
+                    "llm_queue_depth": gate.queue_depth,
+                    "llm_dispatched_total": gate.dispatched_total,
+                    "llm_affinity_hits": gate.affinity_hits,
+                },
+            )
+        except Exception as exc:  # observability must never break scheduling
+            logger.debug("metrics snapshot failed: %s", exc)
 
     def _prioritize(self, runnable: list[sqlite3.Row]) -> list[sqlite3.Row]:
         """Dispatch order among dependency-satisfied tasks.
