@@ -41,9 +41,16 @@ class ProviderConfig(BaseModel):
 
 # Below this the context profile cannot hold a usable prompt at all.
 MIN_INPUT_HEADROOM_TOKENS = 1024
-# Room kept free for tool-loop growth per prompt: one MAX_TOOL_OUTPUT_CHARS
-# tool result (~7.5k tokens at 4 chars/token) plus the assistant turn.
-TOOL_LOOP_RESERVE_TOKENS = 8192
+# Rough chars-per-token for budget accounting (same convention as the
+# context builder and the runner's window fitting).
+CHARS_PER_TOKEN = 4
+# Hard cap on a single tool result handed back to the model. Authoritative
+# here because the prompt-budget reserve must account for it; the local
+# tool executor imports it.
+MAX_TOOL_OUTPUT_CHARS = 30000
+# Protocol overhead per turn (role tags, ids, JSON quoting) on top of the
+# two bounded components.
+TOOL_TURN_OVERHEAD_TOKENS = 512
 
 
 class SamplingConfig(BaseModel):
@@ -155,18 +162,32 @@ class InferenceConfig(BaseModel):
     def input_headroom(self) -> int:
         return self.max_model_len() - self.max_output_tokens
 
+    def tool_turn_reserve_tokens(self) -> int:
+        """Upper bound of ONE unelidable tool turn: the assistant's call
+        arguments (bounded by max_output_tokens — a write_file can spend
+        the whole reservation on the file body), plus one full tool result,
+        plus protocol overhead. BOTH bounded components count: reserving
+        only one of them leaves the worst-case second request over the
+        window with nothing elidable."""
+        return (
+            self.max_output_tokens
+            + MAX_TOOL_OUTPUT_CHARS // CHARS_PER_TOKEN
+            + TOOL_TURN_OVERHEAD_TOKENS
+        )
+
     def prompt_budget_tokens(self) -> int:
-        """Budget for the INITIAL prompt: the input budget minus room for at
-        least one tool turn (assistant message + one full tool result).
+        """Budget for the INITIAL prompt: the input budget minus room for
+        one whole tool turn.
 
         Building the first prompt right up to the input budget means the
         very first tool call pushes the history over it, and the only thing
-        left to elide is the result the model has not seen yet. The
-        reserve keeps one whole turn inside the budget so elision always
-        has an already-seen turn to take space from first.
-        """
+        left to elide is the turn the model has not seen yet. The reserve
+        keeps one full worst-case turn inside the budget so elision always
+        has an already-seen turn to take space from first. Capped at half
+        the budget so tight profiles stay usable (they trade the worst-case
+        guarantee for a workable prompt)."""
         effective = self.effective_input_budget()
-        return effective - min(TOOL_LOOP_RESERVE_TOKENS, effective // 4)
+        return effective - min(self.tool_turn_reserve_tokens(), effective // 2)
 
     def sampling_for_role(self, role: str) -> SamplingConfig:
         """The global profile with the role's EXPLICIT overrides applied.

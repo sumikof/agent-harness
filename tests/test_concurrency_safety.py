@@ -2022,3 +2022,79 @@ async def test_wrong_shape_sse_chunk_is_retried(tmp_path, monkeypatch):
     assert result.status == "COMPLETED"
     assert len(calls) == 3, (
         f"wrong-shape SSE chunks were not retried in-session (calls={len(calls)})")
+
+
+# -- round-14 findings -------------------------------------------------------
+
+
+def test_prompt_reserve_covers_the_whole_unelidable_turn():
+    """The final turn has TWO bounded, unelidable components: call
+    arguments (up to max_output_tokens — write_file spends the whole
+    reservation on the file body) and one tool result. Worst case
+    prompt + args + result + overhead must fit the effective budget."""
+    from harness.config import (
+        CHARS_PER_TOKEN,
+        MAX_TOOL_OUTPUT_CHARS,
+        TOOL_TURN_OVERHEAD_TOKENS,
+        InferenceConfig,
+    )
+
+    inference = InferenceConfig()          # defaults: 50k budget, 8192 output
+    worst_case = (
+        inference.prompt_budget_tokens()
+        + inference.max_output_tokens                       # call arguments
+        + MAX_TOOL_OUTPUT_CHARS // CHARS_PER_TOKEN          # tool result
+        + TOOL_TURN_OVERHEAD_TOKENS
+    )
+    assert worst_case <= inference.effective_input_budget(), (
+        f"worst-case second request ({worst_case} tokens) exceeds the "
+        f"effective input budget ({inference.effective_input_budget()})")
+    # tight profiles stay usable: the reserve is capped, never negative
+    tight = InferenceConfig(input_budget_tokens=4000)
+    assert tight.prompt_budget_tokens() >= tight.effective_input_budget() // 2
+
+
+async def test_wrong_shape_json_response_is_retried(tmp_path, monkeypatch):
+    """The non-streaming twin of the SSE shape validation: 200 + null / [] /
+    {"choices":[null]} must reach the in-session retry, not blow up as
+    AttributeError and discard the conversation."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    bodies = ["null", "[]", '{"choices": [null]}']
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) <= len(bodies):
+            return httpx.Response(
+                200, content=bodies[len(calls) - 1].encode(),
+                headers={"content-type": "application/json"})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant",
+            "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(transient_retries=4, transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED", (
+        f"wrong-shape 200 body aborted the session: {result.error}")
+    assert len(calls) == len(bodies) + 1

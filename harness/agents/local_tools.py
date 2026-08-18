@@ -23,6 +23,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Single source for the tool-result cap: the prompt-budget reserve in
+# config depends on it, so it lives there.
+from ..config import MAX_TOOL_OUTPUT_CHARS
 from ..concurrency import run_thread_uninterruptible
 from ..process import run_command
 from ..context.prefix import canonical_json, sha256_hex
@@ -278,7 +281,6 @@ def decide_local_tool_use(
 
 # -- execution --------------------------------------------------------------
 
-MAX_TOOL_OUTPUT_CHARS = 30000
 TRUNCATION_NOTICE = "\n... (output truncated)"
 
 

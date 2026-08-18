@@ -402,8 +402,26 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                         # it must reach the in-session retry below, not abort
                         # the session and discard the tool-loop history.
                         data = response.json()
-                        choice = (data.get("choices") or [{}])[0]
-                        message = dict(choice.get("message") or {})
+                        # Wrong-SHAPE 200 bodies (null, [], {"choices":[null]})
+                        # would raise AttributeError/IndexError below, which
+                        # the retry handler does not catch — same trust
+                        # failure as bad syntax, so reject them as ValueError.
+                        if not isinstance(data, dict):
+                            raise ValueError(
+                                f"response body is not an object: {body!r}")
+                        choices = data.get("choices") or [{}]
+                        if not isinstance(choices, list) or not choices:
+                            raise ValueError(
+                                f"response has no usable choices: {body!r}")
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            raise ValueError(
+                                f"response choice is not an object: {body!r}")
+                        raw_message = choice.get("message") or {}
+                        if not isinstance(raw_message, dict):
+                            raise ValueError(
+                                f"response message is not an object: {body!r}")
+                        message = dict(raw_message)
                         message["_usage"] = data.get("usage") or {}
             except (httpx.HTTPError, ValueError) as exc:
                 last_error = f"transport error: {type(exc).__name__}: {exc}"
