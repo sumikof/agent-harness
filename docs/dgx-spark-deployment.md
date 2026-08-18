@@ -75,6 +75,10 @@ inference:
 ```
 
 - LLM slotとビルド/テストslotは独立(Agentがツール実行中でも他AgentがGPUを使う)
+- `resource_pools.llm` と `inference.concurrency.max_requests` は**同一のgate**を指す。
+  両者が食い違う場合は小さい方が採用され、警告がログに出る
+- AgentRun上限への到達は**待機(backpressure)**であり失敗ではない。admission gateが
+  空きslotを待ってからdispatchする
 - `RUNNING AgentRun ≤ max_parallel_agent_runs(=max_parallel_tasks)` はDB検証+invariant
 - `同一Task Attemptのmutating Agent ≤ 1` はSQLite partial unique indexで強制
 

@@ -18,6 +18,7 @@ attempt based on the NEW integration HEAD.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -150,143 +151,158 @@ class TaskRunner:
         need_analysis = True
         env: TaskEnv | None = None
 
-        while True:
-            try:
-                if env is None:
-                    cycle = (self.tasks.get(task_id)["attempt_count"] or 0) + 1
-                    env = self._create_env(task_key, cycle)
-                # The attempt is opened BEFORE analysis so that an Analyst
-                # failure is recorded as a failed attempt and counts toward
-                # the retry limit — otherwise a failing analysis would loop
-                # outside every budget except wall clock.
-                attempt_id = self.tasks.start_attempt(
-                    task_id, env.git.head_commit(),
-                    worktree_path=str(env.handle.path), branch=env.handle.branch,
-                )
-                feedback.attempt_no = self.tasks.get(task_id)["attempt_count"]
-
-                if need_analysis:
-                    self.tasks.set_status(task_id, TaskState.ANALYZING, force=True)
-                    brief = await self._invoke(
-                        analyst.SPEC, project_id, project_ctx, env,
-                        task_ctx=task_ctx, attempt_ctx=feedback,
-                        task_id=task_id, attempt_id=attempt_id,
-                        artifact_path=self.artifacts.task_artifact_path(task_key, "task-brief.json"),
+        try:
+            while True:
+                try:
+                    if env is None:
+                        cycle = (self.tasks.get(task_id)["attempt_count"] or 0) + 1
+                        env = self._create_env(task_key, cycle)
+                    # The attempt is opened BEFORE analysis so that an Analyst
+                    # failure is recorded as a failed attempt and counts toward
+                    # the retry limit — otherwise a failing analysis would loop
+                    # outside every budget except wall clock.
+                    attempt_id = self.tasks.start_attempt(
+                        task_id, env.git.head_commit(),
+                        worktree_path=str(env.handle.path), branch=env.handle.branch,
                     )
-                    task_ctx.task_brief = brief.model_dump()
-                    task_ctx.relevant_files = list(brief.files)
-                    need_analysis = False
+                    feedback.attempt_no = self.tasks.get(task_id)["attempt_count"]
 
-                kind, payload = await self._run_attempt(
-                    project_id, task_id, task_key, attempt_id, project_ctx, task_ctx,
-                    feedback, env,
-                )
-            except BudgetExceeded as exc:
-                # A pause must leave no dangling worktree state. The diff is
-                # archived first so nothing is lost; the worktree is removed
-                # (other tasks' worktrees are untouched).
-                self._archive_and_dispose(env, task_key, "budget-paused")
-                env = None
-                self._finish_running_attempts(task_id)
-                if exc.scope == "task":
-                    self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
-                    self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
-                                     payload={"reason": str(exc)})
-                    return TaskOutcome.BLOCKED
-                raise  # project-scope budget: the Project Loop pauses the project
-            except AgentConfigurationError as exc:
-                # A provider/profile misconfiguration fails identically on
-                # every retry: block loudly instead of burning attempts.
-                logger.error("configuration error on %s: %s", task_key, exc)
-                self._archive_and_dispose(env, task_key, "config-error")
-                env = None
-                self._finish_running_attempts(task_id, AttemptState.FAILED)
-                self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
-                self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
-                                 payload={"reason": f"configuration error: {exc.detail}"})
-                return TaskOutcome.BLOCKED
-            except AgentRunFailed as exc:
-                logger.error("agent run failed on %s: %s", task_key, exc)
-                # The attempt opened above is closed as FAILED, so this
-                # failure counts toward consecutive_failures().
-                self._finish_running_attempts(task_id, AttemptState.FAILED)
-                self.tasks.set_status(task_id, TaskState.FAILED, force=True)
-                # Capture the half-done diff now: the Diagnostician needs it
-                # in its context, and the tree is reset before diagnosis.
-                feedback = AttemptContext(
-                    previous_attempt_summary=f"Previous attempt aborted: {exc.detail}",
-                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-aborted.diff"),
-                )
-                kind, payload = ("AGENT_FAILURE", None)
+                    if need_analysis:
+                        self.tasks.set_status(task_id, TaskState.ANALYZING, force=True)
+                        brief = await self._invoke(
+                            analyst.SPEC, project_id, project_ctx, env,
+                            task_ctx=task_ctx, attempt_ctx=feedback,
+                            task_id=task_id, attempt_id=attempt_id,
+                            artifact_path=self.artifacts.task_artifact_path(task_key, "task-brief.json"),
+                        )
+                        task_ctx.task_brief = brief.model_dump()
+                        task_ctx.relevant_files = list(brief.files)
+                        need_analysis = False
 
-            # ---- deterministic routing --------------------------------------
-            if kind == "PASS":
-                outcome, conflict_feedback = await self._complete_and_integrate(
-                    project_id, task_id, task_key, attempt_id, task_row, env, payload
-                )
-                if outcome is not None:
-                    self._dispose_env(env)
+                    kind, payload = await self._run_attempt(
+                        project_id, task_id, task_key, attempt_id, project_ctx, task_ctx,
+                        feedback, env,
+                    )
+                except BudgetExceeded as exc:
+                    # A pause must leave no dangling worktree state. The diff is
+                    # archived first so nothing is lost; the worktree is removed
+                    # (other tasks' worktrees are untouched).
+                    self._archive_and_dispose(env, task_key, "budget-paused")
                     env = None
-                    return outcome
-                # Integration conflict: fresh repair attempt on the NEW
-                # integration HEAD. The old worktree is already archived
-                # and removed by _complete_and_integrate.
-                env = None
-                integration_repairs += 1
-                if integration_repairs > self.config.limits.max_integration_repairs:
+                    self._finish_running_attempts(task_id)
+                    if exc.scope == "task":
+                        self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
+                        self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
+                                         payload={"reason": str(exc)})
+                        return TaskOutcome.BLOCKED
+                    raise  # project-scope budget: the Project Loop pauses the project
+                except AgentConfigurationError as exc:
+                    # A provider/profile misconfiguration fails identically on
+                    # every retry: block loudly instead of burning attempts.
+                    logger.error("configuration error on %s: %s", task_key, exc)
+                    self._archive_and_dispose(env, task_key, "config-error")
+                    env = None
+                    self._finish_running_attempts(task_id, AttemptState.FAILED)
                     self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
                     self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
-                                     payload={"reason": "max integration repairs exceeded"})
+                                     payload={"reason": f"configuration error: {exc.detail}"})
                     return TaskOutcome.BLOCKED
-                feedback = conflict_feedback
-                continue
+                except AgentRunFailed as exc:
+                    logger.error("agent run failed on %s: %s", task_key, exc)
+                    # The attempt opened above is closed as FAILED, so this
+                    # failure counts toward consecutive_failures().
+                    self._finish_running_attempts(task_id, AttemptState.FAILED)
+                    self.tasks.set_status(task_id, TaskState.FAILED, force=True)
+                    # Capture the half-done diff now: the Diagnostician needs it
+                    # in its context, and the tree is reset before diagnosis.
+                    feedback = AttemptContext(
+                        previous_attempt_summary=f"Previous attempt aborted: {exc.detail}",
+                        current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-aborted.diff"),
+                    )
+                    kind, payload = ("AGENT_FAILURE", None)
 
-            if kind == "REPLAN":
-                self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
-                self._archive_and_dispose(env, task_key, f"a{attempt_id}-replan")
-                env = None
-                self.tasks.set_status(task_id, TaskState.PENDING, force=True)
-                self.events.emit("REVIEW_REPLAN", project_id=project_id, task_id=task_id,
-                                 attempt_id=attempt_id,
-                                 payload={"reason": payload.replan_reason if payload else ""})
-                return TaskOutcome.REPLAN
+                # ---- deterministic routing --------------------------------------
+                if kind == "PASS":
+                    outcome, conflict_feedback = await self._complete_and_integrate(
+                        project_id, task_id, task_key, attempt_id, task_row, env, payload
+                    )
+                    if outcome is not None:
+                        self._dispose_env(env)
+                        env = None
+                        return outcome
+                    # Integration conflict: fresh repair attempt on the NEW
+                    # integration HEAD. The old worktree is already archived
+                    # and removed by _complete_and_integrate.
+                    env = None
+                    integration_repairs += 1
+                    if integration_repairs > self.config.limits.max_integration_repairs:
+                        self.tasks.set_status(task_id, TaskState.BLOCKED, force=True)
+                        self.events.emit("TASK_BLOCKED", project_id=project_id, task_id=task_id,
+                                         payload={"reason": "max integration repairs exceeded"})
+                        return TaskOutcome.BLOCKED
+                    feedback = conflict_feedback
+                    continue
 
-            if kind == "VERIFY_FAIL":
-                self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
-                self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
-                feedback = AttemptContext(
-                    verification_failure=payload.model_dump(),
-                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-verify-fail.diff"),
+                if kind == "REPLAN":
+                    self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
+                    self._archive_and_dispose(env, task_key, f"a{attempt_id}-replan")
+                    env = None
+                    self.tasks.set_status(task_id, TaskState.PENDING, force=True)
+                    self.events.emit("REVIEW_REPLAN", project_id=project_id, task_id=task_id,
+                                     attempt_id=attempt_id,
+                                     payload={"reason": payload.replan_reason if payload else ""})
+                    return TaskOutcome.REPLAN
+
+                if kind == "VERIFY_FAIL":
+                    self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
+                    self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
+                    feedback = AttemptContext(
+                        verification_failure=payload.model_dump(),
+                        current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-verify-fail.diff"),
+                    )
+                elif kind == "REPAIR":
+                    self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
+                    self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
+                    feedback = AttemptContext(
+                        review_feedback=payload.model_dump(),
+                        current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-repair.diff"),
+                    )
+                # AGENT_FAILURE: feedback already set above
+
+                # ---- retry budget ----------------------------------------------
+                failures = self.tasks.consecutive_failures(task_id)
+                if failures < self.config.limits.max_attempts:
+                    # Fresh Developer attempt with Attempt Context; the SAME
+                    # worktree is kept — the repair continues on the dirty state
+                    # the previous roles produced.
+                    continue
+
+                diagnosis_rounds += 1
+                outcome = await self._diagnose(
+                    project_id, task_id, task_key, attempt_id,
+                    project_ctx, task_ctx, feedback, diagnosis_rounds, env,
                 )
-            elif kind == "REPAIR":
-                self.tasks.finish_attempt(attempt_id, AttemptState.FAILED)
-                self.tasks.set_status(task_id, TaskState.REPAIR_REQUIRED, force=True)
-                feedback = AttemptContext(
-                    review_feedback=payload.model_dump(),
-                    current_diff=self._bounded_diff(env, f"{task_key}-a{attempt_id}-repair.diff"),
-                )
-            # AGENT_FAILURE: feedback already set above
-
-            # ---- retry budget ----------------------------------------------
-            failures = self.tasks.consecutive_failures(task_id)
-            if failures < self.config.limits.max_attempts:
-                # Fresh Developer attempt with Attempt Context; the SAME
-                # worktree is kept — the repair continues on the dirty state
-                # the previous roles produced.
-                continue
-
-            diagnosis_rounds += 1
-            outcome = await self._diagnose(
-                project_id, task_id, task_key, attempt_id,
-                project_ctx, task_ctx, feedback, diagnosis_rounds, env,
-            )
-            env = None  # diagnosis always archives + disposes the worktree
-            if outcome is not None:
-                return outcome
-            # RETRY: clean slate, re-analyze in a fresh worktree
-            feedback_diag = feedback.diagnosis or {}
-            feedback = AttemptContext(diagnosis=feedback_diag)
-            need_analysis = True
+                env = None  # diagnosis always archives + disposes the worktree
+                if outcome is not None:
+                    return outcome
+                # RETRY: clean slate, re-analyze in a fresh worktree
+                feedback_diag = feedback.diagnosis or {}
+                feedback = AttemptContext(diagnosis=feedback_diag)
+                need_analysis = True
+        except BaseException as exc:
+            # Last line of defense. Every expected outcome is settled
+            # inside the loop; anything else (cancellation, an
+            # unexpected bug) must still not leave a live worktree or a
+            # RUNNING attempt behind for other tasks to trip over. The
+            # dirty diff is archived before the worktree goes away, and
+            # cleanup failures never mask the original error.
+            logger.error("task %s aborted: %s: %s", task_key,
+                         type(exc).__name__, exc)
+            with contextlib.suppress(Exception):
+                self._archive_and_dispose(env, task_key, "aborted")
+            with contextlib.suppress(Exception):
+                self._finish_running_attempts(task_id)
+            raise
 
     # ------------------------------------------------------------------
 

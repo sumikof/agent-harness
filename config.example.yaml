@@ -47,7 +47,10 @@ inference:
   #   reviewer:
   #     temperature: 0.2
   concurrency:
-    max_requests: 16       # process-wide LLM request semaphore (= vLLM max-num-seqs baseline)
+    # In-flight LLM request cap. Shares one gate with
+    # parallelism.resource_pools.llm below; the SMALLER of the two wins and
+    # a mismatch is logged. Keep it aligned with the server's --max-num-seqs.
+    max_requests: 16
   streaming: false         # internal agents don't need token streaming
   request_timeout_seconds: 600
   transient_retries: 4     # in-session retry of 429/5xx/transport failures
@@ -56,7 +59,7 @@ parallelism:
   max_parallel_tasks: 16
   # max_parallel_agent_runs: 16   # defaults to max_parallel_tasks
   resource_pools:
-    llm: 16
+    llm: 16                # same gate as inference.concurrency.max_requests
     heavy_build: 2
     heavy_test: 2
     git_integration: 1     # integration is strictly serialized; keep at 1

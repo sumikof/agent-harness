@@ -335,12 +335,20 @@ class ClaudeAgentRunner(BaseAgentRunner):
         return result
 
 
-def create_runner(provider_type: str, inference=None) -> AgentRunner:
+def create_runner(provider_type: str, inference=None, llm_gate=None) -> AgentRunner:
+    """Build the runner for a provider.
+
+    `llm_gate` is the harness's configured LLM pool (ResourcePools.llm).
+    Passing it is what makes `parallelism.resource_pools.llm` and the
+    scheduler's gate metrics describe the SAME gate the requests pass
+    through; without it a standalone runner falls back to its own
+    process-wide gate sized from `inference.concurrency.max_requests`.
+    """
     if provider_type == "claude":
         return ClaudeAgentRunner()
     if provider_type in ("openai-compatible", "openai_compatible", "vllm"):
         from ..config import InferenceConfig
         from .openai_compat import LocalOpenAICompatibleAgentRunner
 
-        return LocalOpenAICompatibleAgentRunner(inference or InferenceConfig())
+        return LocalOpenAICompatibleAgentRunner(inference or InferenceConfig(), llm_gate)
     raise ValueError(f"unknown agent provider: {provider_type}")

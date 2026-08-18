@@ -27,9 +27,12 @@ from __future__ import annotations
 import asyncio
 import collections
 import itertools
+import logging
 from dataclasses import dataclass
 
 from ..config import ParallelismConfig
+
+logger = logging.getLogger(__name__)
 
 
 class PrefixAffinityGate:
@@ -134,9 +137,22 @@ class PrefixAffinityGate:
 class ResourcePools:
     """Named concurrency limits shared by every task coroutine."""
 
-    def __init__(self, config: ParallelismConfig):
+    def __init__(self, config: ParallelismConfig, llm_max_requests: int | None = None):
         pools = config.resource_pools
-        self.llm = PrefixAffinityGate(pools.llm, config.starvation_rounds)
+        # ONE authoritative in-flight LLM cap. Two settings describe it
+        # (`parallelism.resource_pools.llm` and
+        # `inference.concurrency.max_requests`); the smaller wins so neither
+        # configured ceiling can be exceeded, and a mismatch is reported
+        # rather than silently resolved.
+        llm_slots = pools.llm
+        if llm_max_requests is not None and llm_max_requests != llm_slots:
+            llm_slots = min(llm_slots, llm_max_requests)
+            logger.warning(
+                "parallelism.resource_pools.llm=%d and inference.concurrency.max_requests=%d "
+                "disagree; using %d as the single in-flight LLM cap",
+                pools.llm, llm_max_requests, llm_slots,
+            )
+        self.llm = PrefixAffinityGate(llm_slots, config.starvation_rounds)
         self.heavy_build = asyncio.Semaphore(pools.heavy_build)
         self.heavy_test = asyncio.Semaphore(pools.heavy_test)
         # Serialized integration is a hard invariant: max_git_integrations

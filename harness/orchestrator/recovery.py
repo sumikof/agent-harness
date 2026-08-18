@@ -361,9 +361,17 @@ class RecoveryManager:
                        attempt["id"], worktree_path)
 
     def _recover_orphan_worktrees(self, project_id: int) -> bool:
-        """Registered worktrees no RUNNING attempt references are crash
+        """HARNESS-OWNED worktrees no RUNNING attempt references are crash
         leftovers (their attempt settled in an earlier partial recovery):
-        archive whatever they hold and remove them."""
+        archive whatever they hold and remove them.
+
+        Scope is deliberately narrow. A repository may carry worktrees the
+        harness never created — the operator's own checkouts — and those are
+        not recovery's to destroy: force-removing one and `branch -D`-ing its
+        branch can drop the only reference to unmerged commits. Only
+        worktrees under this manager's root, on a branch under the harness
+        branch prefix, are treated as orphans.
+        """
         if self.worktrees is None or not self.git.is_repo():
             return False
         referenced = {
@@ -372,8 +380,21 @@ class RecoveryManager:
             if a["worktree_path"]
         }
         acted = False
-        for path in self.worktrees.registered_paths():
+        for path in self.worktrees.managed_paths():
             if str(path.resolve()) in referenced:
+                continue
+            checked_out = None
+            if path.is_dir():
+                candidate = GitRepository(path)
+                if candidate.is_repo():
+                    checked_out = candidate.current_branch()
+            # A worktree inside our root but on a foreign branch is not ours
+            # to remove — leave it and let the operator decide.
+            if checked_out is not None and not self.worktrees.owns_branch(checked_out):
+                logger.warning(
+                    "recovery: leaving worktree %s alone; branch '%s' is not a "
+                    "harness task branch", path, checked_out,
+                )
                 continue
             repo = GitRepository(path)
             try:
@@ -390,9 +411,10 @@ class RecoveryManager:
                 raise RecoveryIntegrityError(
                     f"could not archive orphan worktree {path} before removal: {exc}"
                 )
-            branch = repo.current_branch() if path.is_dir() and repo.is_repo() else None
-            self.worktrees.remove_path(path, branch=branch if branch != "DETACHED" else None)
-            logger.warning("recovery: removed orphan worktree %s", path)
+            # Only a harness task branch is ever deleted along with the tree.
+            branch = checked_out if self.worktrees.owns_branch(checked_out) else None
+            self.worktrees.remove_path(path, branch=branch)
+            logger.warning("recovery: removed orphan worktree %s (branch %s)", path, branch)
             acted = True
         return acted
 

@@ -20,7 +20,9 @@ so crash recovery can reconcile by trailer instead of merging twice.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -61,6 +63,11 @@ class IntegrationManager:
         self.operations = operations
         self.integration_branch = integration_branch
         self._lock = asyncio.Lock()            # max_git_integrations = 1, enforced
+        # Held by the WORKER THREAD for the whole git-mutating section.
+        # Cancelling an awaiter cannot stop a thread that is already inside
+        # `git merge`, so mutual exclusion has to bind to the thread doing
+        # the work, not to the coroutine waiting for it.
+        self._merge_lock = threading.Lock()
         # Like CheckpointManager: the successful merge's operation result is
         # recorded by the CALLER in the same transaction as the task-state
         # updates, so the journal and the task state settle atomically.
@@ -84,12 +91,45 @@ class IntegrationManager:
         async with self._lock:
             # The merge itself is subprocess work; run off the event loop so
             # parallel tasks keep their agents moving meanwhile.
-            return await asyncio.to_thread(
+            worker = asyncio.ensure_future(asyncio.to_thread(
                 self._integrate_sync, task_key, task_commit, title,
                 project_id, task_id, attempt_id,
-            )
+            ))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Cancelling this coroutine does NOT stop the worker thread:
+                # `git merge` may still be mutating the integration checkout.
+                # Releasing `_lock` now would let a second integration overlap
+                # a live merge, so wait for the worker to settle first. The
+                # result is then discarded by design — the intent stays
+                # PENDING and startup recovery reconciles it by trailer.
+                logger.warning(
+                    "integration of %s cancelled; waiting for the merge thread to settle",
+                    task_key,
+                )
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait({worker})
+                raise
 
     def _integrate_sync(
+        self,
+        task_key: str,
+        task_commit: str,
+        title: str,
+        project_id: int | None,
+        task_id: int | None,
+        attempt_id: int | None,
+    ) -> IntegrationOutcome:
+        # Second line of defense: even if an awaiter is cancelled and its
+        # `async with self._lock` unwinds early, no other worker thread can
+        # enter the git-mutating section while this one is inside it.
+        with self._merge_lock:
+            return self._merge_locked(
+                task_key, task_commit, title, project_id, task_id, attempt_id
+            )
+
+    def _merge_locked(
         self,
         task_key: str,
         task_commit: str,

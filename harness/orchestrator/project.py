@@ -82,7 +82,9 @@ class ProjectOrchestrator:
         self.integration = IntegrationManager(
             self.git, self.operations, integration_branch=config.project.base_branch
         )
-        self.pools = ResourcePools(config.parallelism)
+        self.pools = ResourcePools(
+            config.parallelism, config.inference.concurrency.max_requests
+        )
         # Final verification runs against the integration checkout.
         self.verifier = VerificationRunner(
             config.verification, config.repository_path, config.logs_path / "verification"
@@ -93,7 +95,7 @@ class ProjectOrchestrator:
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(
             config, self.context_builder, self.artifacts, self.runs, self.events,
-            self.budget, self.operations, self.git,
+            self.budget, self.operations, self.git, llm_gate=self.pools.llm,
         )
         self.task_runner = TaskRunner(
             config, self.invoker, self.tasks, self.runs, self.events,

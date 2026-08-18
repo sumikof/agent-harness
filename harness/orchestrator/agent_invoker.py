@@ -106,6 +106,7 @@ class AgentInvoker:
         budget: BudgetManager,
         operations: Optional[OperationRepository] = None,
         git: Optional[GitRepository] = None,
+        llm_gate=None,
     ):
         self.config = config
         self.context_builder = context_builder
@@ -115,8 +116,29 @@ class AgentInvoker:
         self.budget = budget
         self.operations = operations
         self.git = git
+        # The configured LLM pool (ResourcePools.llm). Passed to every local
+        # provider so `parallelism.resource_pools.llm` and the scheduler's
+        # metrics observe the SAME gate the requests actually go through.
+        self.llm_gate = llm_gate
+        self._admission: Optional[asyncio.Semaphore] = None
+        self._admission_loop = None
 
     # ------------------------------------------------------------------
+
+    def _admission_gate(self) -> asyncio.Semaphore:
+        """Waitable admission control for concurrent AgentRuns.
+
+        Reaching `max_parallel_agent_runs` is ordinary contention — the
+        dispatch queues here instead of raising. Bound lazily to the running
+        loop so one invoker can serve sequential event loops.
+        """
+        loop = asyncio.get_running_loop()
+        if self._admission is None or self._admission_loop is not loop:
+            self._admission = asyncio.Semaphore(
+                self.config.parallelism.agent_run_limit()
+            )
+            self._admission_loop = loop
+        return self._admission
 
     def build_profile(self, spec: RoleSpec) -> AgentProfile:
         provider_type, model = self.config.provider.for_role(spec.role.value)
@@ -166,7 +188,7 @@ class AgentInvoker:
             self.budget.check_task(task_id)
 
         profile = self.build_profile(spec)
-        runner = create_runner(profile.provider, self.config.inference)
+        runner = create_runner(profile.provider, self.config.inference, self.llm_gate)
 
         # Capability validation happens BEFORE anything is dispatched. A
         # provider missing a required capability is a configuration error,
@@ -399,187 +421,195 @@ class AgentInvoker:
             )
             resolved: ResolvedAgentRunSpec = await runner.resolve(request)
 
-            # 3. One WRITE-LOCKED transaction: concurrency checks + run row +
-            #    resolved spec + dispatch intent. Two invariants are checked:
-            #      - RUNNING AgentRun count <= configured max_parallel_agent_runs
-            #      - at most ONE RUNNING mutating agent per task attempt
-            #        (also DB-enforced by a partial unique index)
-            #    Durable COMMIT happens before the side effect (dispatch).
-            db = self.runs.db
-            with db.transaction(immediate=True):
-                running = self.runs.running_runs()
-                limit = self.config.parallelism.agent_run_limit()
-                if len(running) >= limit:
-                    raise ConcurrentRunError(
-                        f"{len(running)} agent runs already RUNNING (limit {limit}); "
-                        "refusing to dispatch"
-                    )
-                if spec.mutates_repo and attempt_id is not None:
-                    conflicting = self.runs.running_mutating_for_attempt(attempt_id)
-                    if conflicting:
+            # Admission control: a dispatch waits for a free AgentRun slot
+            # instead of failing. Normal contention at the configured limit
+            # is backpressure, not an error — the DB checks inside stay as
+            # invariant guards for state that should now be unreachable.
+            async with self._admission_gate():
+                # 3. One WRITE-LOCKED transaction: concurrency checks + run row +
+                #    resolved spec + dispatch intent. Two invariants are checked:
+                #      - RUNNING AgentRun count <= configured max_parallel_agent_runs
+                #      - at most ONE RUNNING mutating agent per task attempt
+                #        (also DB-enforced by a partial unique index)
+                #    Durable COMMIT happens before the side effect (dispatch).
+                db = self.runs.db
+                with db.transaction(immediate=True):
+                    running = self.runs.running_runs()
+                    limit = self.config.parallelism.agent_run_limit()
+                    if len(running) >= limit:
+                        # Unreachable while admission control holds: this is
+                        # an invariant guard against state the harness did
+                        # not create (e.g. an externally modified database).
                         raise ConcurrentRunError(
-                            f"mutating agent run(s) {[r['id'] for r in conflicting]} still "
-                            f"RUNNING for attempt {attempt_id}; one worktree, one writer"
+                            f"{len(running)} agent runs already RUNNING (limit {limit}) "
+                            "despite holding an admission slot; refusing to dispatch"
                         )
-                try:
-                    run_id = self.runs.start_run(
-                        project_id,
-                        spec.role.value,
-                        attempt_id,
-                        provider=resolved.provider,
-                        model=resolved.model,
-                        profile_hash=resolved.profile_hash,
-                        profile_version=resolved.profile_version,
-                        context_manifest_path=resolved.context_manifest_path,
-                        context_manifest_hash=resolved.context_manifest_hash,
-                        resolved_spec=resolved.persistable_dump(),
-                        mutating=spec.mutates_repo,
-                        prefix_group_key=prefix_group_key,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # The partial unique index caught a concurrent mutating
-                    # RUNNING row for this attempt from another process.
-                    raise ConcurrentRunError(
-                        f"another mutating agent run became RUNNING concurrently: {exc}"
-                    )
-                dispatch_op_id = None
-                if self.operations:
-                    base_diff_hash = None
-                    if spec.mutates_repo and git is not None:
-                        try:
-                            base_diff_hash = git.dirty_state_hash()
-                        except Exception as exc:
-                            logger.warning("could not hash pre-dispatch state: %s", exc)
-                    dispatch_op_id = self.operations.record_intent(
-                        OperationType.AGENT_DISPATCH,
-                        {
-                            "role": spec.role.value,
-                            "provider": resolved.provider,
-                            "model": resolved.model,
-                            "technical_attempt": attempt,
-                            "run_id": run_id,
-                            # Recovery may only reset a diff whose hash it
-                            # has durably recorded.
-                            "base_diff_sha256": base_diff_hash,
-                        },
+                    if spec.mutates_repo and attempt_id is not None:
+                        conflicting = self.runs.running_mutating_for_attempt(attempt_id)
+                        if conflicting:
+                            raise ConcurrentRunError(
+                                f"mutating agent run(s) {[r['id'] for r in conflicting]} still "
+                                f"RUNNING for attempt {attempt_id}; one worktree, one writer"
+                            )
+                    try:
+                        run_id = self.runs.start_run(
+                            project_id,
+                            spec.role.value,
+                            attempt_id,
+                            provider=resolved.provider,
+                            model=resolved.model,
+                            profile_hash=resolved.profile_hash,
+                            profile_version=resolved.profile_version,
+                            context_manifest_path=resolved.context_manifest_path,
+                            context_manifest_hash=resolved.context_manifest_hash,
+                            resolved_spec=resolved.persistable_dump(),
+                            mutating=spec.mutates_repo,
+                            prefix_group_key=prefix_group_key,
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        # The partial unique index caught a concurrent mutating
+                        # RUNNING row for this attempt from another process.
+                        raise ConcurrentRunError(
+                            f"another mutating agent run became RUNNING concurrently: {exc}"
+                        )
+                    dispatch_op_id = None
+                    if self.operations:
+                        base_diff_hash = None
+                        if spec.mutates_repo and git is not None:
+                            try:
+                                base_diff_hash = git.dirty_state_hash()
+                            except Exception as exc:
+                                logger.warning("could not hash pre-dispatch state: %s", exc)
+                        dispatch_op_id = self.operations.record_intent(
+                            OperationType.AGENT_DISPATCH,
+                            {
+                                "role": spec.role.value,
+                                "provider": resolved.provider,
+                                "model": resolved.model,
+                                "technical_attempt": attempt,
+                                "run_id": run_id,
+                                # Recovery may only reset a diff whose hash it
+                                # has durably recorded.
+                                "base_diff_sha256": base_diff_hash,
+                            },
+                            project_id=project_id,
+                            task_id=task_id,
+                            attempt_id=attempt_id,
+                            agent_run_id=run_id,
+                        )
+                        db.execute(
+                            "UPDATE agent_runs SET dispatch_operation_id = ? WHERE id = ?",
+                            (dispatch_op_id, run_id),
+                        )
+                    self.events.emit(
+                        EventType.AGENT_STARTED,
                         project_id=project_id,
                         task_id=task_id,
                         attempt_id=attempt_id,
                         agent_run_id=run_id,
+                        operation_id=dispatch_op_id,
+                        payload={"role": spec.role.value, "run_id": run_id,
+                                 "technical_attempt": attempt},
                     )
-                    db.execute(
-                        "UPDATE agent_runs SET dispatch_operation_id = ? WHERE id = ?",
-                        (dispatch_op_id, run_id),
+
+                # 4. Side effect: the actual agent session.
+                result = await runner.run(resolved)
+
+                # A run that tripped the repeat-action guard is never adopted as
+                # a success: its output came from a session stuck in a loop.
+                if result.loop_detected and result.status == "COMPLETED":
+                    result.status = "FAILED"
+                    result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
+                # Per-run budget: the SDK offers no mid-run cost cutoff, so the
+                # cap is applied to the run's EFFECTIVE status before anything is
+                # recorded — run row, operation result and events then agree.
+                cap = self.config.budget.agent_run_usd
+                cap_exceeded = result.cost_usd > cap
+                if cap_exceeded and result.status == "COMPLETED":
+                    result.status = "FAILED"
+                    result.error = f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}"
+
+                # 5. Result — run row, operation result, billing and every event
+                #    land in ONE transaction, so a crash right after the provider
+                #    returned cannot leave a COMPLETED run with a dangling
+                #    PENDING dispatch or unrecorded cost.
+                with db.transaction():
+                    self.runs.finish_run(
+                        run_id,
+                        status=result.status,
+                        session_id=result.session_id,
+                        output_artifact=spec.output_artifact,
+                        token_usage=result.token_usage,
+                        cost_usd=result.cost_usd,
+                        error=result.error,
                     )
-                self.events.emit(
-                    EventType.AGENT_STARTED,
-                    project_id=project_id,
-                    task_id=task_id,
-                    attempt_id=attempt_id,
-                    agent_run_id=run_id,
-                    operation_id=dispatch_op_id,
-                    payload={"role": spec.role.value, "run_id": run_id,
-                             "technical_attempt": attempt},
-                )
-
-            # 4. Side effect: the actual agent session.
-            result = await runner.run(resolved)
-
-            # A run that tripped the repeat-action guard is never adopted as
-            # a success: its output came from a session stuck in a loop.
-            if result.loop_detected and result.status == "COMPLETED":
-                result.status = "FAILED"
-                result.error = "LOOP_DETECTED: identical tool call repeated beyond abort threshold"
-            # Per-run budget: the SDK offers no mid-run cost cutoff, so the
-            # cap is applied to the run's EFFECTIVE status before anything is
-            # recorded — run row, operation result and events then agree.
-            cap = self.config.budget.agent_run_usd
-            cap_exceeded = result.cost_usd > cap
-            if cap_exceeded and result.status == "COMPLETED":
-                result.status = "FAILED"
-                result.error = f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}"
-
-            # 5. Result — run row, operation result, billing and every event
-            #    land in ONE transaction, so a crash right after the provider
-            #    returned cannot leave a COMPLETED run with a dangling
-            #    PENDING dispatch or unrecorded cost.
-            with db.transaction():
-                self.runs.finish_run(
-                    run_id,
-                    status=result.status,
-                    session_id=result.session_id,
-                    output_artifact=spec.output_artifact,
-                    token_usage=result.token_usage,
-                    cost_usd=result.cost_usd,
-                    error=result.error,
-                )
-                if self.operations and dispatch_op_id:
-                    self.operations.record_result(
-                        dispatch_op_id,
-                        OperationStatus.COMPLETED
-                        if result.status == "COMPLETED"
-                        else OperationStatus.FAILED,
-                        {"status": result.status, "error": result.error,
-                         "cost_usd": result.cost_usd},
-                    )
-                self.budget.record_cost(project_id, task_id, result.cost_usd)
-                for warning in result.loop_warnings:
+                    if self.operations and dispatch_op_id:
+                        self.operations.record_result(
+                            dispatch_op_id,
+                            OperationStatus.COMPLETED
+                            if result.status == "COMPLETED"
+                            else OperationStatus.FAILED,
+                            {"status": result.status, "error": result.error,
+                             "cost_usd": result.cost_usd},
+                        )
+                    self.budget.record_cost(project_id, task_id, result.cost_usd)
+                    for warning in result.loop_warnings:
+                        self.events.emit(
+                            EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                        )
+                    if result.loop_detected:
+                        # The guard only flags; the Orchestrator owns the
+                        # transition: the run fails the attempt (reasoning-retry
+                        # path — fresh session, possibly diagnosis), never a
+                        # provider retry of the same context.
+                        self.events.emit(
+                            EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id,
+                            payload={"role": spec.role.value, "run_id": run_id},
+                        )
+                    if result.telemetry:
+                        self.events.emit(
+                            EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
+                            attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                        )
                     self.events.emit(
-                        EventType.LOOP_WARNING, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id, payload={"warning": warning},
+                        EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
+                        project_id=project_id,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        agent_run_id=run_id,
+                        payload={
+                            "role": spec.role.value,
+                            "run_id": run_id,
+                            "cost_usd": result.cost_usd,
+                            "turns": result.num_turns,
+                            "error": result.error,
+                            "failure_kind": result.failure_kind.value if result.failure_kind else None,
+                        },
                     )
+                # An over-budget run fails the attempt (normal retry/diagnosis
+                # path) instead of being retried — failed runs included, so a
+                # high-cost failure is never blindly redispatched. Only the raise
+                # lives outside the transaction; the state was recorded above.
+                if cap_exceeded:
+                    raise AgentRunFailed(
+                        spec.role.value,
+                        f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
+                    )
+                if result.status == "COMPLETED":
+                    return result, run_id
                 if result.loop_detected:
-                    # The guard only flags; the Orchestrator owns the
-                    # transition: the run fails the attempt (reasoning-retry
-                    # path — fresh session, possibly diagnosis), never a
-                    # provider retry of the same context.
-                    self.events.emit(
-                        EventType.LOOP_DETECTED, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id,
-                        payload={"role": spec.role.value, "run_id": run_id},
+                    raise AgentRunFailed(
+                        spec.role.value,
+                        "loop detected (repeated identical tool call) — aborting for a fresh attempt",
                     )
-                if result.telemetry:
-                    self.events.emit(
-                        EventType.PROVIDER_TELEMETRY, project_id=project_id, task_id=task_id,
-                        attempt_id=attempt_id, agent_run_id=run_id, payload=result.telemetry,
+                # Permanent failures (auth, config, missing model) fail
+                # identically on retry — surface immediately instead.
+                if result.failure_kind == FailureKind.PERMANENT:
+                    raise AgentRunFailed(
+                        spec.role.value, f"permanent provider failure: {result.error}"
                     )
-                self.events.emit(
-                    EventType.AGENT_COMPLETED if result.status == "COMPLETED" else EventType.AGENT_FAILED,
-                    project_id=project_id,
-                    task_id=task_id,
-                    attempt_id=attempt_id,
-                    agent_run_id=run_id,
-                    payload={
-                        "role": spec.role.value,
-                        "run_id": run_id,
-                        "cost_usd": result.cost_usd,
-                        "turns": result.num_turns,
-                        "error": result.error,
-                        "failure_kind": result.failure_kind.value if result.failure_kind else None,
-                    },
-                )
-            # An over-budget run fails the attempt (normal retry/diagnosis
-            # path) instead of being retried — failed runs included, so a
-            # high-cost failure is never blindly redispatched. Only the raise
-            # lives outside the transaction; the state was recorded above.
-            if cap_exceeded:
-                raise AgentRunFailed(
-                    spec.role.value,
-                    f"run cost ${result.cost_usd:.2f} exceeded agent_run_usd cap ${cap:.2f}",
-                )
-            if result.status == "COMPLETED":
-                return result, run_id
-            if result.loop_detected:
-                raise AgentRunFailed(
-                    spec.role.value,
-                    "loop detected (repeated identical tool call) — aborting for a fresh attempt",
-                )
-            # Permanent failures (auth, config, missing model) fail
-            # identically on retry — surface immediately instead.
-            if result.failure_kind == FailureKind.PERMANENT:
-                raise AgentRunFailed(
-                    spec.role.value, f"permanent provider failure: {result.error}"
-                )
             if attempt < TECHNICAL_RETRIES:
                 # A mutating role may have half-edited the tree before the
                 # transient failure; redispatching on top of that would run

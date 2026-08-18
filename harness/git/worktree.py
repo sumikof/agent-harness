@@ -92,3 +92,31 @@ class WorktreeManager:
 
     def registered_paths(self) -> list[Path]:
         return [Path(p) for p in self.main.list_worktrees()]
+
+    def owns(self, path: str | Path, branch: str | None = None) -> bool:
+        """True only for worktrees this manager created.
+
+        A repository may legitimately carry worktrees the harness knows
+        nothing about (the operator's own checkouts). Recovery must never
+        force-remove those or `branch -D` their branch — which, for a clean
+        branch holding unmerged commits, would drop its only reference. A
+        worktree counts as harness-owned only when it lives under the
+        configured worktrees root AND (when a branch is given) sits on a
+        branch under the harness branch prefix.
+        """
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        if not resolved.is_relative_to(self.root.resolve()):
+            return False
+        if branch is not None and not self.owns_branch(branch):
+            return False
+        return True
+
+    def owns_branch(self, branch: str | None) -> bool:
+        return bool(branch) and branch.startswith(f"{self.branch_prefix}/")
+
+    def managed_paths(self) -> list[Path]:
+        """Registered worktrees located under this manager's root."""
+        return [path for path in self.registered_paths() if self.owns(path)]

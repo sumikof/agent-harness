@@ -101,7 +101,7 @@ def config(tmp_path) -> HarnessConfig:
 
 
 def install_fake(monkeypatch, fake: FakeRunner) -> None:
-    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider, inference=None: fake)
+    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider, inference=None, llm_gate=None: fake)
 
 
 def test_ensure_project_identity_rules(config, tmp_path):
@@ -516,7 +516,7 @@ async def test_failed_run_cost_still_hits_run_cap(config, monkeypatch):
             return AgentResult(status="FAILED", error="boom", cost_usd=5.0)
 
     monkeypatch.setattr(agent_invoker_module, "create_runner",
-                        lambda provider, inference=None: ExpensiveFailingRunner())
+                        lambda provider, inference=None, llm_gate=None: ExpensiveFailingRunner())
 
     state = await orchestrator.run()
 
