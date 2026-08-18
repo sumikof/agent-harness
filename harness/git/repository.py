@@ -489,8 +489,13 @@ class GitRepository:
         return self.head_commit() or ""
 
     def pin_ref(self, name: str, commit: str) -> None:
-        """Keep `commit` reachable under refs/... after its branch is gone."""
-        self._run("update-ref", name, commit, check=False)
+        """Keep `commit` reachable under refs/... after its branch is gone.
+
+        Raises GitError on failure: the caller is about to delete the
+        commit's only other ref, so a silently-missing pin would leave the
+        recorded task_commit gc-prunable — the exact loss it prevents.
+        """
+        self._run("update-ref", name, commit)
 
     def merge_in_progress(self) -> bool:
         git_dir = self._run("rev-parse", "--git-dir").stdout.strip()

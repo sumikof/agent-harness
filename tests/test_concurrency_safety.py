@@ -1734,3 +1734,105 @@ def test_timeout_report_salvages_output_when_a_descendant_holds_the_pipe(monkeyp
     assert "diagnostic-line" in result.output, (
         "the timeout report lost the output captured before the deadline")
     assert "outside the killed group" in result.output
+
+
+# -- round-11 findings -------------------------------------------------------
+
+
+async def test_malformed_stream_is_retried_in_session(tmp_path, monkeypatch):
+    """The streaming twin of the malformed-200 fix: an HTML body or a stream
+    cut off before [DONE] must hit the in-session retry, not complete the
+    turn with an empty/partial assistant message."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:                      # 200 + HTML: no SSE at all
+            return httpx.Response(200, text="<html>gateway buffering</html>")
+        if len(calls) == 2:                      # truncated: chunks, no [DONE]
+            return httpx.Response(200, content=_sse_body_without_done())
+        return _sse_response(httpx, [
+            {"choices": [{"delta": {
+                "role": "assistant",
+                "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}]},
+            {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 5}},
+        ])
+
+    def _sse_body_without_done():
+        chunk = {"choices": [{"delta": {"role": "assistant", "content": "partial"}}]}
+        return f"data: {json.dumps(chunk)}\n\n".encode()
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(streaming=True, transient_retries=3,
+                                transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert len(calls) == 3, (
+        f"malformed/truncated streams were not retried (calls={len(calls)})")
+    assert "T1" in (result.output_text or ""), (
+        "the session completed on a damaged stream's partial content")
+
+
+def test_pin_ref_failure_is_loud(tmp_path):
+    """If the conflict ref cannot be written, the caller must find out
+    BEFORE deleting the commit's only other ref — check=False would let
+    disposal proceed and leave tasks.task_commit gc-prunable."""
+    from harness.git.repository import GitError, GitRepository
+
+    git = GitRepository(tmp_path / "repo")
+    git.init()
+    (git.path / "f.txt").write_text("x\n")
+    git.add_all()
+    git.commit("c")
+    commit = git.head_commit()
+
+    with pytest.raises(GitError):
+        git.pin_ref("refs/harness/conflicts/..invalid", commit)
+    with pytest.raises(GitError):
+        git.pin_ref("refs/harness/conflicts/ok", "a" * 40)  # nonexistent object
+
+
+def test_stable_sections_exceeding_the_budget_fail_loudly(tmp_path):
+    """When the system prompt + stable sections alone exceed the budget,
+    nothing downstream ever truncates them — every request would be
+    rejected for context length. Fail once at build time instead."""
+    from harness.context.builder import ContextBudgetError, ContextBuilder
+    from harness.context.project_context import ProjectContext
+    from harness.orchestrator.state_machine import Role
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    builder = ContextBuilder(prompts, input_budget_tokens=1000)   # 4000 chars
+    oversized = ProjectContext(
+        name="p", goal="g" * 20000, repository_path=str(tmp_path),
+        base_branch="main",
+    )
+    with pytest.raises(ContextBudgetError, match="context_profile"):
+        builder.build_prompt(Role.DEVELOPER, oversized, system_prompt="S" * 1000)
+
+    # a fitting project still builds — the gate only fires on real overflow
+    fitting = ProjectContext(
+        name="p", goal="ship it", repository_path=str(tmp_path),
+        base_branch="main",
+    )
+    assert builder.build_prompt(Role.DEVELOPER, fitting, system_prompt="sys")

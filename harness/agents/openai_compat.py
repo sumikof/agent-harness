@@ -443,6 +443,8 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
     content_parts: list[str] = []
     tool_calls: dict[int, dict] = {}
     usage: dict = {}
+    saw_chunk = False
+    saw_done = False
     # Whether the server emitted hidden reasoning — a BOOLEAN, never the
     # text: reasoning is not persisted or forwarded anywhere. The health
     # probe needs it so a thinking model's response counts as a completion
@@ -457,11 +459,13 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
+                saw_done = True
                 break
             try:
                 chunk = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            saw_chunk = True
             if chunk.get("usage"):
                 usage = chunk["usage"]
             for choice in chunk.get("choices") or []:
@@ -484,6 +488,15 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                         call["function"]["name"] = function["name"]
                     if function.get("arguments"):
                         call["function"]["arguments"] += function["arguments"]
+    if not (saw_chunk and saw_done):
+        # An HTML body, a stream of unparseable events, or a stream cut off
+        # before its [DONE] sentinel. Accepting it would complete a tool
+        # turn with an empty/partial response and bypass the in-session
+        # retry that exists exactly for transient transport damage.
+        raise ValueError(
+            "malformed or truncated SSE stream "
+            f"(parsed_chunks={saw_chunk}, done_sentinel={saw_done})"
+        )
     message: dict = {"role": "assistant", "content": "".join(content_parts)}
     if tool_calls:
         message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]

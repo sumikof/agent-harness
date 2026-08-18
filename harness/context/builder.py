@@ -61,6 +61,10 @@ SECTION_FLOOR_CHARS = 2000
 _TRUNCATABLE = ("extra_context", "attempt_context", "task_context")
 
 
+class ContextBudgetError(ValueError):
+    """Stable prompt content alone exceeds the configured input budget."""
+
+
 class ContextBuilder:
     def __init__(self, prompts_dir: Path, input_budget_tokens: int | None = None):
         self.prompts_dir = prompts_dir
@@ -220,6 +224,20 @@ class ContextBuilder:
             tail = text[-(keep - len(head)):] if keep > len(head) else ""
             trimmed[name] = head + TRUNCATION_NOTICE + tail
             total -= len(text) - len(trimmed[name])
+        if total > budget_chars:
+            # Only stable, untrimmable content is left (system prompt, rules,
+            # project context, assignment). The provider never truncates
+            # those either, so every request for this project would be
+            # rejected for context length — fail once, loudly, with the
+            # numbers, instead of failing on every dispatch.
+            raise ContextBudgetError(
+                f"stable prompt content ({total} chars + {reserved_chars} "
+                f"reserved for the system prompt) exceeds the input budget "
+                f"({self.input_budget_tokens} tokens = "
+                f"{self.input_budget_tokens * CHARS_PER_TOKEN} chars); "
+                "shorten the project context / role prompt or select a "
+                "larger context_profile"
+            )
         return [(name, trimmed[name]) for name, _ in sections]
 
     def _task_instruction(self, role: Role) -> str:
