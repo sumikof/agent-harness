@@ -409,7 +409,11 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                         if not isinstance(data, dict):
                             raise ValueError(
                                 f"response body is not an object: {body!r}")
-                        choices = data.get("choices") or [{}]
+                        # No `or {}` normalization BEFORE the checks: an
+                        # empty choices list or a null message is the same
+                        # trust failure — synthesizing an empty assistant
+                        # message would end the session instead of retrying.
+                        choices = data.get("choices")
                         if not isinstance(choices, list) or not choices:
                             raise ValueError(
                                 f"response has no usable choices: {body!r}")
@@ -417,7 +421,7 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                         if not isinstance(choice, dict):
                             raise ValueError(
                                 f"response choice is not an object: {body!r}")
-                        raw_message = choice.get("message") or {}
+                        raw_message = choice.get("message")
                         if not isinstance(raw_message, dict):
                             raise ValueError(
                                 f"response message is not an object: {body!r}")
@@ -510,7 +514,14 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                     content_parts.append(delta["content"])
                 if delta.get("reasoning_content"):
                     reasoning_seen = True
-                for fragment in delta.get("tool_calls") or []:
+                fragments = delta.get("tool_calls") or []
+                if not isinstance(fragments, list):
+                    raise ValueError(
+                        f"SSE delta has non-list tool_calls: {data[:200]!r}")
+                for fragment in fragments:
+                    if not isinstance(fragment, dict):
+                        raise ValueError(
+                            f"SSE tool-call fragment is not an object: {data[:200]!r}")
                     index = fragment.get("index", 0)
                     call = tool_calls.setdefault(
                         index,
@@ -520,6 +531,9 @@ async def stream_chat_completion(client, payload: dict, url: str = "/chat/comple
                     if fragment.get("id"):
                         call["id"] = fragment["id"]
                     function = fragment.get("function") or {}
+                    if not isinstance(function, dict):
+                        raise ValueError(
+                            f"SSE tool-call function is not an object: {data[:200]!r}")
                     if function.get("name"):
                         call["function"]["name"] = function["name"]
                     if function.get("arguments"):

@@ -2098,3 +2098,103 @@ async def test_wrong_shape_json_response_is_retried(tmp_path, monkeypatch):
     assert result.status == "COMPLETED", (
         f"wrong-shape 200 body aborted the session: {result.error}")
     assert len(calls) == len(bodies) + 1
+
+
+# -- round-15 findings -------------------------------------------------------
+
+
+async def test_empty_choices_and_null_message_are_retried(tmp_path, monkeypatch):
+    """`{"choices":[]}` and a null message must not be normalized into an
+    empty assistant message that 'completes' the session — they are the
+    same trust failure as any other malformed 200 and must retry."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    bodies = ['{"choices": []}', '{"choices": [{"message": null}]}']
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) <= len(bodies):
+            return httpx.Response(
+                200, content=bodies[len(calls) - 1].encode(),
+                headers={"content-type": "application/json"})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant",
+            "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5}})
+
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url,
+                            transport=httpx.MockTransport(handler)))
+
+    inference = InferenceConfig(transient_retries=3, transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert "T1" in (result.output_text or ""), (
+        "an empty/null response was synthesized into a completed session")
+    assert len(calls) == len(bodies) + 1
+
+
+async def test_null_tool_call_fragment_is_retried(tmp_path, monkeypatch):
+    """`{"delta":{"tool_calls":[null]}}` inside an otherwise valid stream
+    must invalidate it via ValueError, not escape as AttributeError."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    calls: list[int] = []
+    good = {"choices": [{"delta": {
+        "role": "assistant",
+        "content": '```json\n{"task": "T1", "summary": "s"}\n```'}}]}
+    usage = {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            bad = {"choices": [{"delta": {"tool_calls": [None]}}]}
+            return httpx.Response(200, content=(
+                f"data: {json.dumps(bad)}\n\ndata: [DONE]\n\n").encode())
+        if len(calls) == 2:
+            bad = {"choices": [{"delta": {"tool_calls": [{"function": "x"}]}}]}
+            return httpx.Response(200, content=(
+                f"data: {json.dumps(bad)}\n\ndata: [DONE]\n\n").encode())
+        return _sse_response(httpx, [good, usage])
+
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url,
+                            transport=httpx.MockTransport(handler)))
+
+    inference = InferenceConfig(streaming=True, transient_retries=3,
+                                transient_retry_base_delay=0.01)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=4,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    assert len(calls) == 3, (
+        f"invalid tool-call fragments were not retried (calls={len(calls)})")
