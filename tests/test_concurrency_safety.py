@@ -400,3 +400,174 @@ def test_role_sampling_override_is_partial(config):
     assert reviewer.top_p == 0.8            # the customized global, not 0.95
     developer = config.inference.sampling_for_role("developer")
     assert developer.temperature == 0.7 and developer.top_p == 0.8
+
+
+# -- repeated cancellation --------------------------------------------------
+
+
+async def test_settlement_wait_survives_repeated_cancellation():
+    """A second SIGINT during shutdown must not shorten the wait: returning
+    early hands the abort path a worker still writing in a worktree."""
+    import threading
+
+    from harness.concurrency import run_thread_uninterruptible
+
+    started = threading.Event()
+    state = {"done": False}
+
+    def worker():
+        started.set()
+        import time
+        time.sleep(0.4)
+        state["done"] = True
+        return "finished"
+
+    task = asyncio.create_task(run_thread_uninterruptible(worker, label="probe"))
+    await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()          # second cancellation, mid-settlement
+    await asyncio.sleep(0.05)
+    task.cancel()          # and a third
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state["done"], "helper returned while its worker was still running"
+
+
+# -- process groups ---------------------------------------------------------
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path):
+    """A timed-out command's descendants must not survive to keep writing
+    into the worktree the harness is about to archive or delete."""
+    from harness.process import run_command
+
+    marker = tmp_path / "child-was-alive.txt"
+    # The shell starts a background descendant, then blocks. Killing only the
+    # direct child leaves the descendant to create the marker.
+    script = (
+        f"(sleep 1.2; echo alive > {marker}) & "
+        "sleep 30"
+    )
+    result = run_command(script, tmp_path, timeout=1)
+    assert result.timed_out and result.exit_code == -1
+
+    import time
+    time.sleep(2.0)   # past when the descendant would have written
+    assert not marker.exists(), "a descendant outlived the killed command"
+
+
+def test_run_command_returns_output_and_exit_code(tmp_path):
+    from harness.process import run_command
+
+    ok = run_command("echo hello", tmp_path, timeout=10)
+    assert ok.exit_code == 0 and "hello" in ok.output and not ok.timed_out
+    bad = run_command("exit 3", tmp_path, timeout=10)
+    assert bad.exit_code == 3
+
+
+# -- endpoint authentication ------------------------------------------------
+
+
+def test_api_key_is_sent_and_scopes_the_client_cache():
+    from harness.agents.openai_compat import auth_headers, shared_client
+
+    assert auth_headers("sk-secret") == {"Authorization": "Bearer sk-secret"}
+    assert auth_headers("not-needed") == {}   # local vLLM without --api-key
+    assert auth_headers("") == {}
+
+    authed = shared_client("http://endpoint/v1", 10, "sk-secret")
+    assert authed.headers.get("authorization") == "Bearer sk-secret"
+    # a different credential must never reuse another's client
+    assert shared_client("http://endpoint/v1", 10, "sk-other") is not authed
+    assert shared_client("http://endpoint/v1", 10, "sk-secret") is authed
+
+
+# -- health gate covers the models roles really use -------------------------
+
+
+def test_health_gate_checks_every_effective_role_model(config):
+    """provider.for_role decides the dispatched model; the gate must
+    validate those, not just the inference default."""
+    from harness.config import RoleProviderConfig
+    from harness.main import _uses_local_inference, local_role_models
+
+    config.provider.roles = {
+        "reviewer": RoleProviderConfig(model="qwen-reviewer"),
+        "planner": RoleProviderConfig(type="claude", model="claude-opus-5"),
+    }
+    models = local_role_models(config)
+    assert "qwen-reviewer" in models                 # the role override
+    assert config.provider.model in models           # the shared default
+    assert "claude-opus-5" not in models             # not a local provider
+
+    all_cloud = config.model_copy(deep=True)
+    all_cloud.provider.type = "claude"
+    all_cloud.provider.roles = {}
+    assert local_role_models(all_cloud) == []
+    assert not _uses_local_inference(all_cloud)
+
+
+# -- streaming mode ---------------------------------------------------------
+
+
+async def test_streaming_mode_is_honored_and_reassembles_tool_calls(tmp_path, monkeypatch):
+    """`inference.streaming: true` must actually stream — and SSE tool-call
+    fragments must reassemble into the same shape the loop expects."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import LocalOpenAICompatibleAgentRunner
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    (tmp_path / "hello.txt").write_text("streamed content\n")
+    seen_stream_flags = []
+
+    def sse(*chunks: dict) -> bytes:
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        return (body + "data: [DONE]\n\n").encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_stream_flags.append(body["stream"])
+        if len(seen_stream_flags) == 1:
+            # one tool call split across three deltas
+            return httpx.Response(200, content=sse(
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call-1",
+                     "function": {"name": "read_file", "arguments": '{"pa'}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": 'th": "hello'}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": '.txt"}'}}]}}]},
+                {"usage": {"prompt_tokens": 7, "completion_tokens": 3}},
+            ), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, content=sse(
+            {"choices": [{"delta": {"content": '```json\n{"ok": '}}]},
+            {"choices": [{"delta": {"content": 'true}\n```'}}]},
+            {"usage": {"prompt_tokens": 9, "completion_tokens": 4}},
+        ), headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(streaming=True)
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=5,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="s", prompt="p",
+    )
+    result = await runner.run(spec)
+
+    assert all(seen_stream_flags), "streaming was configured but not requested"
+    assert result.status == "COMPLETED"
+    assert result.structured_output == {"ok": True}
+    assert result.telemetry["tool_calls"] == 1     # the split call reassembled
+    assert result.token_usage["output_tokens"] == 7

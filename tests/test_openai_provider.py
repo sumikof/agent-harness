@@ -89,8 +89,11 @@ def make_spec(tmp_path, role=Role.ANALYST, **overrides) -> ResolvedAgentRunSpec:
 def install_transport(monkeypatch, handler):
     transport = httpx.MockTransport(handler)
 
-    def fake_shared_client(base_url, timeout_seconds):
-        return httpx.AsyncClient(base_url=base_url, transport=transport)
+    def fake_shared_client(base_url, timeout_seconds, api_key=None):
+        return httpx.AsyncClient(
+            base_url=base_url, transport=transport,
+            headers=oc.auth_headers(api_key),
+        )
 
     monkeypatch.setattr(oc, "shared_client", fake_shared_client)
 

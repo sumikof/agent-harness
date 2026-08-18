@@ -51,7 +51,10 @@ inference:
     # parallelism.resource_pools.llm below; the SMALLER of the two wins and
     # a mismatch is logged. Keep it aligned with the server's --max-num-seqs.
     max_requests: 16
-  streaming: false         # internal agents don't need token streaming
+  # api_key: sk-...        # sent as a bearer token when the endpoint needs auth
+  #                        # (leave as the default for a local vLLM without --api-key)
+  streaming: false         # internal agents don't need token streaming;
+                           # true switches the agent loop to SSE
   request_timeout_seconds: 600
   transient_retries: 4     # in-session retry of 429/5xx/transport failures
 

@@ -32,7 +32,8 @@ async def run_thread_uninterruptible(
 
     The worker is shielded so cancelling the caller cannot orphan it, and
     the caller does not resume unwinding — releasing locks, removing
-    worktrees — until the thread has actually finished.
+    worktrees — until the thread has actually finished. Repeated
+    cancellation cannot shorten that wait.
     """
     worker = asyncio.ensure_future(asyncio.to_thread(func, *args))
     try:
@@ -42,7 +43,13 @@ async def run_thread_uninterruptible(
             "%s cancelled; waiting for its worker thread to settle before cleanup",
             label,
         )
-        # A second cancellation must not skip the wait either.
-        with contextlib.suppress(BaseException):
-            await asyncio.wait({worker})
+        # Loop, don't suppress-once: a SECOND cancellation (another SIGINT
+        # during shutdown) interrupts the wait itself, and returning there
+        # would hand the abort path a still-running worker — exactly the
+        # race this helper exists to prevent. Keep re-entering until the
+        # worker is genuinely done; each attempt yields to the event loop,
+        # so the thread's completion callback can land.
+        while not worker.done():
+            with contextlib.suppress(BaseException):
+                await asyncio.wait({worker})
         raise

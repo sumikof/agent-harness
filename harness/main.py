@@ -53,12 +53,28 @@ def cmd_init(config: HarnessConfig) -> int:
     return 0
 
 
+LOCAL_PROVIDER_TYPES = {"openai-compatible", "openai_compatible", "vllm"}
+
+
+def local_role_models(config: HarnessConfig) -> list[str]:
+    """Every model a LOCAL-provider role will actually dispatch.
+
+    The invoker resolves each role through `provider.for_role`, so the
+    health gate has to validate those models — not just
+    `inference.model`, which a role override may never use.
+    """
+    from .orchestrator.state_machine import Role
+
+    models: list[str] = []
+    for role in Role:
+        provider_type, model = config.provider.for_role(role.value)
+        if provider_type in LOCAL_PROVIDER_TYPES and model not in models:
+            models.append(model)
+    return models
+
+
 def _uses_local_inference(config: HarnessConfig) -> bool:
-    local_types = {"openai-compatible", "openai_compatible", "vllm"}
-    if config.provider.type in local_types:
-        return True
-    return any((role.type or config.provider.type) in local_types
-               for role in config.provider.roles.values())
+    return bool(local_role_models(config))
 
 
 def cmd_health(config: HarnessConfig) -> int:
@@ -66,9 +82,10 @@ def cmd_health(config: HarnessConfig) -> int:
     tool calling, structured output, prefix cache) before any task runs."""
     from .agents.health import verify_endpoint
 
-    report = asyncio.run(verify_endpoint(config.inference))
+    models = local_role_models(config) or [config.inference.model]
+    report = asyncio.run(verify_endpoint(config.inference, models))
     print(f"endpoint          : {config.inference.base_url}")
-    print(f"model available   : {report.model_available}")
+    print(f"models available  : {report.models_checked or report.model_available}")
     print(f"completion        : {report.completion_ok} (usage={report.usage_reported})")
     print(f"tool calling      : {report.tool_calling_ok}")
     print(f"structured output : {report.structured_output_ok}")

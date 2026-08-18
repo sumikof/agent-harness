@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 
 from ..config import InferenceConfig
+from .openai_compat import auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,9 @@ _PREFIX_FILLER = ("The harness verifies serving features before use. " * 400).st
 class HealthReport:
     healthy: bool = False
     model_available: bool = False
+    # Every model a local role will actually dispatch, and whether the
+    # endpoint serves it.
+    models_checked: dict = field(default_factory=dict)
     completion_ok: bool = False
     usage_reported: bool = False
     tool_calling_ok: bool = False
@@ -76,14 +80,30 @@ class InferenceHealthError(Exception):
     pass
 
 
-async def verify_endpoint(inference: InferenceConfig) -> HealthReport:
+async def verify_endpoint(
+    inference: InferenceConfig, models: list[str] | None = None
+) -> HealthReport:
+    """Verify the endpoint against the models the harness will really use.
+
+    `models` is the set of effective role models (see
+    `harness.main.local_role_models`); it defaults to the inference default
+    alone. Checking only the default would pass a configuration whose roles
+    dispatch a model the server does not serve — or reject a valid one whose
+    default is simply unused.
+    """
     import httpx
 
     report = HealthReport()
     base = inference.base_url.rstrip("/")
     root = base[: -len("/v1")] if base.endswith("/v1") else base
+    required = list(dict.fromkeys(models or [inference.model]))
+    # Smoke tests run against the first required model; availability is
+    # checked for all of them.
+    probe_model = required[0]
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(
+        timeout=60.0, headers=auth_headers(inference.api_key)
+    ) as client:
         # 1. liveness
         try:
             response = await client.get(f"{root}/health")
@@ -98,14 +118,16 @@ async def verify_endpoint(inference: InferenceConfig) -> HealthReport:
                 report.errors.append(f"endpoint unreachable: {exc}")
                 return report
 
-        # 2. model availability
+        # 2. model availability — for EVERY model a local role dispatches
         try:
             response = await client.get(f"{base}/models")
-            models = [m.get("id") for m in response.json().get("data", [])]
-            report.model_available = inference.model in models
-            if not report.model_available:
+            served = [m.get("id") for m in response.json().get("data", [])]
+            report.models_checked = {name: (name in served) for name in required}
+            report.model_available = all(report.models_checked.values())
+            missing = [name for name, ok in report.models_checked.items() if not ok]
+            if missing:
                 report.errors.append(
-                    f"model '{inference.model}' not served (available: {models})"
+                    f"model(s) {missing} not served (available: {served})"
                 )
         except (httpx.HTTPError, ValueError) as exc:
             report.errors.append(f"/models failed: {exc}")
@@ -113,7 +135,7 @@ async def verify_endpoint(inference: InferenceConfig) -> HealthReport:
 
         async def chat(messages, tools=None, max_tokens=256):
             payload = {
-                "model": inference.model,
+                "model": probe_model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.0,

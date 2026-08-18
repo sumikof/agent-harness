@@ -20,11 +20,11 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..concurrency import run_thread_uninterruptible
+from ..process import run_command
 from ..context.prefix import canonical_json, sha256_hex
 from ..orchestrator.state_machine import Role
 from ..security.commands import check_command, find_write_hint
@@ -362,17 +362,13 @@ class LocalToolExecutor:
                       self.command_timeout)
 
         def run() -> str:
-            try:
-                result = subprocess.run(
-                    args["command"], shell=True, cwd=str(self.cwd),
-                    capture_output=True, text=True, timeout=timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return f"TIMEOUT after {timeout}s"
-            output = (result.stdout or "") + (
-                "\n" + result.stderr if result.stderr else ""
-            )
-            return f"exit code: {result.returncode}\n{output}"
+            # Own process group, killed as a group on timeout: a test runner's
+            # workers must not survive into a worktree the harness is about
+            # to archive or delete.
+            result = run_command(args["command"], self.cwd, timeout)
+            if result.timed_out:
+                return result.output
+            return f"exit code: {result.exit_code}\n{result.output}"
 
         # The command runs inside this task's worktree; cancelling the await
         # cannot stop it, so cleanup must not race a live process (see

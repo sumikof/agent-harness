@@ -22,6 +22,7 @@ sees the AgentRunner protocol. Design points for DGX Spark throughput:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -40,21 +41,39 @@ logger = logging.getLogger(__name__)
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
 _PERMANENT_STATUS = {401, 403, 404, 422}
 
-# Shared clients keyed by base_url — process-wide connection pooling.
-_CLIENTS: dict[str, Any] = {}
+# Shared clients keyed by (base_url, auth identity) — process-wide
+# connection pooling. The auth identity is part of the key so a client
+# built for one credential is never reused for another.
+_CLIENTS: dict[tuple[str, str], Any] = {}
+
+# Placeholder meaning "this endpoint needs no credential" (the default for
+# a local vLLM started without --api-key).
+NO_AUTH_PLACEHOLDER = "not-needed"
 
 
-def shared_client(base_url: str, timeout_seconds: int):
+def auth_headers(api_key: str | None) -> dict[str, str]:
+    """Bearer header for endpoints that require authentication."""
+    if not api_key or api_key == NO_AUTH_PLACEHOLDER:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def shared_client(base_url: str, timeout_seconds: int, api_key: str | None = None):
     import httpx
 
-    client = _CLIENTS.get(base_url)
+    headers = auth_headers(api_key)
+    # Identity, not the secret itself, keys the cache.
+    key = (base_url, hashlib.sha256((api_key or "").encode()).hexdigest()[:16]
+           if headers else "anon")
+    client = _CLIENTS.get(key)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+            headers=headers,
         )
-        _CLIENTS[base_url] = client
+        _CLIENTS[key] = client
     return client
 
 
@@ -236,6 +255,57 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
 
     # ------------------------------------------------------------------
 
+    async def _stream_chat(self, client, payload: dict):
+        """Consume an SSE completion into the same message shape as the
+        non-streaming path. Returns (message | None, status, body).
+
+        Tool calls arrive as indexed fragments — name and id on the first
+        delta for an index, `arguments` accumulating across later ones — so
+        they are reassembled per index before the loop sees them.
+        """
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        usage: dict = {}
+        async with client.stream("POST", "/chat/completions", json=payload) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode("utf-8", "replace")[:500]
+                return None, response.status_code, body
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                    for fragment in delta.get("tool_calls") or []:
+                        index = fragment.get("index", 0)
+                        call = tool_calls.setdefault(
+                            index,
+                            {"id": "", "type": "function",
+                             "function": {"name": "", "arguments": ""}},
+                        )
+                        if fragment.get("id"):
+                            call["id"] = fragment["id"]
+                        function = fragment.get("function") or {}
+                        if function.get("name"):
+                            call["function"]["name"] = function["name"]
+                        if function.get("arguments"):
+                            call["function"]["arguments"] += function["arguments"]
+        message: dict = {"role": "assistant", "content": "".join(content_parts)}
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        message["_usage"] = usage
+        return message, 200, ""
+
     async def _chat(
         self, spec: ResolvedAgentRunSpec, messages: list[dict], tools: list[dict]
     ) -> dict:
@@ -247,10 +317,11 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
         payload: dict[str, Any] = {
             "model": spec.model,
             "messages": messages,
-            # The internal loop is non-streaming: agents don't display tokens
-            # and skipping SSE reduces host CPU/HTTP overhead (config
-            # `inference.streaming` exists for benchmarking the alternative).
-            "stream": False,
+            # Non-streaming by default: internal agents display nothing, and
+            # skipping SSE cuts host CPU/HTTP overhead. `inference.streaming`
+            # switches the loop to SSE so the alternative is measurable
+            # end-to-end, not just in the benchmark script.
+            "stream": bool(self.inference.streaming),
             "temperature": sampling.get("temperature", 0.6),
             "top_p": sampling.get("top_p", 0.95),
             "max_tokens": spec.max_output_tokens or self.inference.max_output_tokens,
@@ -263,28 +334,36 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
             if key in sampling:
                 payload[key] = sampling[key]
 
+        if payload["stream"]:
+            payload["stream_options"] = {"include_usage": True}
         client = shared_client(spec.base_url or self.inference.base_url,
-                               self.inference.request_timeout_seconds)
+                               self.inference.request_timeout_seconds,
+                               self.inference.api_key)
         delay = self.inference.transient_retry_base_delay
         last_error = "not attempted"
         for attempt in range(self.inference.transient_retries + 1):
             await self.gate.acquire(spec.prefix_group_key or None)
             try:
-                response = await client.post("/chat/completions", json=payload)
+                if payload["stream"]:
+                    message, status, body = await self._stream_chat(client, payload)
+                else:
+                    response = await client.post("/chat/completions", json=payload)
+                    status, body = response.status_code, response.text[:500]
+                    message = None
+                    if status == 200:
+                        data = response.json()
+                        choice = (data.get("choices") or [{}])[0]
+                        message = dict(choice.get("message") or {})
+                        message["_usage"] = data.get("usage") or {}
             except httpx.HTTPError as exc:
                 last_error = f"transport error: {type(exc).__name__}: {exc}"
             else:
-                if response.status_code == 200:
-                    data = response.json()
-                    choice = (data.get("choices") or [{}])[0]
-                    message = dict(choice.get("message") or {})
-                    message["_usage"] = data.get("usage") or {}
+                if message is not None:
                     return message
-                body = response.text[:500]
-                last_error = f"HTTP {response.status_code}: {body}"
-                if response.status_code in _PERMANENT_STATUS:
+                last_error = f"HTTP {status}: {body}"
+                if status in _PERMANENT_STATUS:
                     raise PermanentHTTPError(last_error)
-                if response.status_code not in _TRANSIENT_STATUS:
+                if status not in _TRANSIENT_STATUS:
                     raise PermanentHTTPError(last_error)
             finally:
                 self.gate.release(spec.prefix_group_key or None)
