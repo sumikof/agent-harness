@@ -24,6 +24,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..concurrency import run_thread_uninterruptible
 from ..context.prefix import canonical_json, sha256_hex
 from ..orchestrator.state_machine import Role
 from ..security.commands import check_command, find_write_hint
@@ -144,6 +145,42 @@ WRITE_TOOLS: list[dict] = [
 
 _WRITER_ROLES = {Role.DEVELOPER, Role.TESTER}
 
+# Host-heavy shell commands. An agent running `pytest` or `mvn` consumes the
+# same CPU/RAM as the harness's own verification step, so it must draw from
+# the same bounded pools — otherwise `max_parallel_agent_runs` expensive
+# builds can run at once and exhaust the machine that is also serving the
+# model. Substring matching over the normalized command line, so chained
+# forms (`cd x && pytest -q`) are caught too. A heuristic by nature:
+# over-matching only serializes more work, under-matching is the status quo.
+HEAVY_TEST_MARKERS = (
+    "pytest", "py.test", "unittest", "tox", "nosetests",
+    "jest", "vitest", "mocha", "npm test", "yarn test", "pnpm test",
+    "go test", "cargo test", "mvn test", "mvn verify", "gradle test",
+    "gradlew test", "rspec", "phpunit", "dotnet test", "ctest",
+)
+HEAVY_BUILD_MARKERS = (
+    "mvn ", "gradle ", "gradlew ", "make ", "cmake", "cargo build",
+    "go build", "npm run build", "npm ci", "npm install", "yarn build",
+    "yarn install", "pnpm build", "pnpm install", "tsc", "webpack",
+    "vite build", "docker build", "pip install", "poetry install",
+    "cargo check", "dotnet build",
+)
+
+
+def classify_command(command: str) -> str | None:
+    """'test' | 'build' | None — which host pool this command belongs to."""
+    normalized = " ".join((command or "").split()).lower()
+    if not normalized:
+        return None
+    padded = f" {normalized} "
+    for marker in HEAVY_TEST_MARKERS:
+        if marker in padded:
+            return "test"
+    for marker in HEAVY_BUILD_MARKERS:
+        if marker in padded:
+            return "build"
+    return None
+
 
 def tool_schemas_for(role: Role) -> list[dict]:
     """The tool catalog for one role: fixed content, fixed order."""
@@ -216,6 +253,10 @@ class LocalToolExecutor:
     guard: RepeatActionGuard | None = None
     command_timeout: int = 300
     max_output_chars: int = MAX_TOOL_OUTPUT_CHARS
+    # Shared host pools (asyncio.Semaphore-like). Agent-triggered builds and
+    # test runs are gated by the SAME limits as harness verification.
+    heavy_build_pool: object | None = None
+    heavy_test_pool: object | None = None
     tool_calls: int = 0
     loop_detected: bool = field(default=False)
 
@@ -308,6 +349,14 @@ class LocalToolExecutor:
                         return "\n".join(results)
         return "\n".join(results) if results else "no matches"
 
+    def _pool_for(self, command: str):
+        kind = classify_command(command)
+        if kind == "test":
+            return self.heavy_test_pool
+        if kind == "build":
+            return self.heavy_build_pool
+        return None
+
     async def _tool_run_command(self, args: dict) -> str:
         timeout = min(int(args.get("timeout_seconds") or self.command_timeout),
                       self.command_timeout)
@@ -325,7 +374,15 @@ class LocalToolExecutor:
             )
             return f"exit code: {result.returncode}\n{output}"
 
-        return await asyncio.to_thread(run)
+        # The command runs inside this task's worktree; cancelling the await
+        # cannot stop it, so cleanup must not race a live process (see
+        # harness.concurrency).
+        pool = self._pool_for(args["command"])
+        if pool is None:
+            return await run_thread_uninterruptible(run, label="agent command")
+        async with pool:
+            return await run_thread_uninterruptible(
+                run, label="agent host-heavy command")
 
     async def _tool_write_file(self, args: dict) -> str:
         target = self._resolve(args["path"])

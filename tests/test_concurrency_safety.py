@@ -166,7 +166,7 @@ async def test_agent_run_limit_queues_instead_of_failing(config, monkeypatch):
     pid = project["id"]
     runner = BlockingRunner()
     monkeypatch.setattr(agent_invoker_module, "create_runner",
-                        lambda provider, inference=None, llm_gate=None: runner)
+                        lambda *_a, **_k: runner)
 
     ctx = orchestrator.project_context()
     invocations = []
@@ -212,3 +212,191 @@ def test_configured_llm_pool_is_the_gate_requests_use(config):
 def test_standalone_runner_falls_back_to_the_process_gate(config):
     runner = create_runner("openai-compatible", config.inference)
     assert runner.gate.slots == config.inference.concurrency.max_requests
+
+
+# -- split-task dependency ordering ----------------------------------------
+
+
+def test_split_rewires_dependents_to_replacements(config):
+    """A SPLIT original becomes SKIPPED, and SKIPPED satisfies dependencies.
+    Without rewiring, a dependent joins the runnable frontier ALONGSIDE the
+    replacements and a parallel scheduler can start it against stale code."""
+    from harness.artifacts.schemas import Diagnosis, PlannedTask
+
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    t0 = orchestrator.tasks.create(pid, "T000", "prerequisite")
+    t1 = orchestrator.tasks.create(pid, "T001", "big task", dependencies=["T000"])
+    orchestrator.tasks.create(pid, "T002", "dependent", dependencies=["T001"])
+    orchestrator.tasks.set_status(t0, __import__(
+        "harness.orchestrator.state_machine", fromlist=["TaskState"]
+    ).TaskState.COMPLETED, force=True)
+
+    diagnosis = Diagnosis(
+        recommendation="SPLIT",
+        split_tasks=[
+            PlannedTask(task_key="T001A", title="part A"),
+            PlannedTask(task_key="T001B", title="part B", dependencies=["T001A"]),
+        ],
+    )
+    inserted = orchestrator.task_runner._insert_split_tasks(pid, t1, diagnosis)
+    assert inserted == ["T001A", "T001B"]
+    orchestrator.tasks.set_status(t1, __import__(
+        "harness.orchestrator.state_machine", fromlist=["TaskState"]
+    ).TaskState.SKIPPED, force=True)
+
+    deps = json.loads(orchestrator.tasks.get_by_key(pid, "T002")["dependencies"])
+    assert deps == ["T001A", "T001B"], "dependent still points at the split original"
+
+    # replacements inherit what the original waited for
+    assert "T000" in json.loads(
+        orchestrator.tasks.get_by_key(pid, "T001A")["dependencies"])
+
+    runnable = {t["task_key"] for t in orchestrator.tasks.runnable_tasks(pid)}
+    assert "T002" not in runnable, "dependent became runnable before its replacements"
+    assert "T001A" in runnable
+
+
+# -- host resource pools ----------------------------------------------------
+
+
+def test_agent_commands_draw_from_the_host_pools(tmp_path):
+    """Agent-triggered builds/tests consume the same CPU/RAM as harness
+    verification, so they must be gated by the same bounded pools."""
+    from harness.agents.local_tools import LocalToolExecutor, classify_command
+    from harness.orchestrator.state_machine import Role as R
+
+    assert classify_command("cd svc && pytest -q") == "test"
+    assert classify_command("mvn -q package") == "build"
+    assert classify_command("git status") is None
+
+    async def scenario():
+        pool = asyncio.Semaphore(1)
+        state = {"active": 0, "peak": 0}
+
+        class Tracking:
+            async def __aenter__(self):
+                await pool.acquire()
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+
+            async def __aexit__(self, *exc):
+                state["active"] -= 1
+                pool.release()
+
+        executor = LocalToolExecutor(
+            role=R.DEVELOPER, cwd=tmp_path, repo_root=tmp_path,
+            heavy_test_pool=Tracking(), heavy_build_pool=Tracking(),
+        )
+        await asyncio.gather(*(
+            executor.execute("run_command", {"command": "pytest --version || true"})
+            for _ in range(4)
+        ))
+        return state["peak"]
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_light_commands_are_not_gated(tmp_path):
+    from harness.agents.local_tools import LocalToolExecutor
+    from harness.orchestrator.state_machine import Role as R
+
+    class Forbidden:
+        async def __aenter__(self):
+            raise AssertionError("a light command must not consume a host pool slot")
+
+        async def __aexit__(self, *exc):
+            pass
+
+    executor = LocalToolExecutor(
+        role=R.DEVELOPER, cwd=tmp_path, repo_root=tmp_path,
+        heavy_test_pool=Forbidden(), heavy_build_pool=Forbidden(),
+    )
+    out = asyncio.run(executor.execute("run_command", {"command": "echo hi"}))
+    assert "exit code: 0" in out
+
+
+# -- verification cancellation ---------------------------------------------
+
+
+async def test_verification_settles_before_the_worktree_is_removed(config, monkeypatch):
+    """Cancelling the task while verification runs must not delete the
+    worktree out from under the still-running verifier."""
+    orchestrator = ProjectOrchestrator(config)
+    project = orchestrator.ensure_project()
+    pid = project["id"]
+    tid = orchestrator.tasks.create(pid, "T001", "task")
+    env = orchestrator.task_runner._create_env("T001", 1)
+    state = {"finished": False, "tree_present_at_exit": None}
+
+    def slow_verify(label, on_step=None):
+        import time
+        time.sleep(0.3)
+        state["tree_present_at_exit"] = env.handle.path.is_dir()
+        state["finished"] = True
+        from harness.artifacts.schemas import VerificationResult
+        return VerificationResult(passed=True, steps=[])
+
+    monkeypatch.setattr(env.verifier, "run", slow_verify)
+
+    async def verify():
+        from harness.concurrency import run_thread_uninterruptible
+        async with orchestrator.task_runner.pools.heavy_test:
+            return await run_thread_uninterruptible(
+                env.verifier.run, "T001-a1", None, label="verification")
+
+    task = asyncio.create_task(verify())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # cancellation waited for the verifier instead of racing it
+    assert state["finished"], "cancellation returned while the verifier was live"
+    assert state["tree_present_at_exit"] is True
+    orchestrator.worktrees.remove(env.handle)
+
+
+# -- stale worktree registrations -------------------------------------------
+
+
+def test_vanished_worktree_registration_is_pruned(config):
+    """A worktree directory can disappear while git still registers it.
+    Without a prune the branch cannot be deleted and the next
+    `worktree add -b` fails on the existing name, stranding the task."""
+    import shutil
+
+    orchestrator = ProjectOrchestrator(config)
+    orchestrator.ensure_project()
+    handle = orchestrator.worktrees.create("T001", 1, orchestrator.git.head_commit())
+    branch = handle.branch
+    shutil.rmtree(handle.path)                      # directory gone, registration stays
+
+    orchestrator.worktrees.remove_path(handle.path, branch=branch)
+
+    assert not orchestrator.git.branch_exists(branch)
+    assert orchestrator.worktrees.registered_paths() == []
+    # the task can start a fresh cycle on the same branch name
+    again = orchestrator.worktrees.create("T001", 1, orchestrator.git.head_commit())
+    assert again.path.is_dir()
+    orchestrator.worktrees.remove(again)
+
+
+# -- partial sampling overrides ---------------------------------------------
+
+
+def test_role_sampling_override_is_partial(config):
+    """A role that overrides one field must keep the customized global
+    profile for every other field, not pydantic's class defaults."""
+    config.inference.sampling.top_p = 0.8
+    config.inference.sampling.temperature = 0.7
+    config.inference.role_sampling = {
+        "reviewer": type(config.inference.sampling).model_validate({"temperature": 0.2})
+    }
+
+    reviewer = config.inference.sampling_for_role("reviewer")
+    assert reviewer.temperature == 0.2      # the explicit override
+    assert reviewer.top_p == 0.8            # the customized global, not 0.95
+    developer = config.inference.sampling_for_role("developer")
+    assert developer.temperature == 0.7 and developer.top_p == 0.8

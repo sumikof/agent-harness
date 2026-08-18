@@ -99,10 +99,19 @@ class InferenceConfig(BaseModel):
         return self.context_profiles.get(self.context_profile, 65536)
 
     def sampling_for_role(self, role: str) -> SamplingConfig:
+        """The global profile with the role's EXPLICIT overrides applied.
+
+        A role entry is a partial override: only the fields actually
+        present in the configuration win. Returning the parsed override
+        directly would let pydantic's class defaults silently overwrite a
+        customized global profile (e.g. a global top_p alongside a
+        reviewer that only sets temperature).
+        """
         override = self.role_sampling.get(role)
         if override is None:
             return self.sampling
-        return override
+        explicit = override.model_dump(exclude_unset=True)
+        return self.sampling.model_copy(update=explicit)
 
 
 class ResourcePoolsConfig(BaseModel):

@@ -95,7 +95,8 @@ class ProjectOrchestrator:
         self.budget = BudgetManager(config, self.projects, self.tasks, self.runs)
         self.invoker = AgentInvoker(
             config, self.context_builder, self.artifacts, self.runs, self.events,
-            self.budget, self.operations, self.git, llm_gate=self.pools.llm,
+            self.budget, self.operations, self.git,
+            llm_gate=self.pools.llm, resource_pools=self.pools,
         )
         self.task_runner = TaskRunner(
             config, self.invoker, self.tasks, self.runs, self.events,

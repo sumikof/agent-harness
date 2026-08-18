@@ -27,6 +27,7 @@ from enum import StrEnum
 
 from ..agents import analyst, developer, diagnostician, reviewer, tester
 from ..artifacts.manager import ArtifactManager
+from ..concurrency import run_thread_uninterruptible
 from ..artifacts.schemas import Diagnosis, Review, VerificationResult
 from ..config import HarnessConfig
 from ..context.attempt_context import AttemptContext
@@ -378,8 +379,13 @@ class TaskRunner:
             if verify_op_id else None
         )
         async with self.pools.heavy_test:
-            verification: VerificationResult = await asyncio.to_thread(
-                env.verifier.run, f"{task_key}-a{attempt_id}", on_step
+            # The verifier runs real build/test commands INSIDE this task's
+            # worktree. Cancelling the await cannot stop them, so the abort
+            # handler must not archive and delete that worktree while they
+            # are still writing to it.
+            verification: VerificationResult = await run_thread_uninterruptible(
+                env.verifier.run, f"{task_key}-a{attempt_id}", on_step,
+                label=f"verification of {task_key}",
             )
         if self.operations and verify_op_id:
             self.operations.record_result(
@@ -633,28 +639,54 @@ class TaskRunner:
     def _insert_split_tasks(
         self, project_id: int, task_id: int, diagnosis: Diagnosis
     ) -> list[str]:
-        """Insert the diagnosis's replacement tasks; returns the inserted keys."""
+        """Insert the diagnosis's replacement tasks; returns the inserted keys.
+
+        The DAG is preserved across the split, not just the sequence order:
+        replacements inherit the original's dependencies, and every
+        unfinished dependent of the original is repointed at the
+        replacements. Relying on sequence numbers alone was enough for a
+        sequential scheduler but not for a parallel one, which would
+        otherwise start a dependent alongside the replacements.
+        """
         original = self.tasks.get(task_id)
+        original_key = original["task_key"]
         base_seq = original["sequence"]
+        original_deps = json.loads(original["dependencies"] or "[]")
         all_tasks = self.tasks.list_for_project(project_id)
         next_seqs = sorted(t["sequence"] for t in all_tasks if t["sequence"] > base_seq)
         upper = next_seqs[0] if next_seqs else base_seq + 100
         count = len(diagnosis.split_tasks)
+        replacement_keys = [planned.task_key for planned in diagnosis.split_tasks]
         inserted: list[str] = []
         for index, planned in enumerate(diagnosis.split_tasks, start=1):
             seq = base_seq + max(1, (upper - base_seq) * index // (count + 1))
             if self.tasks.get_by_key(project_id, planned.task_key) is not None:
                 continue
+            # A replacement still waits for whatever the original waited
+            # for; the diagnosis only declares dependencies BETWEEN the
+            # replacements.
+            dependencies = list(planned.dependencies)
+            for dep in original_deps:
+                if dep not in dependencies and dep != original_key:
+                    dependencies.append(dep)
             self.tasks.create(
                 project_id,
                 planned.task_key,
                 planned.title,
                 planned.goal,
                 planned.acceptance_criteria,
-                planned.dependencies,
+                dependencies,
                 sequence=seq,
             )
             inserted.append(planned.task_key)
+        if inserted:
+            rewired = self.tasks.rewire_dependencies(
+                project_id, original_key,
+                [key for key in replacement_keys if key in inserted],
+            )
+            if rewired:
+                logger.info("split %s: repointed dependents %s at %s",
+                            original_key, rewired, inserted)
         return inserted
 
     # ------------------------------------------------------------------

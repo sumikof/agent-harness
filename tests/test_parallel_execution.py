@@ -105,7 +105,7 @@ def config(tmp_path) -> HarnessConfig:
 
 def install(monkeypatch, runner) -> None:
     monkeypatch.setattr(agent_invoker_module, "create_runner",
-                        lambda provider, inference=None, llm_gate=None: runner)
+                        lambda *_a, **_k: runner)
     monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
 
 

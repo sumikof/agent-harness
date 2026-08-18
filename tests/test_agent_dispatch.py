@@ -62,7 +62,7 @@ def ok_result(payload: dict | None = None) -> AgentResult:
 
 
 def install(monkeypatch, runner):
-    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda provider, inference=None, llm_gate=None: runner)
+    monkeypatch.setattr(agent_invoker_module, "create_runner", lambda *_a, **_k: runner)
     monkeypatch.setattr(agent_invoker_module, "TECHNICAL_RETRY_DELAY", 0.0)
 
 

@@ -134,6 +134,39 @@ class TaskRepository:
                     payload={"from": row["status"], "to": status.value, "forced": force},
                 )
 
+    def rewire_dependencies(
+        self, project_id: int, old_key: str, new_keys: list[str]
+    ) -> list[str]:
+        """Repoint unfinished tasks that depend on `old_key` at `new_keys`.
+
+        Used when a task is SPLIT: the original becomes SKIPPED, and SKIPPED
+        satisfies dependencies (a dropped task must not deadlock its
+        dependents). Without rewiring, a dependent would enter the runnable
+        frontier ALONGSIDE the replacements — under a parallel scheduler it
+        could then start before the work it depends on has been integrated.
+        Returns the task keys whose dependencies were changed.
+        """
+        changed: list[str] = []
+        terminal = ("COMPLETED", "SKIPPED")
+        for row in self.list_for_project(project_id):
+            if row["status"] in terminal or row["task_key"] in new_keys:
+                continue
+            deps = json.loads(row["dependencies"] or "[]")
+            if old_key not in deps:
+                continue
+            rewired: list[str] = []
+            for dep in deps:
+                if dep != old_key:
+                    rewired.append(dep)
+                    continue
+                rewired.extend(key for key in new_keys if key not in rewired)
+            self.db.execute(
+                "UPDATE tasks SET dependencies = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(rewired, ensure_ascii=False), utcnow(), row["id"]),
+            )
+            changed.append(row["task_key"])
+        return changed
+
     def update_definition(
         self,
         task_id: int,

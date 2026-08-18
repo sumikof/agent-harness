@@ -77,11 +77,21 @@ class WorktreeManager:
 
     def remove_path(self, path: str | Path, branch: str | None = None) -> None:
         """Remove one worktree (and optionally its branch). Never touches
-        any other worktree."""
+        any other worktree.
+
+        A vanished directory still leaves git's worktree REGISTRATION
+        behind, and git refuses to delete a branch that a registration
+        still claims as checked out. Pruning therefore has to happen on
+        every path — otherwise the next attempt cannot delete the branch
+        and `worktree add -b` fails on the name that already exists,
+        stranding the task.
+        """
         path = Path(path)
         try:
             if path.exists():
-                self.main.remove_worktree(path)
+                self.main.remove_worktree(path)   # removes + prunes
+            else:
+                self.main.prune_worktrees()       # stale registration only
         except GitError as exc:
             logger.warning("git worktree remove failed for %s (%s); cleaning up", path, exc)
             if path.exists():

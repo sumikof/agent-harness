@@ -75,9 +75,14 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
 
     provider_name = "openai-compatible"
 
-    def __init__(self, inference: InferenceConfig, gate: Optional[PrefixAffinityGate] = None):
+    def __init__(self, inference: InferenceConfig,
+                 gate: Optional[PrefixAffinityGate] = None,
+                 resource_pools=None):
         self.inference = inference
         self.gate = gate or global_llm_gate(inference.concurrency.max_requests)
+        # Host pools for agent-triggered builds/tests — the SAME limits the
+        # harness's own verification draws from.
+        self.resource_pools = resource_pools
 
     def capabilities(self) -> AgentCapabilities:
         # Declared here; VERIFIED against the live endpoint by
@@ -124,11 +129,14 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
                 abort_after=spec.repeat_guard.abort_after,
                 exempt_tools=spec.repeat_guard.exempt_tools,
             )
+        pools = self.resource_pools
         executor = LocalToolExecutor(
             role=role,
             cwd=Path(spec.cwd),
             repo_root=Path(spec.repo_root),
             guard=guard,
+            heavy_build_pool=getattr(pools, "heavy_build", None),
+            heavy_test_pool=getattr(pools, "heavy_test", None),
         )
         tools = tool_schemas_for(role)
 

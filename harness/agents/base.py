@@ -335,7 +335,8 @@ class ClaudeAgentRunner(BaseAgentRunner):
         return result
 
 
-def create_runner(provider_type: str, inference=None, llm_gate=None) -> AgentRunner:
+def create_runner(provider_type: str, inference=None, llm_gate=None,
+                  resource_pools=None) -> AgentRunner:
     """Build the runner for a provider.
 
     `llm_gate` is the harness's configured LLM pool (ResourcePools.llm).
@@ -343,6 +344,8 @@ def create_runner(provider_type: str, inference=None, llm_gate=None) -> AgentRun
     scheduler's gate metrics describe the SAME gate the requests pass
     through; without it a standalone runner falls back to its own
     process-wide gate sized from `inference.concurrency.max_requests`.
+    `resource_pools` additionally gates agent-triggered build/test commands
+    against the harness's host limits.
     """
     if provider_type == "claude":
         return ClaudeAgentRunner()
@@ -350,5 +353,6 @@ def create_runner(provider_type: str, inference=None, llm_gate=None) -> AgentRun
         from ..config import InferenceConfig
         from .openai_compat import LocalOpenAICompatibleAgentRunner
 
-        return LocalOpenAICompatibleAgentRunner(inference or InferenceConfig(), llm_gate)
+        return LocalOpenAICompatibleAgentRunner(
+            inference or InferenceConfig(), llm_gate, resource_pools)
     raise ValueError(f"unknown agent provider: {provider_type}")

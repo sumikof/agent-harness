@@ -107,6 +107,7 @@ class AgentInvoker:
         operations: Optional[OperationRepository] = None,
         git: Optional[GitRepository] = None,
         llm_gate=None,
+        resource_pools=None,
     ):
         self.config = config
         self.context_builder = context_builder
@@ -119,7 +120,10 @@ class AgentInvoker:
         # The configured LLM pool (ResourcePools.llm). Passed to every local
         # provider so `parallelism.resource_pools.llm` and the scheduler's
         # metrics observe the SAME gate the requests actually go through.
-        self.llm_gate = llm_gate
+        self.llm_gate = llm_gate or getattr(resource_pools, "llm", None)
+        # Host pools travel to the provider so agent-run builds/tests draw
+        # from the same limits as harness verification.
+        self.resource_pools = resource_pools
         self._admission: Optional[asyncio.Semaphore] = None
         self._admission_loop = None
 
@@ -188,7 +192,8 @@ class AgentInvoker:
             self.budget.check_task(task_id)
 
         profile = self.build_profile(spec)
-        runner = create_runner(profile.provider, self.config.inference, self.llm_gate)
+        runner = create_runner(profile.provider, self.config.inference,
+                               self.llm_gate, self.resource_pools)
 
         # Capability validation happens BEFORE anything is dispatched. A
         # provider missing a required capability is a configuration error,

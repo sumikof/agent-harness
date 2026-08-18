@@ -20,12 +20,12 @@ so crash recovery can reconcile by trailer instead of merging twice.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from ..concurrency import run_thread_uninterruptible
 from ..database.operation_repository import (
     OperationRepository,
     OperationStatus,
@@ -91,26 +91,15 @@ class IntegrationManager:
         async with self._lock:
             # The merge itself is subprocess work; run off the event loop so
             # parallel tasks keep their agents moving meanwhile.
-            worker = asyncio.ensure_future(asyncio.to_thread(
+            # Cancelling this coroutine does NOT stop the worker thread:
+            # `git merge` may still be mutating the integration checkout.
+            # Releasing `_lock` before it settles would let a second
+            # integration overlap a live merge.
+            return await run_thread_uninterruptible(
                 self._integrate_sync, task_key, task_commit, title,
                 project_id, task_id, attempt_id,
-            ))
-            try:
-                return await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                # Cancelling this coroutine does NOT stop the worker thread:
-                # `git merge` may still be mutating the integration checkout.
-                # Releasing `_lock` now would let a second integration overlap
-                # a live merge, so wait for the worker to settle first. The
-                # result is then discarded by design — the intent stays
-                # PENDING and startup recovery reconciles it by trailer.
-                logger.warning(
-                    "integration of %s cancelled; waiting for the merge thread to settle",
-                    task_key,
-                )
-                with contextlib.suppress(BaseException):
-                    await asyncio.wait({worker})
-                raise
+                label=f"integration of {task_key}",
+            )
 
     def _integrate_sync(
         self,
