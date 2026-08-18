@@ -1063,3 +1063,128 @@ def test_deployment_artifacts_are_not_committable():
     assert is_ignored("deploy/inference/.env")        # operator's HF token
     # the frozen production profile is source, not an artifact
     assert not is_ignored("config/inference-tuning.json")
+
+
+# -- tool-loop growth vs the context window ---------------------------------
+
+
+async def test_tool_loop_history_is_clamped_to_the_input_budget(tmp_path, monkeypatch):
+    """The budget shapes the FIRST prompt only; each turn appends an
+    assistant message plus a tool result and the whole history is resent.
+    One large read_file is enough to overrun the window otherwise."""
+    import httpx
+
+    import harness.agents.openai_compat as oc
+    from harness.agents.openai_compat import (
+        CHARS_PER_TOKEN,
+        ELIDED_TOOL_RESULT,
+        LocalOpenAICompatibleAgentRunner,
+        _messages_size,
+    )
+    from harness.agents.profile import ResolvedAgentRunSpec
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 120_000 + "\n")          # far past one tool result cap
+    sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sizes.append(_messages_size(body["messages"]))
+        if len(sizes) <= 3:
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": f"c{len(sizes)}", "type": "function",
+                                "function": {"name": "read_file",
+                                             "arguments": json.dumps({"path": "big.txt"})}}]}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "role": "assistant", "content": '```json\n{"task": "T001", "summary": "s"}\n```'}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(oc, "shared_client",
+                        lambda base_url, t, k=None: httpx.AsyncClient(
+                            base_url=base_url, transport=transport))
+
+    inference = InferenceConfig(input_budget_tokens=4000)   # small, so the loop bites
+    runner = LocalOpenAICompatibleAgentRunner(inference, PrefixAffinityGate(2))
+    spec = ResolvedAgentRunSpec(
+        provider="openai-compatible", model="m", role="analyst", profile_id="x",
+        profile_version="1", profile_hash="h", max_turns=8,
+        cwd=str(tmp_path), repo_root=str(tmp_path), base_url="http://fake/v1",
+        system_prompt="system", prompt="task prompt",
+    )
+    result = await runner.run(spec)
+
+    assert result.status == "COMPLETED"
+    limit = inference.effective_input_budget() * CHARS_PER_TOKEN
+    assert sizes, "no request was sent"
+    assert max(sizes) <= limit, (
+        f"history grew to {max(sizes)} chars, past the {limit}-char budget")
+    assert len(sizes) > 3, "the tool loop did not actually run"
+
+
+def test_elision_keeps_the_assignment_and_tool_call_pairing(tmp_path):
+    """Trimming must not break the protocol: a tool message whose assistant
+    tool_calls remain cannot simply be dropped, and the assignment stays."""
+    from harness.agents.openai_compat import (
+        ELIDED_TOOL_RESULT,
+        LocalOpenAICompatibleAgentRunner,
+    )
+    from harness.config import InferenceConfig
+    from harness.orchestrator.resources import PrefixAffinityGate
+
+    runner = LocalOpenAICompatibleAgentRunner(
+        InferenceConfig(input_budget_tokens=1000), PrefixAffinityGate(2))
+    messages = [
+        {"role": "system", "content": "SYSTEM PROMPT"},
+        {"role": "user", "content": "THE ASSIGNMENT"},
+    ]
+    for i in range(6):
+        messages.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": f"c{i}", "type": "function",
+                                         "function": {"name": "read_file",
+                                                      "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": f"c{i}",
+                         "content": "y" * 5000})
+
+    runner._fit_to_window(messages)
+
+    assert messages[0]["content"] == "SYSTEM PROMPT"
+    assert messages[1]["content"] == "THE ASSIGNMENT"
+    tool_messages = [m for m in messages if m["role"] == "tool"]
+    assert len(tool_messages) == 6                     # none dropped
+    assert all(m.get("tool_call_id") for m in tool_messages)
+    assert any(m["content"] == ELIDED_TOOL_RESULT for m in tool_messages)
+
+
+def test_health_gate_requires_usage_reporting():
+    """The runner declares a usage_reporting capability and records absent
+    counts as zero, so an endpoint without usage must not pass startup."""
+    from harness.agents.health import ModelReport
+
+    complete = ModelReport(model="m", available=True, completion_ok=True,
+                           usage_reported=True, tool_calling_ok=True,
+                           structured_output_ok=True)
+    assert complete.ok
+    no_usage = ModelReport(model="m", available=True, completion_ok=True,
+                           usage_reported=False, tool_calling_ok=True,
+                           structured_output_ok=True)
+    assert not no_usage.ok
+
+
+def test_non_positive_output_reservation_is_refused():
+    """Zero or negative leaves MORE apparent headroom, so a bare headroom
+    check accepts it — then every request is rejected by the server."""
+    import pydantic
+
+    from harness.config import InferenceConfig
+
+    for value in (0, -1):
+        with pytest.raises(pydantic.ValidationError):
+            InferenceConfig(max_output_tokens=value)
+    with pytest.raises(pydantic.ValidationError):
+        InferenceConfig(input_budget_tokens=0)
+    assert InferenceConfig(max_output_tokens=1).effective_input_budget() > 0

@@ -64,9 +64,14 @@ class ModelReport:
 
     @property
     def ok(self) -> bool:
+        # usage_reported is required, not informational: the runner declares
+        # a usage_reporting capability and records absent counts as zero, so
+        # an endpoint without it would silently corrupt token telemetry and
+        # every budget derived from it.
         return (
             self.available
             and self.completion_ok
+            and self.usage_reported
             and self.tool_calling_ok
             and self.structured_output_ok
         )
@@ -220,6 +225,11 @@ async def verify_endpoint(
             except Exception as exc:
                 report.errors.append(f"[{name}] completion smoke test failed: {exc}")
                 continue
+            if not model_report.usage_reported:
+                report.errors.append(
+                    f"[{name}] endpoint returned no usage counts; token telemetry "
+                    "and every budget derived from it would be wrong"
+                )
 
             # 4. tool calling (qwen3_coder parser server-side)
             try:

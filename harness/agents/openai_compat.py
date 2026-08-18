@@ -39,6 +39,22 @@ from .profile import AgentCapabilities, ResolvedAgentRunSpec
 logger = logging.getLogger(__name__)
 
 _TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Same chars-per-token heuristic the ContextBuilder budgets with.
+CHARS_PER_TOKEN = 4
+ELIDED_TOOL_RESULT = "[earlier tool result elided to fit the context window]"
+
+
+def _messages_size(messages: list[dict]) -> int:
+    """Approximate character size of a chat history, tool calls included."""
+    total = 0
+    for message in messages:
+        total += len(message.get("content") or "")
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            total += len(function.get("name") or "")
+            total += len(function.get("arguments") or "")
+    return total
 _PERMANENT_STATUS = {401, 403, 404, 422}
 
 # Shared clients keyed by (base_url, auth identity) — process-wide
@@ -255,6 +271,45 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
 
     # ------------------------------------------------------------------
 
+    def _fit_to_window(self, messages: list[dict]) -> None:
+        """Bound the accumulated tool loop to the configured input budget.
+
+        The context budget shapes the INITIAL prompt, but each turn appends
+        an assistant message plus a tool result, and the whole history is
+        resent while output tokens stay reserved. One large read_file/grep
+        result is enough to push a normal session past the server window.
+
+        Oldest-first, tool results are replaced by a short notice — the
+        message and its tool_call_id stay in place, because dropping a tool
+        message whose assistant tool_calls remain would break the protocol.
+        The system prompt and the task prompt are never touched: they are
+        the assignment. Elision is permanent, so history cannot regrow.
+        """
+        budget_chars = self.inference.effective_input_budget() * CHARS_PER_TOKEN
+        if _messages_size(messages) <= budget_chars:
+            return
+        for message in messages:
+            if _messages_size(messages) <= budget_chars:
+                return
+            if message.get("role") != "tool":
+                continue
+            if message.get("content") == ELIDED_TOOL_RESULT:
+                continue
+            message["content"] = ELIDED_TOOL_RESULT
+        # Still oversized with every tool result elided: drop older assistant
+        # prose too (never the first two messages — system + assignment).
+        for message in messages[2:]:
+            if _messages_size(messages) <= budget_chars:
+                return
+            if message.get("role") == "assistant" and message.get("content"):
+                message["content"] = ""
+        if _messages_size(messages) > budget_chars:
+            logger.warning(
+                "conversation still exceeds the input budget after elision "
+                "(%d chars); the request may be rejected by the server",
+                _messages_size(messages),
+            )
+
     async def _stream_chat(self, client, payload: dict):
         """Consume an SSE completion into the same message shape as the
         non-streaming path. Returns (message | None, status, body).
@@ -313,6 +368,9 @@ class LocalOpenAICompatibleAgentRunner(BaseAgentRunner):
         transient failures retried in-session with backoff."""
         import httpx
 
+        # Applied before every request (retries included) so a long tool
+        # loop can never outgrow the window mid-session.
+        self._fit_to_window(messages)
         sampling = spec.sampling or {}
         payload: dict[str, Any] = {
             "model": spec.model,

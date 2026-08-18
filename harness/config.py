@@ -89,9 +89,12 @@ class InferenceConfig(BaseModel):
     )
     # Input token budget within the context profile: the rest is reserved
     # for reasoning, tool calls, and model output. Approximate (chars/4).
-    input_budget_tokens: int = 50000
-    # Reserved output tokens per request.
-    max_output_tokens: int = 8192
+    input_budget_tokens: int = Field(default=50000, gt=0)
+    # Reserved output tokens per request. Must be positive: the value is
+    # forwarded as `max_tokens`, and zero or negative makes the server
+    # reject every request — while leaving MORE apparent input headroom,
+    # so a bare headroom check would accept it.
+    max_output_tokens: int = Field(default=8192, gt=0)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
     # Per-role sampling overrides (partial; unset fields fall back).
     role_sampling: dict[str, SamplingConfig] = Field(default_factory=dict)
