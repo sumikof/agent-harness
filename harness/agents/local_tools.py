@@ -197,6 +197,26 @@ def tool_schema_hash(role: Role) -> str:
 # -- security decision ------------------------------------------------------
 
 LOCAL_WRITE_TOOLS = {"write_file", "edit_file"}
+# Read tools take a path too. Confining writes but not reads would let a
+# prompt in an untrusted repository pull ~/.ssh keys or a host .env into
+# the model request and the artifacts — the very files the command policy
+# blocks on the shell side.
+LOCAL_READ_PATH_TOOLS = {"read_file", "list_directory", "grep"}
+
+
+def resolve_inside(repo_root: str | Path, path: str) -> Path | None:
+    """Absolute path for `path`, or None when it escapes `repo_root`."""
+    root = Path(repo_root).resolve()
+    target = Path(path)
+    if not target.is_absolute():
+        target = root / target
+    try:
+        resolved = target.resolve()
+    except OSError:
+        return None
+    if resolved != root and root not in resolved.parents:
+        return None
+    return resolved
 
 
 def decide_local_tool_use(
@@ -215,6 +235,23 @@ def decide_local_tool_use(
                     f"{role.value} has read-only shell access ({hint}); "
                     "use the write_file/edit_file tools if your role permits file changes"
                 )
+        return True, ""
+
+    if tool_name in LOCAL_READ_PATH_TOOLS:
+        # grep's path is optional (defaults to the repository root).
+        file_path = arguments.get("path")
+        if file_path and resolve_inside(repo_root, file_path) is None:
+            return False, (
+                f"Reads outside the repository are forbidden: {file_path}"
+            )
+        return True, ""
+
+    if tool_name == "glob":
+        pattern = arguments.get("pattern", "")
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            return False, (
+                f"Glob patterns must stay inside the repository: {pattern}"
+            )
         return True, ""
 
     if tool_name in LOCAL_WRITE_TOOLS:
@@ -288,10 +325,15 @@ class LocalToolExecutor:
         return text[: self.max_output_chars] + TRUNCATION_NOTICE
 
     def _resolve(self, path: str) -> Path:
-        target = Path(path)
-        if not target.is_absolute():
-            target = self.cwd / target
-        return target
+        """Resolve inside the repository, or refuse.
+
+        Enforced here as well as in the policy so a future caller cannot
+        reach outside by skipping decide_local_tool_use().
+        """
+        resolved = resolve_inside(self.repo_root, path)
+        if resolved is None:
+            raise ValueError(f"path escapes the repository: {path}")
+        return resolved
 
     # -- handlers ----------------------------------------------------------
 
@@ -315,10 +357,13 @@ class LocalToolExecutor:
         )
 
     async def _tool_glob(self, args: dict) -> str:
+        root = Path(self.repo_root).resolve()
         matches = sorted(
             str(p.relative_to(self.cwd))
             for p in self.cwd.glob(args["pattern"])
-            if ".git" not in p.parts
+            # A pattern can still walk out through a symlink; drop anything
+            # that does not resolve inside the repository.
+            if ".git" not in p.parts and resolve_inside(root, str(p)) is not None
         )[:500]
         return "\n".join(matches) if matches else "no matches"
 
@@ -328,11 +373,13 @@ class LocalToolExecutor:
         except re.error as exc:
             return f"invalid pattern: {exc}"
         base = self._resolve(args.get("path") or ".")
+        root = Path(self.repo_root).resolve()
         file_glob = args.get("glob")
         results: list[str] = []
         files = [base] if base.is_file() else [
             p for p in sorted(base.rglob("*"))
             if p.is_file() and ".git" not in p.parts
+            and resolve_inside(root, str(p)) is not None
         ]
         for path in files:
             rel = str(path.relative_to(self.cwd)) if path.is_relative_to(self.cwd) else str(path)

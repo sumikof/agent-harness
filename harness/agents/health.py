@@ -4,11 +4,13 @@ Capabilities are never assumed: before the harness starts a project on
 the local OpenAI-compatible provider, the endpoint must pass
 
     1. liveness            GET /health (vLLM) or GET /v1/models
-    2. model availability  the configured alias is served
+    2. model availability  every model a local role dispatches is served
     3. simple completion   a trivial prompt returns text + usage
     4. tool calling        the model emits a correct read_file tool call
                            (qwen3_coder parser on the server side)
     5. structured output   the model returns parseable JSON on request
+
+Probes 3-5 run against EVERY effective role model, not just the first.
     6. prefix caching      two requests sharing a long prefix; the served
                            /metrics (when reachable) must show prefix
                            cache activity — merely passing the CLI flag
@@ -49,30 +51,78 @@ _PREFIX_FILLER = ("The harness verifies serving features before use. " * 400).st
 
 
 @dataclass
-class HealthReport:
-    healthy: bool = False
-    model_available: bool = False
-    # Every model a local role will actually dispatch, and whether the
-    # endpoint serves it.
-    models_checked: dict = field(default_factory=dict)
+class ModelReport:
+    """Capability probe results for ONE served model."""
+
+    model: str
+    available: bool = False
     completion_ok: bool = False
     usage_reported: bool = False
     tool_calling_ok: bool = False
     structured_output_ok: bool = False
-    prefix_cache_verified: bool = False
-    prefix_cache_note: str = ""
     reasoning_content_seen: bool = False
-    errors: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """Startup gate: hard requirements only."""
         return (
-            self.healthy
-            and self.model_available
+            self.available
             and self.completion_ok
             and self.tool_calling_ok
             and self.structured_output_ok
+        )
+
+
+@dataclass
+class HealthReport:
+    healthy: bool = False
+    # One entry per model a local role will actually dispatch. Capabilities
+    # are probed on EVERY one of them: a second served model that lacks the
+    # tool parser or usable structured output must not pass startup and
+    # surface only once its role starts a task.
+    models: dict = field(default_factory=dict)      # model -> ModelReport
+    prefix_cache_verified: bool = False
+    prefix_cache_note: str = ""
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def models_checked(self) -> dict:
+        return {name: report.available for name, report in self.models.items()}
+
+    @property
+    def model_available(self) -> bool:
+        return bool(self.models) and all(r.available for r in self.models.values())
+
+    def _all(self, attribute: str) -> bool:
+        return bool(self.models) and all(
+            getattr(r, attribute) for r in self.models.values()
+        )
+
+    # Aggregates across every probed model.
+    @property
+    def completion_ok(self) -> bool:
+        return self._all("completion_ok")
+
+    @property
+    def usage_reported(self) -> bool:
+        return self._all("usage_reported")
+
+    @property
+    def tool_calling_ok(self) -> bool:
+        return self._all("tool_calling_ok")
+
+    @property
+    def structured_output_ok(self) -> bool:
+        return self._all("structured_output_ok")
+
+    @property
+    def reasoning_content_seen(self) -> bool:
+        return any(r.reasoning_content_seen for r in self.models.values())
+
+    @property
+    def ok(self) -> bool:
+        """Startup gate: every effective role model must pass."""
+        return self.healthy and bool(self.models) and all(
+            r.ok for r in self.models.values()
         )
 
 
@@ -97,9 +147,6 @@ async def verify_endpoint(
     base = inference.base_url.rstrip("/")
     root = base[: -len("/v1")] if base.endswith("/v1") else base
     required = list(dict.fromkeys(models or [inference.model]))
-    # Smoke tests run against the first required model; availability is
-    # checked for all of them.
-    probe_model = required[0]
 
     async with httpx.AsyncClient(
         timeout=60.0, headers=auth_headers(inference.api_key)
@@ -122,9 +169,9 @@ async def verify_endpoint(
         try:
             response = await client.get(f"{base}/models")
             served = [m.get("id") for m in response.json().get("data", [])]
-            report.models_checked = {name: (name in served) for name in required}
-            report.model_available = all(report.models_checked.values())
-            missing = [name for name, ok in report.models_checked.items() if not ok]
+            report.models = {name: ModelReport(model=name, available=name in served)
+                             for name in required}
+            missing = [name for name in required if name not in served]
             if missing:
                 report.errors.append(
                     f"model(s) {missing} not served (available: {served})"
@@ -133,9 +180,9 @@ async def verify_endpoint(
             report.errors.append(f"/models failed: {exc}")
             return report
 
-        async def chat(messages, tools=None, max_tokens=256):
+        async def chat(messages, model, tools=None, max_tokens=256):
             payload = {
-                "model": probe_model,
+                "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
@@ -148,66 +195,87 @@ async def verify_endpoint(
             response.raise_for_status()
             return response.json()
 
-        # 3. simple completion
-        try:
-            data = await chat([{"role": "user", "content": "Reply with the single word: ready"}])
-            message = data["choices"][0]["message"]
-            report.completion_ok = bool(
-                (message.get("content") or "").strip()
-                or message.get("reasoning_content")
-            )
-            report.usage_reported = bool(data.get("usage", {}).get("completion_tokens"))
-            report.reasoning_content_seen = bool(message.get("reasoning_content"))
-        except Exception as exc:
-            report.errors.append(f"completion smoke test failed: {exc}")
-            return report
+        # 3-5. capability probes, per model. A role dispatching a model that
+        # cannot tool-call or emit parseable JSON must fail startup, not the
+        # first task that happens to use it.
+        for name, model_report in report.models.items():
+            if not model_report.available:
+                continue
 
-        # 4. tool calling (qwen3_coder parser server-side)
-        try:
-            data = await chat(
-                [{"role": "user",
-                  "content": "Use the read_file tool to read the file 'README.md'. "
-                             "Do not answer in text."}],
-                tools=_TOOL_SMOKE_SCHEMA,
-            )
-            calls = data["choices"][0]["message"].get("tool_calls") or []
-            ok = False
-            for call in calls:
-                function = call.get("function") or {}
-                if function.get("name") == "read_file":
-                    import json as _json
-                    args = _json.loads(function.get("arguments") or "{}")
-                    ok = "README" in str(args.get("path", ""))
-            report.tool_calling_ok = ok
-            if not ok:
-                report.errors.append(
-                    f"tool-calling smoke test produced no valid read_file call: {calls!r}"
+            # 3. simple completion
+            try:
+                data = await chat(
+                    [{"role": "user", "content": "Reply with the single word: ready"}],
+                    name,
                 )
-        except Exception as exc:
-            report.errors.append(f"tool-calling smoke test failed: {exc}")
+                message = data["choices"][0]["message"]
+                model_report.completion_ok = bool(
+                    (message.get("content") or "").strip()
+                    or message.get("reasoning_content")
+                )
+                model_report.usage_reported = bool(
+                    data.get("usage", {}).get("completion_tokens"))
+                model_report.reasoning_content_seen = bool(
+                    message.get("reasoning_content"))
+            except Exception as exc:
+                report.errors.append(f"[{name}] completion smoke test failed: {exc}")
+                continue
 
-        # 5. structured output (normal generation + parse — the production path)
-        try:
-            data = await chat(
-                [{"role": "user",
-                  "content": 'Respond with ONLY this JSON in a ```json fence: {"status": "ok"}'}],
-            )
-            from .base import extract_json
+            # 4. tool calling (qwen3_coder parser server-side)
+            try:
+                data = await chat(
+                    [{"role": "user",
+                      "content": "Use the read_file tool to read the file 'README.md'. "
+                                 "Do not answer in text."}],
+                    name,
+                    tools=_TOOL_SMOKE_SCHEMA,
+                )
+                calls = data["choices"][0]["message"].get("tool_calls") or []
+                ok = False
+                for call in calls:
+                    function = call.get("function") or {}
+                    if function.get("name") == "read_file":
+                        import json as _json
+                        args = _json.loads(function.get("arguments") or "{}")
+                        ok = "README" in str(args.get("path", ""))
+                model_report.tool_calling_ok = ok
+                if not ok:
+                    report.errors.append(
+                        f"[{name}] tool-calling smoke test produced no valid "
+                        f"read_file call: {calls!r}"
+                    )
+            except Exception as exc:
+                report.errors.append(f"[{name}] tool-calling smoke test failed: {exc}")
 
-            parsed = extract_json(data["choices"][0]["message"].get("content") or "")
-            report.structured_output_ok = isinstance(parsed, dict) and "status" in parsed
-            if not report.structured_output_ok:
-                report.errors.append("structured-output smoke test: no parseable JSON")
-        except Exception as exc:
-            report.errors.append(f"structured-output smoke test failed: {exc}")
+            # 5. structured output (normal generation + parse — production path)
+            try:
+                data = await chat(
+                    [{"role": "user",
+                      "content": 'Respond with ONLY this JSON in a ```json fence: '
+                                 '{"status": "ok"}'}],
+                    name,
+                )
+                from .base import extract_json
+
+                parsed = extract_json(data["choices"][0]["message"].get("content") or "")
+                model_report.structured_output_ok = (
+                    isinstance(parsed, dict) and "status" in parsed)
+                if not model_report.structured_output_ok:
+                    report.errors.append(
+                        f"[{name}] structured-output smoke test: no parseable JSON")
+            except Exception as exc:
+                report.errors.append(
+                    f"[{name}] structured-output smoke test failed: {exc}")
 
         # 6. prefix caching: option flags are not proof — observe metrics.
         try:
             before = await _prefix_cache_counters(client, root)
+            probe = next((n for n, r in report.models.items() if r.available),
+                         required[0])
             shared = [{"role": "user", "content": _PREFIX_FILLER + " Reply: one"}]
-            await chat(shared, max_tokens=8)
+            await chat(shared, probe, max_tokens=8)
             shared2 = [{"role": "user", "content": _PREFIX_FILLER + " Reply: two"}]
-            await chat(shared2, max_tokens=8)
+            await chat(shared2, probe, max_tokens=8)
             after = await _prefix_cache_counters(client, root)
             if before is None or after is None:
                 report.prefix_cache_note = (

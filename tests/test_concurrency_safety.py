@@ -571,3 +571,125 @@ async def test_streaming_mode_is_honored_and_reassembles_tool_calls(tmp_path, mo
     assert result.structured_output == {"ok": True}
     assert result.telemetry["tool_calls"] == 1     # the split call reassembled
     assert result.token_usage["output_tokens"] == 7
+
+
+# -- termination escalation -------------------------------------------------
+
+
+def test_sigterm_ignoring_descendant_is_escalated_to_sigkill(tmp_path, monkeypatch):
+    """The shell leader exiting is NOT proof the group is gone: a descendant
+    that traps SIGTERM must still be SIGKILLed, or it keeps writing into the
+    worktree after the command was declared timed out."""
+    import time
+
+    import harness.process as process_module
+    from harness.process import run_command
+
+    monkeypatch.setattr(process_module, "TERM_GRACE_SECONDS", 0.3)
+    marker = tmp_path / "survivor.txt"
+    script = (
+        f"bash -c 'trap \"\" TERM; for i in $(seq 30); do sleep 0.1; done; "
+        f"echo alive > {marker}' & sleep 30"
+    )
+
+    result = run_command(script, tmp_path, timeout=1)
+    assert result.timed_out
+
+    time.sleep(3.5)     # past when the trapping descendant would have written
+    assert not marker.exists(), "a SIGTERM-ignoring descendant outlived the kill"
+
+
+# -- read confinement -------------------------------------------------------
+
+
+def test_read_tools_cannot_escape_the_repository(tmp_path):
+    """Writes were confined but reads were not: a prompt in an untrusted
+    repository could pull host credentials into the model request."""
+    from harness.agents.local_tools import LocalToolExecutor, decide_local_tool_use
+    from harness.orchestrator.state_machine import Role as R
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "inside.txt").write_text("repository content\n")
+    secret = tmp_path / "secret.env"
+    secret.write_text("API_KEY=leaked\n")
+
+    for tool, args in (
+        ("read_file", {"path": str(secret)}),
+        ("read_file", {"path": "../secret.env"}),
+        ("list_directory", {"path": str(tmp_path)}),
+        ("grep", {"pattern": "API_KEY", "path": str(tmp_path)}),
+        ("glob", {"pattern": "../*.env"}),
+    ):
+        allowed, reason = decide_local_tool_use(R.DEVELOPER, tool, args, repo)
+        assert not allowed, f"{tool} escaped the repository with {args}"
+        assert "repositor" in reason
+
+    # in-repository reads still work
+    allowed, _ = decide_local_tool_use(R.DEVELOPER, "read_file",
+                                       {"path": "inside.txt"}, repo)
+    assert allowed
+
+    # and the executor refuses independently of the policy layer
+    executor = LocalToolExecutor(role=R.DEVELOPER, cwd=repo, repo_root=repo)
+    out = asyncio.run(executor.execute("read_file", {"path": str(secret)}))
+    assert "leaked" not in out
+    inside = asyncio.run(executor.execute("read_file", {"path": "inside.txt"}))
+    assert "repository content" in inside
+
+
+# -- per-model capability probing -------------------------------------------
+
+
+async def test_health_probes_capabilities_on_every_role_model(monkeypatch):
+    """A second served model lacking tool calling must fail startup, not the
+    first task that happens to use it."""
+    import httpx
+
+    from harness.agents.health import verify_endpoint
+    from harness.config import InferenceConfig
+
+    probed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "good"}, {"id": "weak"}]})
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.url.path.endswith("/metrics"):
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        model = body["model"]
+        probed.append(model)
+        if body.get("tools"):
+            if model == "weak":          # served, but cannot tool-call
+                return httpx.Response(200, json={
+                    "choices": [{"message": {"role": "assistant", "content": "sorry"}}],
+                    "usage": {"completion_tokens": 2}})
+            return httpx.Response(200, json={"choices": [{"message": {
+                "role": "assistant",
+                "tool_calls": [{"id": "c", "type": "function", "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"})}}]}}],
+                "usage": {"completion_tokens": 2}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant",
+                                     "content": '```json\n{"status": "ok"}\n```'}}],
+            "usage": {"completion_tokens": 3}})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched)
+    report = await verify_endpoint(InferenceConfig(), ["good", "weak"])
+
+    assert set(report.models) == {"good", "weak"}
+    assert report.models["good"].ok
+    assert not report.models["weak"].tool_calling_ok
+    assert not report.ok, "startup passed despite a role model that cannot tool-call"
+    assert any("weak" in e for e in report.errors)
+    assert "weak" in probed, "the second role model was never probed"
